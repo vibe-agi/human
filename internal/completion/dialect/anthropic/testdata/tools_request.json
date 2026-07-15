@@ -1,0 +1,70 @@
+{
+  "model": "human-agent-fixture",
+  "max_tokens": 1024,
+  "stream": true,
+  "system": [
+    {
+      "type": "text",
+      "text": "Workspace: workspace_fixture_01; task: task_fixture_01."
+    },
+    {
+      "type": "text",
+      "text": "Use only declared tools and preserve tool-use identities."
+    }
+  ],
+  "metadata": {
+    "user_id": "caller_fixture_01"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "Read the synthetic README."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_fixture_read_01",
+          "name": "read_file",
+          "input": {
+            "path": "/workspace/README.md"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_fixture_read_01",
+          "content": "synthetic contents",
+          "is_error": false
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "Summarize the result."
+    }
+  ],
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "Read one synthetic workspace file.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

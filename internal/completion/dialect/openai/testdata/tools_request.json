@@ -1,0 +1,59 @@
+{
+  "model": "human-agent-fixture",
+  "stream": true,
+  "user": "caller_fixture_01",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Workspace: workspace_fixture_01; task: task_fixture_01. Use only declared tools."
+    },
+    {
+      "role": "user",
+      "content": "Read the synthetic README."
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_fixture_read_01",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"/workspace/README.md\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_fixture_read_01",
+      "content": "synthetic contents"
+    },
+    {
+      "role": "user",
+      "content": "Summarize the result."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read one synthetic workspace file.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

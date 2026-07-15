@@ -1,0 +1,70 @@
+{
+  "dialect": "anthropic_messages",
+  "model": "human-agent-fixture",
+  "stream": true,
+  "system": "Workspace: workspace_fixture_01; task: task_fixture_01.\nUse only declared tools and preserve tool-use identities.",
+  "messages": [
+    {
+      "role": "user",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "Read the synthetic README."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "blocks": [
+        {
+          "type": "tool_use",
+          "tool_call_id": "toolu_fixture_read_01",
+          "tool_name": "read_file",
+          "input": {
+            "path": "/workspace/README.md"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "blocks": [
+        {
+          "type": "tool_result",
+          "tool_call_id": "toolu_fixture_read_01",
+          "output": "synthetic contents"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "Summarize the result."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "Read one synthetic workspace file.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "metadata": {
+    "user_id": "caller_fixture_01"
+  }
+}

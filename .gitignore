@@ -6,8 +6,9 @@ formal/tla2tools.jar
 
 # 构建产物
 /bin/
-humand
-human
+/humand
+/human
+/human-mcp
 
 # 本地环境
 .human/
