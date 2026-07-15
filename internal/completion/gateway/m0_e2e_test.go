@@ -21,12 +21,12 @@ import (
 	"github.com/vibe-agi/human/internal/ratelimit"
 )
 
-// TestP1M0TwentyRemoteToolLoops is the executable P1-M0 contract smoke test:
+// TestM0TwentyRemoteToolLoops is the executable M0 contract smoke test:
 // the real gateway and caller shim complete read -> edit -> exec -> final
 // twenty times, while duplicate HTTP requests and tool executions remain
 // idempotent. It intentionally uses the project-owned exact adapter rather
 // than inferring capabilities from a tool schema.
-func TestP1M0TwentyRemoteToolLoops(t *testing.T) {
+func TestM0TwentyRemoteToolLoops(t *testing.T) {
 	fixture := newGatewayFixtureWithConfig(t, true, Config{RateLimit: ratelimit.Config{
 		RatePerSecond: 10_000, Burst: 10_000,
 	}})
@@ -61,12 +61,12 @@ func TestP1M0TwentyRemoteToolLoops(t *testing.T) {
 			t.Fatal(err)
 		}
 		shimServer := httptest.NewServer(shim)
-		runP1M0Loop(t, fixture, shimServer.URL, workspace, cycle)
+		runM0Loop(t, fixture, shimServer.URL, workspace, cycle)
 		shimServer.Close()
 	}
 }
 
-func runP1M0Loop(t *testing.T, fixture *gatewayFixture, shimURL, workspace string, cycle int) {
+func runM0Loop(t *testing.T, fixture *gatewayFixture, shimURL, workspace string, cycle int) {
 	t.Helper()
 	taskID := fmt.Sprintf("task-m0-%02d", cycle)
 	fileName := fmt.Sprintf("source-%02d.txt", cycle)

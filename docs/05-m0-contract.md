@@ -1,8 +1,8 @@
-# 05 · P1-M0 可执行契约
+# 05 · M0 可执行契约
 
-[02](02-gateway.md) 讲"为什么"，本篇是"照着实现什么"——P1-M0/M1 的精确字段、状态、时序。收口 codex 复审的 4 个实现契约 + read/search + 身份拆分。02 相关节引用此处为准。
+[02](02-gateway.md) 讲"为什么"，本篇是"照着实现什么"——M0/M1 的精确字段、状态、时序。本文定义身份、adapter、循环、拒单与 read/search 的实现边界，02 相关节引用此处为准。
 
-> **当前落点**：循环状态机与 Remote tools 核心已在 `internal/completion/`、caller shim、SQLite store、gateway 与 worker 协议中实现；仓库内直接协议测试跑通 20 次闭环、重复 POST 与重复 tool-call 去重。Workspace 的 snapshot/base_commit/完整镜像字段校验和主动 TUI read/search 入口尚未实现；真实外部 harness 透传、10m/2h 长挂与部分响应重试也仍未执行。
+> **当前落点**：循环状态机与 Remote tools 核心已在 `internal/completion/`、caller shim、SQLite store、gateway 与 worker 协议中实现；仓库内直接协议测试跑通 20 次闭环、重复 POST 与重复 tool-call 去重。Workspace 的 snapshot/base_commit/完整镜像字段校验尚未实现；真实外部 harness 透传、10m/2h 长挂与部分响应重试也仍未执行。
 
 ## 1. 身份：三个正交概念，不可混用
 
@@ -75,21 +75,21 @@ admitted ─→ leased ─→ awaiting_human ─→ responded
 先写 200 → 推 TUI → 人才看到、才能按 `r`。故**人工拒单必然在阶段 B（200 之后）**，不可能在阶段 A 返 503。
 
 - **阶段 A（200 前，可返真 HTTP 错误）**：只做**机器可判断**的——鉴权、接单人在线、队列容量、限流。
-- **阶段 B（200 后，只能流内失败/断流）**：人工拒单、超时、中途不可用 → 流内 error event / 断流；行为由 P1-M0 实测（客户端对部分响应的重试未必一致）。
+- **阶段 B（200 后，只能流内失败/断流）**：人工拒单、超时、中途不可用 → 流内 error event / 断流；行为由 M0 实测（客户端对部分响应的重试未必一致）。
 - **不在 200 前阻塞等真人接单**——否则重新引入首字节超时。准入只看"有没有人在线且有容量"，不等"某个人接了这单"。
 
 ## 6. read/search 与 caller-side CAS
 
-adapter 声明了 read/search，但本地 agent 的 read 只读**本地 scratch**，不会自动穿越到需求方。当前已实现的是 caller shim 的 `human_read_file` / `human_search` executor、CAS 文件操作与直接协议测试；尚无主动 TUI read/search/file-open 入口，也没有 Workspace snapshot/helper 自动 hydrate。完整穿越仍须从下列路径中实现并实测可用者：
+Remote tools 的文件穿越只有一条实现路径：**caller shim 或等价 harness adapter 暴露并执行受信工具，客户侧 Agent 负责标准 tool-call/result 循环。**
 
-- **TUI read/search/file-open 入口**：人/agent 触发 → 作为 read/search tool_call 发往需求方 → 结果回填镜像；
-- **本地 MCP 文件代理**：接单人的 agent 通过一个本地 MCP，其文件读取被代理成需求方 tool_call；
-- **caller helper 自动 hydrate**（Workspace 档）：helper 主动把 R 下文件同步进镜像。
+1. 客户侧集成以受限 token 读取 `GET /internal/v1/tools/schema`，获得 `human_read_file`、`human_search`、`human_write_file`、`human_edit_file`、`human_delete_file`、`human_rename_file`，以及显式开启时才出现的 `human_exec`。
+2. 人的 completion 响应发出相应 tool call；客户侧 Agent 调用 `POST /internal/v1/tools/execute`。shim 不信任 body 内的 caller/task 身份，而是用受信启动配置覆盖，再在客户工作区执行。
+3. tool result 由客户侧 Agent 放入下一次 completion，请求回到同一 `task_id` 与原 lease；gateway 对账后继续循环。
 
-**caller-side CAS（编辑前置条件）**：edit 回传时带其所基于内容的指纹（行区间 hash / blob sha）；需求方侧（harness 或 helper）**先校验前置条件再落盘**——匹配才 apply，不匹配则显式失败（对账走第 4 节，重新 read 重做）。这是"逐 tool-call 确认"落到线上的机制，替代"单一写者自动对齐"的乐观假设。
+**caller-side CAS（编辑前置条件）**：read 返回内容指纹；write/edit/delete/rename 必须带 `expected_sha256`。shim 在真实文件系统上先校验指纹、realpath 与 symlink 边界，再落盘；不匹配就显式失败，随后重新 read 并重做。执行账本再以 tool-call ID 保证精确重试只重放原结果。这是“逐 tool-call 确认”的线上机制，不依赖镜像自动一致。
 
-## 7. 本契约对应的验收点（P1-M0）
+## 7. 本契约对应的验收点（M0）
 
-**仓库内已验证**：项目自有 gateway + caller shim 通过直接 HTTP/tool 协议连续跑通 20 次 `read→result→edit→result→exec→final`；显式 key 的重复 POST 与重复 tool-call 复用持久结果；两个同 body 独立 key 不折叠，工具账本可跨 shim 重启重放。这里的 read 覆盖 caller shim executor，不代表主动 TUI 穿越入口已经存在。
+**仓库内已验证**：项目自有 gateway + caller shim 通过直接 HTTP/tool 协议连续跑通 20 次 `read→result→edit→result→exec→final`；显式 key 的重复 POST 与重复 tool-call 复用持久结果；两个同 body 独立 key 不折叠，工具账本可跨 shim 重启重放。
 
-**P1-M0 仍待外部验证**：冻结版本的目标 harness 是否透传三档身份字段；Chat/Responses/Anthropic 的 10m/2h 长挂；已吐进度后流内失败的客户端重试；真实 read/search schema/结果格式；20 次外部闭环的零重复、零静默错误记录。只有后者完成，才可给具体 harness 下兼容结论。
+**M0 仍待外部验证**：冻结版本的目标 harness 是否透传三档身份字段并正确执行 shim 工具循环；Chat/Responses/Anthropic 的 10m/2h 长挂；已吐进度后流内失败的客户端重试；真实 read/search schema/结果格式；20 次外部闭环的零重复、零静默错误记录。只有这些完成，才可给具体 harness 下兼容结论。

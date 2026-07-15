@@ -26,9 +26,6 @@ import (
 	"github.com/vibe-agi/human/internal/completion/dialect/responses"
 	"github.com/vibe-agi/human/internal/completion/gateway"
 	"github.com/vibe-agi/human/internal/completion/hub"
-	"github.com/vibe-agi/human/internal/delegation"
-	"github.com/vibe-agi/human/internal/delegation/a2aadapter"
-	delegationworkerws "github.com/vibe-agi/human/internal/delegation/workerws"
 	"github.com/vibe-agi/human/internal/ratelimit"
 	"github.com/vibe-agi/human/internal/store/sqlite"
 	completionworkerws "github.com/vibe-agi/human/internal/workerws"
@@ -86,8 +83,6 @@ func newServeCommand(settings *viper.Viper) *cobra.Command {
 	flags.Bool("audit-payload", false, "retain request and response payloads in addition to metadata")
 	flags.Duration("audit-payload-ttl", 7*24*time.Hour, "retention period for explicitly enabled audit payloads")
 	flags.Duration("shutdown-timeout", 10*time.Second, "graceful shutdown timeout")
-	flags.String("a2a-base-url", "http://127.0.0.1:8080", "public base URL advertised by the A2A Agent Card")
-	flags.Bool("remote-exec", false, "allow workers to request caller-approved remote commands")
 	mustBind(settings, "serve.listen", flags.Lookup("listen"))
 	mustBind(settings, "serve.queue_capacity", flags.Lookup("queue-capacity"))
 	mustBind(settings, "serve.heartbeat", flags.Lookup("heartbeat"))
@@ -97,8 +92,6 @@ func newServeCommand(settings *viper.Viper) *cobra.Command {
 	mustBind(settings, "audit.payload", flags.Lookup("audit-payload"))
 	mustBind(settings, "audit.payload_ttl", flags.Lookup("audit-payload-ttl"))
 	mustBind(settings, "serve.shutdown_timeout", flags.Lookup("shutdown-timeout"))
-	mustBind(settings, "a2a.base_url", flags.Lookup("a2a-base-url"))
-	mustBind(settings, "delegation.remote_exec", flags.Lookup("remote-exec"))
 	return command
 }
 
@@ -112,39 +105,13 @@ func serve(ctx context.Context, settings *viper.Viper) error {
 		return err
 	}
 	defer database.Close()
-	delegationStore, err := delegation.OpenSQLite(ctx, databasePath)
-	if err != nil {
-		return fmt.Errorf("open delegation authority: %w", err)
-	}
-	defer delegationStore.Close()
 	if _, err := database.PurgeExpiredAuditPayloads(ctx, time.Now()); err != nil {
 		return fmt.Errorf("purge expired audit payloads: %w", err)
 	}
 	authenticator := auth.NewService(database)
-	a2aServer, err := a2aadapter.NewServer(a2aadapter.ServerConfig{
-		Authority: delegationStore,
-		Authenticator: a2aadapter.BearerAuthenticatorFunc(func(ctx context.Context, token string) (string, error) {
-			principal, err := authenticator.Authenticate(ctx, token)
-			if err != nil || principal.Type != auth.PrincipalCaller || strings.TrimSpace(principal.SubjectID) == "" {
-				return "", a2aadapter.ErrInvalidBearerToken
-			}
-			return principal.SubjectID, nil
-		}),
-		BaseURL: settings.GetString("a2a.base_url"), Version: Version,
-		RemoteExec: settings.GetBool("delegation.remote_exec"),
-	})
-	if err != nil {
-		return fmt.Errorf("create A2A server: %w", err)
-	}
 	workerHub := hub.New(settings.GetInt("serve.queue_capacity"))
 	completionWorkerServer, err := completionworkerws.New(
 		completionworkerws.Config{}, authenticator, workerHub, database,
-	)
-	if err != nil {
-		return err
-	}
-	delegationWorkerServer, err := delegationworkerws.New(
-		delegationworkerws.Config{RemoteExec: settings.GetBool("delegation.remote_exec")}, authenticator, delegationStore,
 	)
 	if err != nil {
 		return err
@@ -172,10 +139,7 @@ func serve(ctx context.Context, settings *viper.Viper) error {
 		return fmt.Errorf("recover incomplete completion requests: %w", err)
 	}
 	mux := http.NewServeMux()
-	registerServeRoutes(
-		mux, completionWorkerServer, delegationWorkerServer,
-		a2aServer.Handler(), gatewayServer,
-	)
+	registerServeRoutes(mux, completionWorkerServer, gatewayServer)
 	httpServer := &http.Server{
 		Addr:              settings.GetString("serve.listen"),
 		Handler:           requestLog(mux),
@@ -210,14 +174,9 @@ func serve(ctx context.Context, settings *viper.Viper) error {
 func registerServeRoutes(
 	mux *http.ServeMux,
 	completionWorker http.Handler,
-	delegationWorker http.Handler,
-	a2a http.Handler,
 	gateway http.Handler,
 ) {
 	mux.Handle("/internal/v1/worker/ws", completionWorker)
-	mux.Handle(delegationworkerws.DefaultPath, delegationWorker)
-	mux.Handle("/.well-known/agent-card.json", a2a)
-	mux.Handle("/a2a/", a2a)
 	mux.Handle("/", gateway)
 }
 
@@ -298,14 +257,7 @@ func newMigrateCommand(settings *viper.Viper) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := database.Close(); err != nil {
-				return err
-			}
-			delegationStore, err := delegation.OpenSQLite(command.Context(), databasePath)
-			if err != nil {
-				return err
-			}
-			return delegationStore.Close()
+			return database.Close()
 		},
 	}
 }

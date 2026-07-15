@@ -41,7 +41,6 @@ func New() *cobra.Command {
 	mustBind(settings, "workspace.mirror_root", command.Flags().Lookup("mirror-root"))
 	mustBind(settings, "worker.outbox", command.Flags().Lookup("outbox"))
 	command.AddCommand(newShimCommand(settings))
-	command.AddCommand(newDelegationCommand(settings))
 	return command
 }
 

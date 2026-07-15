@@ -9,16 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
-	"time"
 
-	"github.com/coder/websocket"
-	"github.com/coder/websocket/wsjson"
 	"github.com/vibe-agi/human/internal/auth"
-	"github.com/vibe-agi/human/internal/delegation"
-	"github.com/vibe-agi/human/internal/delegation/workerproto"
-	delegationworkerws "github.com/vibe-agi/human/internal/delegation/workerws"
 	"github.com/vibe-agi/human/internal/store/sqlite"
 )
 
@@ -110,46 +103,31 @@ func TestVersion(t *testing.T) {
 	}
 }
 
-func TestServeRoutesDelegationWorkerWebSocketWithWorkerAuth(t *testing.T) {
-	ctx := context.Background()
-	databasePath := filepath.Join(t.TempDir(), "human.db")
-	database, err := sqlite.Open(ctx, databasePath)
+func TestServeFlagsAreCompletionOnly(t *testing.T) {
+	t.Parallel()
+	serve, _, err := New().Find([]string{"serve"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
-	delegationStore, err := delegation.OpenSQLite(ctx, databasePath)
-	if err != nil {
-		t.Fatal(err)
+	for _, name := range []string{
+		"listen", "queue-capacity", "heartbeat", "max-pending", "rate-limit",
+		"rate-burst", "audit-payload", "audit-payload-ttl", "shutdown-timeout",
+	} {
+		if serve.Flags().Lookup(name) == nil {
+			t.Fatalf("completion serve flag %q is not registered", name)
+		}
 	}
-	defer delegationStore.Close()
-	if _, err := delegationStore.CreateTask(ctx, delegation.CreateTaskInput{
-		ID: "route-task", CallerID: "caller-1",
-	}); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"a2a-base-url", "remote-exec"} {
+		if serve.Flags().Lookup(name) != nil {
+			t.Fatalf("removed serve flag %q is still registered", name)
+		}
 	}
-	tokens := auth.NewService(database)
-	workerToken, err := tokens.Issue(ctx, auth.PrincipalWorker, "route-worker")
-	if err != nil {
-		t.Fatal(err)
-	}
-	callerToken, err := tokens.Issue(ctx, auth.PrincipalCaller, "caller-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	delegationWorker, err := delegationworkerws.New(
-		delegationworkerws.Config{SnapshotPoll: 10 * time.Millisecond}, tokens, delegationStore,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+}
 
+func TestServeRoutesCompletionOnly(t *testing.T) {
+	t.Parallel()
 	completionWorker := http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		response.Header().Set("X-Human-Route", "completion-worker")
-		response.WriteHeader(http.StatusNoContent)
-	})
-	a2a := http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-		response.Header().Set("X-Human-Route", "a2a")
 		response.WriteHeader(http.StatusNoContent)
 	})
 	gateway := http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
@@ -157,7 +135,7 @@ func TestServeRoutesDelegationWorkerWebSocketWithWorkerAuth(t *testing.T) {
 		response.WriteHeader(http.StatusNoContent)
 	})
 	mux := http.NewServeMux()
-	registerServeRoutes(mux, completionWorker, delegationWorker, a2a, gateway)
+	registerServeRoutes(mux, completionWorker, gateway)
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
@@ -170,56 +148,14 @@ func TestServeRoutesDelegationWorkerWebSocketWithWorkerAuth(t *testing.T) {
 		t.Fatalf("completion route = %d / %q", response.StatusCode, response.Header.Get("X-Human-Route"))
 	}
 
-	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + delegationworkerws.DefaultPath
-	connection, response, err := websocket.Dial(ctx, websocketURL, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + callerToken.Secret}},
-	})
-	if connection != nil {
-		connection.CloseNow()
-	}
-	if response != nil {
-		defer response.Body.Close()
-	}
-	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("caller delegation-worker dial response = %#v, error = %v", response, err)
-	}
-
-	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	connection, _, err = websocket.Dial(dialCtx, websocketURL, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + workerToken.Secret}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.CloseNow()
-	var helloEnvelope workerproto.Envelope
-	if err := wsjson.Read(dialCtx, connection, &helloEnvelope); err != nil {
-		t.Fatal(err)
-	}
-	if helloEnvelope.Type != workerproto.MessageHello {
-		t.Fatalf("first delegation message = %q", helloEnvelope.Type)
-	}
-	var hello workerproto.Hello
-	if err := json.Unmarshal(helloEnvelope.Payload, &hello); err != nil {
-		t.Fatal(err)
-	}
-	if hello.WorkerID != "route-worker" {
-		t.Fatalf("worker identity = %q", hello.WorkerID)
-	}
-	var snapshotEnvelope workerproto.Envelope
-	if err := wsjson.Read(dialCtx, connection, &snapshotEnvelope); err != nil {
-		t.Fatal(err)
-	}
-	if snapshotEnvelope.Type != workerproto.MessageSnapshot {
-		t.Fatalf("second delegation message = %q", snapshotEnvelope.Type)
-	}
-	var snapshot workerproto.Snapshot
-	if err := json.Unmarshal(snapshotEnvelope.Payload, &snapshot); err != nil {
-		t.Fatal(err)
-	}
-	if err := snapshot.Validate(); err != nil || snapshot.Snapshot.Task.ID != "route-task" ||
-		snapshot.Reason != workerproto.ReasonRecovery {
-		t.Fatalf("delegation snapshot = %#v, error = %v", snapshot, err)
+	for _, path := range []string{"/v1/chat/completions", "/v1/messages", "/v1/responses"} {
+		response, err = http.Get(server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusNoContent || response.Header.Get("X-Human-Route") != "gateway" {
+			t.Fatalf("gateway route %q = %d / %q", path, response.StatusCode, response.Header.Get("X-Human-Route"))
+		}
 	}
 }

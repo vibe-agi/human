@@ -373,7 +373,7 @@ func TestOpenAIStreamPersistsAndFlushesHeartbeatBeforeFinal(t *testing.T) {
 	}
 }
 
-// TestOptInGatewaySoak provides the reproducible gateway half of the P1-M0
+// TestOptInGatewaySoak provides the reproducible gateway half of the M0
 // 10m/2h gate. It is intentionally opt-in because the decisive run must still
 // use a frozen real harness outside this process. Example:
 // HUMAN_GATEWAY_SOAK=2h go test -timeout=2h5m ./internal/completion/gateway -run TestOptInGatewaySoak

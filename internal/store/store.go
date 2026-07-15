@@ -1,5 +1,5 @@
-// Package store defines persistence contracts shared by the completion and
-// delegation modes. Domain state-transition rules stay in their mode package.
+// Package store defines persistence contracts for completion requests.
+// Domain state-transition rules stay in the completion package.
 package store
 
 import (

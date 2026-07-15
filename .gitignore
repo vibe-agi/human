@@ -1,14 +1,10 @@
-# TLC 运行产物
-formal/states/
-formal/Mutant*
-formal/tla2tools.jar
+# 临时备份
 *.old
 
 # 构建产物
 /bin/
 /humand
 /human
-/human-mcp
 
 # 本地环境
 .human/

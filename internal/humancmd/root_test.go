@@ -6,6 +6,14 @@ import (
 	"testing"
 )
 
+func TestCommandExposesCompletionFlowOnly(t *testing.T) {
+	t.Parallel()
+	subcommands := New().Commands()
+	if len(subcommands) != 1 || subcommands[0].Name() != "shim" {
+		t.Fatalf("subcommands = %v; want only shim", subcommands)
+	}
+}
+
 func TestWorkerMirrorRootDefaultsToDocumentedLocation(t *testing.T) {
 	t.Parallel()
 	command := New()

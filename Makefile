@@ -1,4 +1,4 @@
-.PHONY: all build test fmt vet formal check
+.PHONY: all build test fmt vet check
 
 all: check
 
@@ -13,8 +13,5 @@ fmt:
 
 vet:
 	go vet ./...
-
-formal:
-	./formal/run-checks.sh
 
 check: build test vet
