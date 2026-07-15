@@ -1,0 +1,14 @@
+# TLC 运行产物
+formal/states/
+formal/Mutant*
+formal/tla2tools.jar
+*.old
+
+# 构建产物
+/bin/
+humand
+human
+
+# 本地环境
+.human/
+*.db
