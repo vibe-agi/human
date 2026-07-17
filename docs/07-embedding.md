@@ -1,0 +1,73 @@
+# Go 库嵌入
+
+Human Agent 的进程形态不是封闭产品边界。`human local`、`human gateway`、`human worker` 是官方 CLI 装配；同一套能力也通过三个 public Go package 暴露，宿主可以保留自己的 listener、身份系统、路由、终端布局与进程生命周期。
+
+## 三个 public package
+
+| package | 宿主获得什么 | 宿主仍负责什么 |
+|---|---|---|
+| `local` | loopback listener、gateway、SQLite、worker 与官方 TUI 的一体化实例 | 把 `BaseURL()` 和 `CallerToken()` 直接交给进程内 Agent 客户端；如需跨重启复用明文凭据，负责加密或 mode `0600` 的持久化 |
+| `gateway` | completion 状态机、SQLite 恢复、模型 HTTP handler、worker WebSocket handler、内建 token 或自定义认证入口 | listener、路由前缀、TLS、反向代理、HTTP 超时、身份验证、secret 管理和优雅关闭 |
+| `worker` | WebSocket 重连、durable outbox、worker state、Live Workspace mirror 与可运行/可组合的 Bubble Tea model | worker credential 的安全取得与保存、mirror 路径、外层终端程序和关闭时机 |
+
+`local.Open` 适合桌面应用把“人 = LLM”直接放进本机进程。最小示例见 [`examples/embed-local`](../examples/embed-local/main.go)：它使用 `local.DefaultConfig()`，因此数据库、outbox 和 TUI state 位于 OS 用户私有数据目录并按真实 workspace 隔离，不会默认写进客户仓库。示例只打印 loopback base URL，绝不打印 caller/worker token；宿主应把 `CallerToken()` 在内存中直接注入自己的 Agent 客户端。下面的 `go run` 命令用于源码 checkout；二进制归档中的 examples 是可复制到宿主 Go module 的参考源码。
+
+```sh
+go run ./examples/embed-local
+```
+
+`worker.Open` 可以单独连接远程 gateway。`Run` 启动官方 TUI；`Model` 返回 `tea.Model`，可以作为更大 Bubble Tea 应用的一部分。一个 `Worker` 同时只允许一个 Tea program，结束后可再次 `Run`；退出时必须调用 `Close`，让网络恢复循环、outbox 和 state store 有确定终点。
+
+## 嵌入自有 Gateway
+
+[`examples/embed-gateway`](../examples/embed-gateway/main.go) 展示完整装配：
+
+1. 以 `gateway.DefaultConfig()` 为基线，选择宿主控制的绝对 SQLite 路径。
+2. 注入 `Authenticator` 和 `WorkerRouter`。
+3. 将 `ModelHandler()` 与 `WorkerHandler()` 分别挂到宿主 mux。
+4. 先停止 HTTP listener，再取消 gateway context、调用 `gateway.Close()`，确保活跃处理与 SQLite 关闭不竞态。
+
+```sh
+# 默认写入 OS 用户配置目录下的示例专用 SQLite；也可显式给绝对路径。
+HUMAN_EMBED_GATEWAY_DB=/absolute/private/path/gateway.db \
+  go run ./examples/embed-gateway
+```
+
+`gateway.Open` 自己不监听端口。`ModelHandler()` 处理 `/healthz`、`/v1/models`、`/v1/chat/completions`、`/v1/messages` 与 `/v1/responses`；如果挂到前缀下，宿主需要像示例一样在进入 handler 前移除前缀。`WorkerHandler()` 是独立 WebSocket handler，可挂到宿主选择的私有路径。若直接使用 `Server` 作为 `http.Handler`，内建路径是 `/internal/v1/worker/ws`。
+
+### 身份扩展点
+
+`Authenticator` 每次收到完整的 `*http.Request`，可从宿主已经验证的 Cookie、JWT、mTLS 证书或 request context 返回：
+
+- `PrincipalCaller`：只能调用模型端点；
+- `PrincipalWorker`：只能建立 worker WebSocket；
+- `SubjectID`：业务主体的稳定 opaque ID；
+- `KeyID`：可选但建议提供的稳定 credential/session ID，用于限流与审计维度。
+
+`SubjectID` 和非空 `KeyID` 必须满足 `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`。邮箱、组织路径等复杂或可变标识应先在宿主身份层映射成稳定 opaque ID，而不是直接进入协议正确性命名空间。
+
+示例里的 `X-Example-*` header **不是认证协议，也不能直接用于生产**。它只演示“受信反向代理已完成认证，然后把结果交给 embedder”的代码形状；marker header 和 loopback 检查都不能证明请求可信。生产系统必须同时做到：外部请求无法直达 Human handler；入口先删除所有客户端自带身份 header；代理到应用这一跳用 mTLS、签名或等价机制验证；只有验证成功后才把身份写入 request context 或受保护 header。若这些条件不成立，应在 `Authenticator` 内直接验证 JWT/session/mTLS，不能信任 header。
+
+设置自定义 `Authenticator` 后，`Issue`、`PrepareToken`、`ActivateToken` 与 `Revoke` 会返回 `ErrBuiltInAuthDisabled`。这是有意的：一个 gateway 只能有一套身份真相。未设置自定义认证时，可以使用 gateway 的内建高熵 token；宿主仍负责只在签发时安全保存明文，数据库只保留 hash。
+
+### 路由扩展点
+
+`WorkerRouter` 只在**新任务准入**时运行。输入包含已经认证的 caller、model、capability tier，以及 workspace、task、idempotency、harness/session、root 与 exec opt-in 等解码后的正确性身份。返回值必须是目标 worker 已认证 `Principal.SubjectID` 的精确值。
+
+路由结果会随任务持久化；continuation、幂等重放和崩溃恢复继续使用原 owner，不会再次路由到另一位专家。因此 tenant 隔离、专家池选择、区域/技能策略都应在首次路由时做出确定决定：
+
+- 返回 `gateway.ErrWorkerRouteDenied` 表示策略拒绝，调用方得到有限的 `403`；
+- 返回其它 error 表示路由基础设施失败，gateway fail-closed；
+- 返回一个当前离线的 worker subject 不会悄悄回退到别人；
+- 返回空字符串才显式请求 gateway 的确定性默认 worker。
+
+## 生命周期与数据责任
+
+公共库不会替宿主隐式接管进程资源：
+
+- `gateway.Server` 不拥有 listener。先停止接收 HTTP，再调用 `Close`；同一个 SQLite 文件不能被多个 gateway 实例当作集群共享存储。
+- `local.Local` 拥有自己的 loopback listener、gateway 与 worker，`Close` 是幂等的；一个实例一次只能运行一个 TUI。
+- `worker.Worker` 拥有网络客户端、outbox 与可选 state store；一个实例一次只能运行一个 TUI。
+- TLS 终止、代理信任、HTTP/server 超时、secret persistence、备份与数据库文件权限最终都是宿主责任。默认路径是安全起点，不会替代部署审计。
+
+当前公开持久层只支持 SQLite 单实例。内部 store interface 不是稳定 driver API；不要通过复制内部 package 假装获得 PostgreSQL/MySQL/Redis 支持。需要多实例或自有数据库时，应在公开 driver contract 明确后再扩展，或让多个业务入口共享一个独立 `human gateway`。

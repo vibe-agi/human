@@ -20,6 +20,17 @@ import (
 	completiongateway "github.com/vibe-agi/human/internal/completion/gateway"
 )
 
+func TestPublicGatewayRequiresExplicitDatabaseIdentity(t *testing.T) {
+	t.Parallel()
+	config := DefaultConfig()
+	if config.DatabasePath != "" {
+		t.Fatalf("public default selected shared database %q", config.DatabasePath)
+	}
+	if _, err := Open(context.Background(), config); err == nil || !strings.Contains(err.Error(), "database path is required") {
+		t.Fatalf("open without explicit database error = %v", err)
+	}
+}
+
 func TestCustomCookieAuthenticationAndPrincipalBoundaries(t *testing.T) {
 	t.Parallel()
 	config := DefaultConfig()
@@ -435,7 +446,7 @@ func TestWorkerWireBudgetIsUnifiedAndBounded(t *testing.T) {
 	t.Parallel()
 	const smaller int64 = 1 << 20
 
-	fromGateway, err := (Config{MaxWorkerMessageBytes: smaller}).withDefaults()
+	fromGateway, err := (Config{DatabasePath: ":memory:", MaxWorkerMessageBytes: smaller}).withDefaults()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +456,7 @@ func TestWorkerWireBudgetIsUnifiedAndBounded(t *testing.T) {
 			fromGateway.MaxWorkerMessageBytes, fromGateway.Worker.ReadLimit, smaller,
 		)
 	}
-	fromTransport, err := (Config{Worker: WorkerTransportConfig{ReadLimit: smaller}}).withDefaults()
+	fromTransport, err := (Config{DatabasePath: ":memory:", Worker: WorkerTransportConfig{ReadLimit: smaller}}).withDefaults()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,14 +509,14 @@ func TestWorkerWireBudgetIsUnifiedAndBounded(t *testing.T) {
 
 func TestStreamWriteTimeoutDefaultsAndRejectsNegativeDuration(t *testing.T) {
 	t.Parallel()
-	configured, err := (Config{}).withDefaults()
+	configured, err := (Config{DatabasePath: ":memory:"}).withDefaults()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if configured.StreamWriteTimeout != 10*time.Second {
 		t.Fatalf("stream write timeout = %v, want 10s", configured.StreamWriteTimeout)
 	}
-	if _, err := (Config{StreamWriteTimeout: -time.Second}).withDefaults(); err == nil ||
+	if _, err := (Config{DatabasePath: ":memory:", StreamWriteTimeout: -time.Second}).withDefaults(); err == nil ||
 		!strings.Contains(err.Error(), "stream write timeout must be positive") {
 		t.Fatalf("negative stream write timeout error = %v", err)
 	}

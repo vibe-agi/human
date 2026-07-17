@@ -161,6 +161,31 @@ func TestReconnectNotificationClearsStaleConnectionError(t *testing.T) {
 	}
 }
 
+func TestOutboxQuarantineIsPersistentVisibleWarningWithoutDisconnect(t *testing.T) {
+	t.Parallel()
+	model := New(newFakeClient())
+	updated, command := model.Update(networkMessage{OutboxQuarantine: &workerclient.OutboxQuarantine{
+		Count: 2, EventIDs: []string{"event-one", "event-two"}, Path: "/private/worker-outbox.db",
+	}})
+	model = updated.(Model)
+	if command == nil {
+		t.Fatal("quarantine notice stopped network subscription")
+	}
+	if model.connection != connectionConnected {
+		t.Fatalf("quarantine notice changed connection state: %v", model.connection)
+	}
+	visible := model.visibleStatus()
+	for _, fragment := range []string{"2 corrupt worker outbox event", "event-one", "/private/worker-outbox.db", "healthy events continue"} {
+		if !strings.Contains(visible, fragment) {
+			t.Fatalf("visible quarantine warning %q lacks %q", visible, fragment)
+		}
+	}
+	model.status = "ready"
+	if !strings.Contains(model.visibleStatus(), "corrupt worker outbox") {
+		t.Fatal("ordinary status update erased the persistent quarantine warning")
+	}
+}
+
 func TestWorkerTokenConflictWaitsForIncumbentWithoutBecomingTerminal(t *testing.T) {
 	t.Parallel()
 	client := newFakeClient()

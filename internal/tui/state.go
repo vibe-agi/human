@@ -580,7 +580,7 @@ func sortedStateKeys(records map[stateRecordKey]json.RawMessage) []stateRecordKe
 }
 
 func (model Model) visibleStatus() string {
-	parts := make([]string, 0, 3)
+	parts := make([]string, 0, 4)
 	if model.status != "" {
 		parts = append(parts, model.status)
 	}
@@ -589,6 +589,9 @@ func (model Model) visibleStatus() string {
 	}
 	if model.stateWriteWarning != "" {
 		parts = append(parts, model.stateWriteWarning)
+	}
+	if model.outboxWarning != "" {
+		parts = append(parts, model.outboxWarning)
 	}
 	if len(parts) == 0 {
 		return "ready"

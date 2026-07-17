@@ -3,12 +3,11 @@ package callershim
 import (
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
-	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
+
+	"github.com/vibe-agi/human/internal/sqlitefile"
 )
 
 // ledgerOwnerLock makes the process boundary used by recoverPending real.
@@ -26,8 +25,8 @@ var localLedgerOwners = struct {
 	paths map[string]struct{}
 }{paths: make(map[string]struct{})}
 
-func acquireLedgerOwnerLock(dsn string) (*ledgerOwnerLock, error) {
-	lockPath, fileBacked, err := ledgerOwnerLockPath(dsn)
+func acquireLedgerOwnerLock(location sqlitefile.Location) (*ledgerOwnerLock, error) {
+	lockPath, fileBacked, err := ledgerOwnerLockPath(location)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +70,8 @@ func acquireLedgerOwnerLock(dsn string) (*ledgerOwnerLock, error) {
 	}
 	if info, err := file.Stat(); err != nil {
 		return nil, fmt.Errorf("inspect opened caller ledger owner lock %s: %w", lockPath, err)
-	} else if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	} else if !info.Mode().IsRegular() ||
+		(runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
 		return nil, fmt.Errorf("caller ledger owner lock %s is not a private regular file", lockPath)
 	}
 	if err := lockLedgerOwnerFile(file); err != nil {
@@ -102,62 +102,12 @@ func releaseLocalLedgerOwner(path string) {
 	localLedgerOwners.Unlock()
 }
 
-func ledgerOwnerLockPath(dsn string) (string, bool, error) {
-	dsn = strings.TrimSpace(dsn)
-	if dsn == ":memory:" {
+func ledgerOwnerLockPath(location sqlitefile.Location) (string, bool, error) {
+	if location.SharedMemory {
+		return "", false, errors.New("shared in-memory caller ledgers are unsupported; use an independent :memory: database or a file-backed ledger")
+	}
+	if !location.FileBacked {
 		return "", false, nil
 	}
-
-	databasePath := dsn
-	if strings.HasPrefix(strings.ToLower(dsn), "file:") {
-		parsed, err := url.Parse(dsn)
-		if err != nil {
-			return "", false, fmt.Errorf("parse caller ledger SQLite URI: %w", err)
-		}
-		query := parsed.Query()
-		memoryMode := strings.EqualFold(query.Get("mode"), "memory")
-		if strings.EqualFold(query.Get("cache"), "shared") &&
-			(memoryMode || parsed.Opaque == ":memory:" || parsed.Path == ":memory:") {
-			return "", false, errors.New("shared in-memory caller ledgers are unsupported; use an independent :memory: database or a file-backed ledger")
-		}
-		if memoryMode || parsed.Opaque == ":memory:" || parsed.Path == ":memory:" {
-			return "", false, nil
-		}
-		if parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost") {
-			return "", false, fmt.Errorf("caller ledger SQLite URI has unsupported host %q", parsed.Host)
-		}
-		switch {
-		case parsed.Opaque != "":
-			databasePath, err = url.PathUnescape(parsed.Opaque)
-			if err != nil {
-				return "", false, fmt.Errorf("decode caller ledger SQLite URI path: %w", err)
-			}
-		case parsed.Path != "":
-			databasePath = parsed.Path
-		default:
-			return "", false, errors.New("file-backed caller ledger SQLite URI requires a path")
-		}
-		databasePath = filepath.FromSlash(databasePath)
-		if runtime.GOOS == "windows" && len(databasePath) >= 3 &&
-			databasePath[0] == filepath.Separator && databasePath[2] == ':' {
-			databasePath = databasePath[1:]
-		}
-	}
-
-	absolute, err := filepath.Abs(databasePath)
-	if err != nil {
-		return "", false, fmt.Errorf("resolve caller ledger path for owner lock: %w", err)
-	}
-	if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
-		absolute = resolved
-	} else if !errors.Is(resolveErr, os.ErrNotExist) {
-		return "", false, fmt.Errorf("resolve caller ledger path for owner lock: %w", resolveErr)
-	} else {
-		resolvedParent, parentErr := filepath.EvalSymlinks(filepath.Dir(absolute))
-		if parentErr != nil {
-			return "", false, fmt.Errorf("resolve caller ledger directory for owner lock: %w", parentErr)
-		}
-		absolute = filepath.Join(resolvedParent, filepath.Base(absolute))
-	}
-	return absolute + ".owner.lock", true, nil
+	return location.Path + ".owner.lock", true, nil
 }

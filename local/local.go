@@ -19,6 +19,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/vibe-agi/human/gateway"
+	"github.com/vibe-agi/human/internal/userdata"
 	"github.com/vibe-agi/human/worker"
 )
 
@@ -78,15 +79,37 @@ type Credentials struct {
 	NewlyIssued bool
 }
 
-// DefaultConfig returns local desktop defaults. The returned worker paths are
-// absolute paths below the current user's home directory.
+// DefaultConfig returns local desktop defaults. Private databases are absolute
+// paths in OS user data, scoped by the real nearest Git workspace (or the real
+// current directory when no Git root exists), so opening Local cannot create
+// state inside a customer checkout implicitly.
 func DefaultConfig() (Config, error) {
 	workerConfig, err := worker.DefaultConfig()
 	if err != nil {
 		return Config{}, err
 	}
+	workspaceRoot, err := userdata.ResolveGitWorkspace(".")
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve default local workspace: %w", err)
+	}
+	gatewayPath, err := userdata.WorkspacePath("local", workspaceRoot, "gateway.db")
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve default local gateway path: %w", err)
+	}
+	outboxPath, err := userdata.WorkspacePath("local", workspaceRoot, "worker-outbox.db")
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve default local worker outbox path: %w", err)
+	}
+	statePath, err := userdata.WorkspacePath("local", workspaceRoot, "worker-state.db")
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve default local worker state path: %w", err)
+	}
+	gatewayConfig := gateway.DefaultConfig()
+	gatewayConfig.DatabasePath = gatewayPath
+	workerConfig.OutboxPath = outboxPath
+	workerConfig.StatePath = statePath
 	return Config{
-		Gateway:         gateway.DefaultConfig(),
+		Gateway:         gatewayConfig,
 		Worker:          workerConfig,
 		ListenAddress:   DefaultListenAddress,
 		CallerSubject:   defaultCallerSubject,
@@ -114,6 +137,9 @@ func (config Config) withDefaults() (Config, error) {
 	}
 	if config.ShutdownTimeout < 0 {
 		return Config{}, errors.New("open local: shutdown timeout must be positive")
+	}
+	if strings.TrimSpace(config.Gateway.DatabasePath) == "" {
+		config.Gateway.DatabasePath = defaults.Gateway.DatabasePath
 	}
 	if strings.TrimSpace(config.Worker.MirrorRoot) == "" {
 		config.Worker.MirrorRoot = defaults.Worker.MirrorRoot

@@ -194,10 +194,10 @@ type Config struct {
 	DatabasePath string
 	Models       []string
 
-	QueueCapacity          int
-	MaxBodyBytes           int64
-	MaxWorkerMessageBytes  int64
-	HeartbeatInterval      time.Duration
+	QueueCapacity         int
+	MaxBodyBytes          int64
+	MaxWorkerMessageBytes int64
+	HeartbeatInterval     time.Duration
 	// StreamWriteTimeout bounds one SSE write plus flush. It is reset after
 	// every successful emission and never acts as a whole-stream timeout.
 	StreamWriteTimeout     time.Duration
@@ -221,11 +221,13 @@ type Config struct {
 	Logger       *slog.Logger
 }
 
-// DefaultConfig returns the local single-instance defaults used by the
-// standalone gateway.
+// DefaultConfig returns protocol and runtime defaults for one gateway.
+// DatabasePath is deliberately empty: an embedder must choose its persistence
+// identity explicitly instead of accidentally sharing a process-global user
+// database with an unrelated embedded gateway. The standalone and local CLI
+// compositions supply their own private OS user-data paths.
 func DefaultConfig() Config {
 	return Config{
-		DatabasePath:          filepath.Join(".human", "human.db"),
 		Models:                []string{"human-expert"},
 		QueueCapacity:         32,
 		MaxBodyBytes:          workerproto.MaxWireMessageBytes,
@@ -265,7 +267,7 @@ func (config Config) withDefaults() (Config, error) {
 		config.Worker.ReadLimit = config.MaxWorkerMessageBytes
 	}
 	if strings.TrimSpace(config.DatabasePath) == "" {
-		config.DatabasePath = defaults.DatabasePath
+		return Config{}, errors.New("gateway database path is required; embedders must choose an explicit persistence identity")
 	}
 	if len(config.Models) == 0 {
 		config.Models = defaults.Models

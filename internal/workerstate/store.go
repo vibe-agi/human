@@ -11,11 +11,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/vibe-agi/human/internal/completion"
+	"github.com/vibe-agi/human/internal/sqlitefile"
 	_ "modernc.org/sqlite"
 )
 
@@ -119,19 +121,22 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, errors.New("worker state path is required")
 	}
 
-	databasePath := path
 	if path != ":memory:" {
 		absolute, err := filepath.Abs(path)
 		if err != nil {
 			return nil, fmt.Errorf("resolve worker state path: %w", err)
 		}
-		databasePath = absolute
-		if err := preparePrivateFile(databasePath); err != nil {
+		path = absolute
+		if err := preparePrivateDirectory(path); err != nil {
 			return nil, err
 		}
 	}
+	location, err := sqlitefile.PreparePrivate(path, "worker state database")
+	if err != nil {
+		return nil, err
+	}
 
-	database, err := sql.Open("sqlite", databasePath)
+	database, err := sql.Open("sqlite", location.OpenDSN())
 	if err != nil {
 		return nil, fmt.Errorf("open worker state: %w", err)
 	}
@@ -352,7 +357,7 @@ func (store *Store) ready(ctx context.Context) error {
 	return nil
 }
 
-func preparePrivateFile(path string) error {
+func preparePrivateDirectory(path string) error {
 	directory := filepath.Dir(path)
 	info, err := os.Stat(directory)
 	switch {
@@ -367,19 +372,8 @@ func preparePrivateFile(path string) error {
 		return fmt.Errorf("inspect worker state directory: %w", err)
 	case !info.IsDir():
 		return errors.New("worker state parent is not a directory")
-	case info.Mode().Perm() != 0o700:
+	case runtime.GOOS != "windows" && info.Mode().Perm() != 0o700:
 		return fmt.Errorf("worker state directory must have mode 0700 (got %04o)", info.Mode().Perm())
-	}
-
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return fmt.Errorf("create worker state database: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close worker state database file: %w", err)
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("secure worker state database: %w", err)
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package humancmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/vibe-agi/human/gateway"
+	"github.com/vibe-agi/human/internal/userdata"
 	localruntime "github.com/vibe-agi/human/local"
 	"github.com/vibe-agi/human/worker"
 )
@@ -57,11 +59,11 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 	}
 	flags := command.Flags()
 	flags.String("listen", "127.0.0.1:19080", "loopback model API listen address")
-	flags.String("db", ".human/human.db", "embedded SQLite database path")
+	flags.String("db", automaticPrivatePath, "embedded SQLite database; auto uses OS user data isolated by workspace")
 	flags.String("mirror-root", "~/mirror", "worker-local workspace mirror root")
 	flags.Bool("workspace-auto-send", false, "send clean mirror changes after live detection and fresh review")
-	flags.String("outbox", "~/.human/worker-outbox.db", "private SQLite outbox for unacknowledged worker events")
-	flags.String("state-db", "~/.human/worker-state.db", "private SQLite TUI recovery state; empty disables persistence")
+	flags.String("outbox", automaticPrivatePath, "private SQLite outbox; auto uses OS user data isolated by workspace")
+	flags.String("state-db", automaticPrivatePath, "private SQLite TUI recovery state; auto uses OS user data, empty disables persistence")
 	flags.String("caller-subject", "local-caller", "stable local caller identity")
 	flags.String("worker-subject", "local-worker", "stable local worker identity")
 	flags.Int("queue-capacity", 32, "maximum admitted and active requests")
@@ -69,7 +71,8 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 	flags.Duration("max-pending", 10*time.Minute, "maximum time waiting for a Human response")
 	flags.Duration("shutdown-timeout", 10*time.Second, "graceful local shutdown timeout")
 	flags.Bool("reset-credentials", false, "rotate the persisted local caller and worker credentials")
-	command.PersistentFlags().String("credentials", ".human/local-credentials.json", "mode-0600 local credential file")
+	command.PersistentFlags().String("workspace", ".", "workspace used to isolate local private state; nearest Git root is selected")
+	command.PersistentFlags().String("credentials", automaticPrivatePath, "mode-0600 credential file; auto uses OS user data isolated by workspace")
 
 	for key, name := range map[string]string{
 		"local.listen": "listen", "local.db": "db", "local.mirror_root": "mirror-root",
@@ -83,10 +86,17 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 		mustBind(settings, key, flags.Lookup(name))
 	}
 	mustBind(settings, "local.credentials", command.PersistentFlags().Lookup("credentials"))
+	mustBind(settings, "local.workspace", command.PersistentFlags().Lookup("workspace"))
 	credentialsCommand := &cobra.Command{
 		Use: "credentials", Short: "print the local caller credential as JSON",
 		RunE: func(command *cobra.Command, _ []string) error {
-			path, err := resolvePrivatePath(settings.GetString("local.credentials"), "local credential file")
+			workspaceRoot, err := resolveLocalWorkspace(settings.GetString("local.workspace"))
+			if err != nil {
+				return err
+			}
+			path, err := resolveWorkspaceDataPath(
+				settings.GetString("local.credentials"), "local credential file", "local", workspaceRoot, "credentials.json",
+			)
 			if err != nil {
 				return err
 			}
@@ -115,11 +125,19 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 }
 
 func runLocal(ctx context.Context, output io.Writer, settings *viper.Viper) error {
-	databasePath, err := resolvePrivatePath(settings.GetString("local.db"), "local database")
+	workspaceRoot, err := resolveLocalWorkspace(settings.GetString("local.workspace"))
 	if err != nil {
 		return err
 	}
-	credentialPath, err := resolvePrivatePath(settings.GetString("local.credentials"), "local credential file")
+	databasePath, err := resolveWorkspaceDataPath(
+		settings.GetString("local.db"), "local database", "local", workspaceRoot, "gateway.db",
+	)
+	if err != nil {
+		return err
+	}
+	credentialPath, err := resolveWorkspaceDataPath(
+		settings.GetString("local.credentials"), "local credential file", "local", workspaceRoot, "credentials.json",
+	)
 	if err != nil {
 		return err
 	}
@@ -127,11 +145,18 @@ func runLocal(ctx context.Context, output io.Writer, settings *viper.Viper) erro
 	if err != nil {
 		return err
 	}
-	outboxPath, err := resolvePrivatePath(settings.GetString("local.outbox"), "local worker outbox")
+	outboxPath, err := resolveWorkspaceDataPath(
+		settings.GetString("local.outbox"), "local worker outbox", "local", workspaceRoot, "worker-outbox.db",
+	)
 	if err != nil {
 		return err
 	}
-	statePath, err := resolveOptionalPrivatePath(settings.GetString("local.state_db"), "local worker state database")
+	statePath := ""
+	if strings.TrimSpace(settings.GetString("local.state_db")) != "" {
+		statePath, err = resolveWorkspaceDataPath(
+			settings.GetString("local.state_db"), "local worker state database", "local", workspaceRoot, "worker-state.db",
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -192,22 +217,38 @@ func runLocal(ctx context.Context, output io.Writer, settings *viper.Viper) erro
 	}
 	defer instance.Close()
 
-	fmt.Fprintf(output, "Human local is ready\nmodel base URL: %s/v1\ncaller credential: %s\n", instance.BaseURL(), credentialPath)
-	fmt.Fprintln(output, "in the Agent terminal: export HUMAN_CALLER_TOKEN=\"$(human local credentials --token-only)\"")
+	fmt.Fprintf(output, "Human local is ready\nworkspace scope: %s\nmodel base URL: %s/v1\ncaller credential: %s\n", workspaceRoot, instance.BaseURL(), credentialPath)
+	fmt.Fprintln(output, "in the same workspace: export HUMAN_CALLER_TOKEN=\"$(human local credentials --workspace . --token-only)\"")
 	_, err = instance.Run(ctx)
 	return err
 }
 
+func resolveLocalWorkspace(value string) (string, error) {
+	absolute, err := resolvePrivatePath(value, "local workspace")
+	if err != nil {
+		return "", err
+	}
+	workspace, err := userdata.ResolveGitWorkspace(absolute)
+	if err != nil {
+		return "", fmt.Errorf("resolve local workspace: %w", err)
+	}
+	return workspace, nil
+}
+
 func readLocalCredentials(path string) (localCredentialFile, bool, error) {
-	info, err := os.Stat(path)
+	const maxCredentialBytes = 64 << 10
+	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return localCredentialFile{}, false, nil
 	}
 	if err != nil {
 		return localCredentialFile{}, false, fmt.Errorf("inspect local credentials: %w", err)
 	}
-	if !info.Mode().IsRegular() {
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return localCredentialFile{}, false, errors.New("local credential path is not a regular file")
+	}
+	if info.Size() > maxCredentialBytes {
+		return localCredentialFile{}, false, errors.New("local credential file exceeds the 64 KiB limit")
 	}
 	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		return localCredentialFile{}, false, fmt.Errorf("local credential file %s must not be accessible by group or others", path)
@@ -217,7 +258,24 @@ func readLocalCredentials(path string) (localCredentialFile, bool, error) {
 		return localCredentialFile{}, false, fmt.Errorf("open local credentials: %w", err)
 	}
 	defer file.Close()
-	decoder := json.NewDecoder(io.LimitReader(file, 64<<10))
+	opened, err := file.Stat()
+	if err != nil {
+		return localCredentialFile{}, false, fmt.Errorf("inspect opened local credentials: %w", err)
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return localCredentialFile{}, false, errors.New("local credential file changed while opening")
+	}
+	if runtime.GOOS != "windows" && opened.Mode().Perm()&0o077 != 0 {
+		return localCredentialFile{}, false, fmt.Errorf("local credential file %s must not be accessible by group or others", path)
+	}
+	payload, err := io.ReadAll(io.LimitReader(file, maxCredentialBytes+1))
+	if err != nil {
+		return localCredentialFile{}, false, fmt.Errorf("read local credentials: %w", err)
+	}
+	if len(payload) > maxCredentialBytes {
+		return localCredentialFile{}, false, errors.New("local credential file exceeds the 64 KiB limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	var credentials localCredentialFile
 	if err := decoder.Decode(&credentials); err != nil {

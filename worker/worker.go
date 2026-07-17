@@ -14,6 +14,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/vibe-agi/human/internal/tui"
+	"github.com/vibe-agi/human/internal/userdata"
 	"github.com/vibe-agi/human/internal/workerclient"
 	"github.com/vibe-agi/human/internal/workerstate"
 )
@@ -32,18 +33,27 @@ type Config struct {
 	WorkspaceAutoSend bool
 }
 
-// DefaultConfig returns private per-user paths suitable for a desktop worker.
-// Token remains empty and must be supplied by the embedding application.
+// DefaultConfig returns private OS user-data paths suitable for a desktop
+// worker. Token remains empty and must be supplied by the embedding
+// application; the editable mirror remains ~/mirror by product convention.
 func DefaultConfig() (Config, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return Config{}, fmt.Errorf("resolve worker home: %w", err)
 	}
+	outboxPath, err := userdata.Path("worker", "worker-outbox.db")
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve worker outbox path: %w", err)
+	}
+	statePath, err := userdata.Path("worker", "worker-state.db")
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve worker state path: %w", err)
+	}
 	return Config{
 		GatewayURL: DefaultWorkerEndpoint,
 		MirrorRoot: filepath.Join(home, "mirror"),
-		OutboxPath: filepath.Join(home, ".human", "worker-outbox.db"),
-		StatePath:  filepath.Join(home, ".human", "worker-state.db"),
+		OutboxPath: outboxPath,
+		StatePath:  statePath,
 	}, nil
 }
 

@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/spf13/viper"
+	"github.com/vibe-agi/human/internal/userdata"
 )
 
 func TestCommandExposesWorkerAndShim(t *testing.T) {
@@ -16,8 +19,8 @@ func TestCommandExposesWorkerAndShim(t *testing.T) {
 	for _, command := range subcommands {
 		names = append(names, command.Name())
 	}
-	if len(names) != 5 || names[0] != "gateway" || names[1] != "local" || names[2] != "shim" || names[3] != "version" || names[4] != "worker" {
-		t.Fatalf("subcommands = %v; want gateway, local, shim, version, and worker", names)
+	if strings.Join(names, ",") != "doctor,gateway,init,local,shim,version,worker" {
+		t.Fatalf("subcommands = %v; want doctor, gateway, init, local, shim, version, and worker", names)
 	}
 }
 
@@ -45,7 +48,7 @@ func TestTopLevelHelpContainsOnlyProductCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	help := output.String()
-	for _, name := range []string{"gateway", "local", "shim", "version", "worker"} {
+	for _, name := range []string{"doctor", "gateway", "init", "local", "shim", "version", "worker"} {
 		if !strings.Contains(help, "  "+name) {
 			t.Fatalf("top-level help omitted %q:\n%s", name, help)
 		}
@@ -61,15 +64,19 @@ func TestWorkerSubcommandHasStandaloneFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"gateway", "token", "mirror-root", "workspace-auto-send", "outbox", "state-db"} {
+	for _, name := range []string{"gateway", "token-file", "mirror-root", "workspace-auto-send", "outbox", "state-db"} {
 		if worker.Flags().Lookup(name) == nil {
 			t.Fatalf("worker flag %q is missing", name)
 		}
 	}
+	if worker.Flags().Lookup("token") != nil {
+		t.Fatal("worker exposes a plaintext token argv flag")
+	}
 }
 
 func TestWorkerSubcommandBindsUsableDefaults(t *testing.T) {
-	t.Parallel()
+	withoutEnvironment(t, "HUMAN_GATEWAY_TOKEN")
+	withoutEnvironment(t, "HUMAN_GATEWAY_TOKEN_FILE")
 	command := New()
 	worker, _, err := command.Find([]string{"worker"})
 	if err != nil {
@@ -78,8 +85,8 @@ func TestWorkerSubcommandBindsUsableDefaults(t *testing.T) {
 	for name, want := range map[string]string{
 		"gateway":     "ws://127.0.0.1:8080/internal/v1/worker/ws",
 		"mirror-root": "~/mirror",
-		"outbox":      "~/.human/worker-outbox.db",
-		"state-db":    "~/.human/worker-state.db",
+		"outbox":      automaticPrivatePath,
+		"state-db":    automaticPrivatePath,
 	} {
 		flag := worker.Flags().Lookup(name)
 		if flag == nil || flag.DefValue != want {
@@ -90,7 +97,7 @@ func TestWorkerSubcommandBindsUsableDefaults(t *testing.T) {
 	// missing token must therefore be the first validation error, rather than a
 	// false missing-default error for gateway or private paths.
 	worker.SetContext(context.Background())
-	if err := worker.RunE(worker, nil); err == nil || err.Error() != "worker token is required" {
+	if err := worker.RunE(worker, nil); err == nil || !strings.Contains(err.Error(), "HUMAN_GATEWAY_TOKEN") {
 		t.Fatalf("worker default validation error = %v", err)
 	}
 }
@@ -104,7 +111,7 @@ func TestLocalSubcommandRunsEmbeddedStackDirectly(t *testing.T) {
 	if local.RunE == nil {
 		t.Fatal("local has no direct RunE")
 	}
-	for _, name := range []string{"listen", "db", "credentials", "mirror-root", "workspace-auto-send", "stream-write-timeout"} {
+	for _, name := range []string{"listen", "db", "credentials", "workspace", "mirror-root", "workspace-auto-send", "stream-write-timeout"} {
 		if local.Flag(name) == nil {
 			t.Fatalf("local flag %q is missing", name)
 		}
@@ -157,19 +164,19 @@ func TestWorkerOutboxDefaultsToPrivateStateDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	flag := command.Flags().Lookup("outbox")
-	if flag == nil || flag.DefValue != "~/.human/worker-outbox.db" {
+	if flag == nil || flag.DefValue != automaticPrivatePath {
 		t.Fatalf("outbox flag = %+v", flag)
 	}
-	home, err := os.UserHomeDir()
+	resolved, err := resolveUserDataPath(flag.DefValue, "worker outbox", "worker", "worker-outbox.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := resolvePrivatePath(flag.DefValue, "worker outbox")
+	want, err := userdata.Path("worker", "worker-outbox.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved != filepath.Join(home, ".human", "worker-outbox.db") {
-		t.Fatalf("resolved outbox = %q", resolved)
+	if resolved != want {
+		t.Fatalf("resolved outbox = %q, want %q", resolved, want)
 	}
 }
 
@@ -180,22 +187,52 @@ func TestWorkerStateDBDefaultsToPrivateStateDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	flag := command.Flags().Lookup("state-db")
-	if flag == nil || flag.DefValue != "~/.human/worker-state.db" {
+	if flag == nil || flag.DefValue != automaticPrivatePath {
 		t.Fatalf("state-db flag = %+v", flag)
 	}
 	if flag.Usage == "" {
 		t.Fatal("state-db flag has no usage text")
 	}
-	home, err := os.UserHomeDir()
+	resolved, err := resolveOptionalUserDataPath(flag.DefValue, "worker state database", "worker", "worker-state.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := resolveOptionalPrivatePath(flag.DefValue, "worker state database")
+	want, err := userdata.Path("worker", "worker-state.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved != filepath.Join(home, ".human", "worker-state.db") {
-		t.Fatalf("resolved state database = %q", resolved)
+	if resolved != want {
+		t.Fatalf("resolved state database = %q, want %q", resolved, want)
+	}
+}
+
+func TestLocalAutomaticPrivatePathsUseRealGitWorkspaceScope(t *testing.T) {
+	t.Parallel()
+	project := filepath.Join(t.TempDir(), "project")
+	nested := filepath.Join(project, "nested")
+	if err := os.MkdirAll(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := resolveLocalWorkspace(nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveWorkspaceDataPath(automaticPrivatePath, "local database", "local", workspace, "gateway.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := userdata.WorkspacePath("local", workspace, "gateway.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("local database = %q, want %q", got, want)
+	}
+	if strings.HasPrefix(got, project+string(filepath.Separator)) {
+		t.Fatalf("automatic local database leaked into customer workspace: %q", got)
 	}
 }
 
@@ -212,27 +249,12 @@ func TestWorkerStateDBCanBeDisabled(t *testing.T) {
 	if flag == nil || !flag.Changed || flag.Value.String() != "" {
 		t.Fatalf("state-db disable flag = %+v", flag)
 	}
-	resolved, err := resolveOptionalPrivatePath(flag.Value.String(), "worker state database")
+	resolved, err := resolveOptionalUserDataPath(flag.Value.String(), "worker state database", "worker", "worker-state.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resolved != "" {
 		t.Fatalf("disabled state database resolved to %q", resolved)
-	}
-}
-
-func TestVersion(t *testing.T) {
-	t.Parallel()
-	command := New()
-	var output bytes.Buffer
-	command.SetOut(&output)
-	command.SetErr(&output)
-	command.SetArgs([]string{"version"})
-	if err := command.ExecuteContext(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if output.String() != "0.1.0-dev\n" {
-		t.Fatalf("version output = %q", output.String())
 	}
 }
 
@@ -256,9 +278,26 @@ func TestRootConfigReachesGatewayAdministration(t *testing.T) {
 	}
 }
 
+func TestConfigDoesNotAutoLoadFromUntrustedWorkingDirectory(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "human.yaml"), []byte(
+		"gateway:\n  url: wss://attacker.example/worker\n  token_file: /private/secret\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(directory)
+	settings := viper.New()
+	if err := loadConfig(settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings.GetString("gateway.url") != "" || settings.GetString("gateway.token_file") != "" {
+		t.Fatalf("working-directory config was loaded: %+v", settings.AllSettings())
+	}
+}
+
 func TestResolveOptionalPrivatePathValidatesEnabledPath(t *testing.T) {
 	t.Parallel()
-	if _, err := resolveOptionalPrivatePath("~someone/worker-state.db", "worker state database"); err == nil {
+	if _, err := resolveOptionalUserDataPath("~someone/worker-state.db", "worker state database", "worker", "worker-state.db"); err == nil {
 		t.Fatal("expected ambiguous user expansion to be rejected")
 	}
 }

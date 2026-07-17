@@ -13,8 +13,11 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"github.com/vibe-agi/human/internal/gatewaycmd"
+	"github.com/vibe-agi/human/internal/userdata"
 	workerlib "github.com/vibe-agi/human/worker"
 )
+
+const automaticPrivatePath = "auto"
 
 func New() *cobra.Command {
 	settings := viper.New()
@@ -37,52 +40,49 @@ func New() *cobra.Command {
 	}
 	addWorkerFlags(workerCommand.Flags())
 	for key, name := range map[string]string{
-		"gateway.url": "gateway", "gateway.token": "token",
+		"gateway.url": "gateway", "gateway.token_file": "token-file",
 		"workspace.mirror_root": "mirror-root", "workspace.auto_send": "workspace-auto-send",
 		"worker.outbox": "outbox", "worker.state_db": "state-db",
 	} {
 		mustBind(settings, key, workerCommand.Flags().Lookup(name))
 	}
 	command.AddCommand(workerCommand)
+	command.AddCommand(newDoctorCommand())
 	command.AddCommand(gatewaycmd.NewGatewayCommand())
+	command.AddCommand(newInitCommand())
 	command.AddCommand(newLocalCommand(settings))
 	command.AddCommand(newShimCommand(settings))
-	command.AddCommand(&cobra.Command{
-		Use: "version", Short: "print version",
-		Run: func(command *cobra.Command, _ []string) {
-			fmt.Fprintln(command.OutOrStdout(), gatewaycmd.Version)
-		},
-	})
+	command.AddCommand(newVersionCommand())
 	return command
 }
 
 func addWorkerFlags(flags *pflag.FlagSet) {
 	flags.String("gateway", "ws://127.0.0.1:8080/internal/v1/worker/ws", "gateway worker WebSocket URL")
-	flags.String("token", "", "worker token")
+	flags.String("token-file", "", "private file containing the worker token (or set HUMAN_GATEWAY_TOKEN)")
 	flags.String("mirror-root", "~/mirror", "worker-local workspace mirror root")
 	flags.Bool("workspace-auto-send", false, "send clean mirror changes after live detection and fresh review")
-	flags.String("outbox", "~/.human/worker-outbox.db", "private SQLite outbox for unacknowledged worker events")
-	flags.String("state-db", "~/.human/worker-state.db", "private SQLite TUI recovery state; empty disables persistence")
+	flags.String("outbox", automaticPrivatePath, "private SQLite outbox; auto uses the OS user-data directory")
+	flags.String("state-db", automaticPrivatePath, "private SQLite TUI recovery state; auto uses OS user data, empty disables persistence")
 }
 
 func run(ctx context.Context, settings *viper.Viper) error {
 	url := strings.TrimSpace(settings.GetString("gateway.url"))
-	token := strings.TrimSpace(settings.GetString("gateway.token"))
 	if url == "" {
 		return errors.New("gateway URL is required")
 	}
-	if token == "" {
-		return errors.New("worker token is required")
+	token, err := resolveSecret("HUMAN_GATEWAY_TOKEN", settings.GetString("gateway.token_file"), "worker token")
+	if err != nil {
+		return err
 	}
 	mirrorRoot, err := resolveMirrorRoot(settings.GetString("workspace.mirror_root"))
 	if err != nil {
 		return err
 	}
-	outboxPath, err := resolvePrivatePath(settings.GetString("worker.outbox"), "worker outbox")
+	outboxPath, err := resolveUserDataPath(settings.GetString("worker.outbox"), "worker outbox", "worker", "worker-outbox.db")
 	if err != nil {
 		return err
 	}
-	statePath, err := resolveOptionalPrivatePath(settings.GetString("worker.state_db"), "worker state database")
+	statePath, err := resolveOptionalUserDataPath(settings.GetString("worker.state_db"), "worker state database", "worker", "worker-state.db")
 	if err != nil {
 		return err
 	}
@@ -103,11 +103,33 @@ func resolveMirrorRoot(value string) (string, error) {
 	return resolvePrivatePath(value, "workspace mirror root")
 }
 
-func resolveOptionalPrivatePath(value, description string) (string, error) {
+func resolveUserDataPath(value, description string, elements ...string) (string, error) {
+	if strings.TrimSpace(value) != automaticPrivatePath {
+		return resolvePrivatePath(value, description)
+	}
+	path, err := userdata.Path(elements...)
+	if err != nil {
+		return "", fmt.Errorf("resolve automatic %s: %w", description, err)
+	}
+	return path, nil
+}
+
+func resolveOptionalUserDataPath(value, description string, elements ...string) (string, error) {
 	if strings.TrimSpace(value) == "" {
 		return "", nil
 	}
-	return resolvePrivatePath(value, description)
+	return resolveUserDataPath(value, description, elements...)
+}
+
+func resolveWorkspaceDataPath(value, description, component, realWorkspace string, elements ...string) (string, error) {
+	if strings.TrimSpace(value) != automaticPrivatePath {
+		return resolvePrivatePath(value, description)
+	}
+	path, err := userdata.WorkspacePath(component, realWorkspace, elements...)
+	if err != nil {
+		return "", fmt.Errorf("resolve automatic %s: %w", description, err)
+	}
+	return path, nil
 }
 
 func resolvePrivatePath(value, description string) (string, error) {
@@ -140,17 +162,10 @@ func loadConfig(settings *viper.Viper) error {
 		settings.SetConfigFile(configFile)
 		return settings.ReadInConfig()
 	}
-	settings.SetConfigName("human")
-	settings.AddConfigPath(".")
-	if home, err := os.UserHomeDir(); err == nil {
-		settings.AddConfigPath(filepath.Join(home, ".human"))
-	}
-	if err := settings.ReadInConfig(); err != nil {
-		var notFound viper.ConfigFileNotFoundError
-		if !errors.As(err, &notFound) {
-			return err
-		}
-	}
+	// Never auto-load configuration from the current directory. Human is meant
+	// to be launched inside untrusted customer workspaces; a checked-in
+	// human.yaml must not be able to redirect a token file or bearer-authenticated
+	// endpoint. Configuration files are therefore explicit-only.
 	return nil
 }
 

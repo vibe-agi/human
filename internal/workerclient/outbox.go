@@ -11,10 +11,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/vibe-agi/human/internal/completion"
+	"github.com/vibe-agi/human/internal/sqlitefile"
 	"github.com/vibe-agi/human/internal/workerproto"
 	_ "modernc.org/sqlite"
 )
@@ -26,6 +28,10 @@ var (
 	errRejectedUnknown         = errors.New("worker rejected event is not durable locally")
 	errRejectedNotSent         = errors.New("worker rejected event was not sent on this connection")
 	errRejectedAckBehind       = errors.New("worker rejection ACK is behind the rejected event sequence")
+	// ErrEventQuarantined reports that an event ID belongs to a corrupt durable
+	// record which was isolated from delivery. The raw record remains available
+	// for operator inspection and the ID must not be reused implicitly.
+	ErrEventQuarantined = errors.New("worker event is quarantined after durable outbox corruption")
 	// ErrEventPreviouslyRejected reports that an exact event is already in the
 	// confirmed rejection tombstone, rather than the send outbox.
 	ErrEventPreviouslyRejected = errors.New("worker event was already rejected")
@@ -35,8 +41,8 @@ var (
 )
 
 const (
-	outboxSchemaVersion     = 1
-	outboxSchemaFingerprint = "human-worker-outbox-v1-20260717"
+	outboxSchemaVersion     = 2
+	outboxSchemaFingerprint = "human-worker-outbox-v2-20260717"
 )
 
 type outboxRecord struct {
@@ -58,9 +64,27 @@ type rejectedRecord struct {
 	RejectedAt    time.Time
 }
 
+// OutboxQuarantine is a payload-free operator notice. Corrupt raw rows are
+// retained in worker_outbox_quarantine, while healthy rows continue to send.
+// EventIDs is deliberately bounded and contains only durable opaque IDs.
+type OutboxQuarantine struct {
+	Count    int
+	EventIDs []string
+	Path     string
+}
+
+type rawOutboxRecord struct {
+	eventID    string
+	taskID     string
+	assignment []byte
+	payload    []byte
+	createdAt  int64
+}
+
 type durableOutbox struct {
 	db        *sql.DB
 	namespace string
+	path      string
 }
 
 func openDurableOutbox(ctx context.Context, path, endpoint, token string) (*durableOutbox, error) {
@@ -87,25 +111,19 @@ func openDurableOutbox(ctx context.Context, path, endpoint, token string) (*dura
 			return nil, fmt.Errorf("inspect worker outbox directory: %w", statErr)
 		case !directoryInfo.IsDir():
 			return nil, errors.New("worker outbox parent is not a directory")
-		case directoryInfo.Mode().Perm()&0o022 != 0:
+		case runtime.GOOS != "windows" && directoryInfo.Mode().Perm()&0o022 != 0:
 			return nil, errors.New("worker outbox directory must not be group- or world-writable")
 		}
 		// The outbox necessarily holds unacknowledged response text and tool
 		// calls. Keep the database private; SQLite inherits this mode for its
 		// transient rollback journal.
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-		if err != nil {
-			return nil, fmt.Errorf("create worker outbox database: %w", err)
-		}
-		if err := file.Close(); err != nil {
-			return nil, fmt.Errorf("close worker outbox database file: %w", err)
-		}
-		if err := os.Chmod(path, 0o600); err != nil {
-			return nil, fmt.Errorf("secure worker outbox database: %w", err)
-		}
+	}
+	location, err := sqlitefile.PreparePrivate(path, "worker outbox database")
+	if err != nil {
+		return nil, err
 	}
 
-	database, err := sql.Open("sqlite", path)
+	database, err := sql.Open("sqlite", location.OpenDSN())
 	if err != nil {
 		return nil, fmt.Errorf("open worker outbox: %w", err)
 	}
@@ -133,7 +151,7 @@ func openDurableOutbox(ctx context.Context, path, endpoint, token string) (*dura
 		  fingerprint TEXT NOT NULL
 		);
 		INSERT INTO worker_outbox_schema (component, version, fingerprint)
-		VALUES ('outbox', 1, 'human-worker-outbox-v1-20260717')
+		VALUES ('outbox', 2, 'human-worker-outbox-v2-20260717')
 		ON CONFLICT(component) DO NOTHING;
 		CREATE TABLE IF NOT EXISTS worker_outbox (
 		  namespace TEXT NOT NULL,
@@ -146,6 +164,19 @@ func openDurableOutbox(ctx context.Context, path, endpoint, token string) (*dura
 		);
 		CREATE INDEX IF NOT EXISTS worker_outbox_created
 		  ON worker_outbox(namespace, created_at, event_id);
+		CREATE TABLE IF NOT EXISTS worker_outbox_quarantine (
+		  namespace TEXT NOT NULL,
+		  event_id TEXT NOT NULL,
+		  task_id TEXT NOT NULL,
+		  assignment BLOB NOT NULL,
+		  payload BLOB NOT NULL,
+		  created_at INTEGER NOT NULL,
+		  quarantined_at INTEGER NOT NULL,
+		  reason TEXT NOT NULL,
+		  PRIMARY KEY (namespace, event_id)
+		);
+		CREATE INDEX IF NOT EXISTS worker_outbox_quarantine_created
+		  ON worker_outbox_quarantine(namespace, quarantined_at, event_id);
 		CREATE TABLE IF NOT EXISTS worker_rejected_inbox (
 		  inbox_seq INTEGER PRIMARY KEY AUTOINCREMENT,
 		  namespace TEXT NOT NULL,
@@ -173,7 +204,7 @@ func openDurableOutbox(ctx context.Context, path, endpoint, token string) (*dura
 		return nil, fmt.Errorf("initialize worker outbox: %w", err)
 	}
 	sum := sha256.Sum256([]byte(endpoint + "\x00" + token))
-	return &durableOutbox{db: database, namespace: hex.EncodeToString(sum[:])}, nil
+	return &durableOutbox{db: database, namespace: hex.EncodeToString(sum[:]), path: path}, nil
 }
 
 func requireCurrentOrEmptyOutboxSchema(ctx context.Context, database *sql.DB) error {
@@ -259,8 +290,19 @@ func (outbox *durableOutbox) Put(
 	case !errors.Is(err, sql.ErrNoRows):
 		return outboxRecord{}, fmt.Errorf("inspect worker outbox event: %w", err)
 	}
+	var quarantined int
 	err = tx.QueryRowContext(ctx, `
-		SELECT task_id, assignment, payload
+		SELECT 1
+		FROM worker_outbox_quarantine
+		WHERE namespace = ? AND event_id = ?`, outbox.namespace, event.ID).Scan(&quarantined)
+	switch {
+	case err == nil:
+		return outboxRecord{}, ErrEventQuarantined
+	case !errors.Is(err, sql.ErrNoRows):
+		return outboxRecord{}, fmt.Errorf("inspect quarantined worker event: %w", err)
+	}
+	err = tx.QueryRowContext(ctx, `
+			SELECT task_id, assignment, payload
 		FROM worker_rejected_inbox
 		WHERE namespace = ? AND event_id = ?`, outbox.namespace, event.ID).
 		Scan(&storedTask, &storedAssignment, &storedPayload)
@@ -326,32 +368,124 @@ func durableAssignmentSnapshot(assignment completion.Assignment) completion.Assi
 
 func (outbox *durableOutbox) List(ctx context.Context) ([]outboxRecord, error) {
 	rows, err := outbox.db.QueryContext(ctx, `
-		SELECT event_id, task_id, assignment, payload, created_at
+			SELECT event_id, task_id, assignment, payload, created_at
 		FROM worker_outbox
 		WHERE namespace = ?
 		ORDER BY created_at, event_id`, outbox.namespace)
 	if err != nil {
 		return nil, fmt.Errorf("list worker outbox events: %w", err)
 	}
-	defer rows.Close()
-	var records []outboxRecord
+	var rawRecords []rawOutboxRecord
 	for rows.Next() {
-		var record outboxRecord
-		var assignment []byte
-		var payload []byte
-		var createdAt int64
-		if err := rows.Scan(&record.EventID, &record.TaskID, &assignment, &payload, &createdAt); err != nil {
+		var record rawOutboxRecord
+		if err := rows.Scan(
+			&record.eventID, &record.taskID, &record.assignment, &record.payload, &record.createdAt,
+		); err != nil {
+			_ = rows.Close()
 			return nil, fmt.Errorf("scan worker outbox event: %w", err)
 		}
-		if err := decodeOutboxRecord(&record, assignment, payload, createdAt); err != nil {
-			return nil, err
+		rawRecords = append(rawRecords, record)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("iterate worker outbox events: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close worker outbox rows: %w", err)
+	}
+
+	// Decode only after closing the query. The outbox intentionally uses one
+	// SQLite connection, so trying to move a corrupt row while rows is open would
+	// deadlock behind that same connection. Every move below is one transaction:
+	// a crash leaves the row either sendable or quarantined, never silently gone.
+	records := make([]outboxRecord, 0, len(rawRecords))
+	for _, raw := range rawRecords {
+		record := outboxRecord{EventID: raw.eventID, TaskID: raw.taskID}
+		if err := decodeOutboxRecord(
+			&record, raw.assignment, raw.payload, raw.createdAt,
+		); err != nil {
+			if quarantineErr := outbox.quarantine(ctx, raw, err); quarantineErr != nil {
+				return records, quarantineErr
+			}
+			continue
 		}
 		records = append(records, record)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate worker outbox events: %w", err)
-	}
 	return records, nil
+}
+
+func (outbox *durableOutbox) quarantine(
+	ctx context.Context,
+	record rawOutboxRecord,
+	decodeErr error,
+) error {
+	tx, err := outbox.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin worker outbox quarantine: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO worker_outbox_quarantine (
+		  namespace, event_id, task_id, assignment, payload,
+		  created_at, quarantined_at, reason
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		outbox.namespace, record.eventID, record.taskID, record.assignment, record.payload,
+		record.createdAt, time.Now().UTC().UnixNano(), decodeErr.Error(),
+	); err != nil {
+		return fmt.Errorf("preserve corrupt worker outbox event %q: %w", record.eventID, err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		DELETE FROM worker_outbox
+		WHERE namespace = ? AND event_id = ?`, outbox.namespace, record.eventID)
+	if err != nil {
+		return fmt.Errorf("isolate corrupt worker outbox event %q: %w", record.eventID, err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("verify corrupt worker outbox isolation %q: %w", record.eventID, err)
+	}
+	if deleted != 1 {
+		return fmt.Errorf("isolate corrupt worker outbox event %q: durable row changed concurrently", record.eventID)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit worker outbox quarantine %q: %w", record.eventID, err)
+	}
+	return nil
+}
+
+func (outbox *durableOutbox) QuarantineSummary(ctx context.Context) (OutboxQuarantine, error) {
+	var summary OutboxQuarantine
+	summary.Path = outbox.path
+	if err := outbox.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM worker_outbox_quarantine
+		WHERE namespace = ?`, outbox.namespace).Scan(&summary.Count); err != nil {
+		return OutboxQuarantine{}, fmt.Errorf("count quarantined worker outbox events: %w", err)
+	}
+	if summary.Count == 0 {
+		return summary, nil
+	}
+	rows, err := outbox.db.QueryContext(ctx, `
+		SELECT event_id
+		FROM worker_outbox_quarantine
+		WHERE namespace = ?
+		ORDER BY quarantined_at, event_id
+		LIMIT 8`, outbox.namespace)
+	if err != nil {
+		return OutboxQuarantine{}, fmt.Errorf("list quarantined worker outbox events: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var eventID string
+		if err := rows.Scan(&eventID); err != nil {
+			return OutboxQuarantine{}, fmt.Errorf("scan quarantined worker outbox event: %w", err)
+		}
+		summary.EventIDs = append(summary.EventIDs, eventID)
+	}
+	if err := rows.Err(); err != nil {
+		return OutboxQuarantine{}, fmt.Errorf("iterate quarantined worker outbox events: %w", err)
+	}
+	return summary, nil
 }
 
 // Lookup returns the exact payload while an event remains in the send outbox.

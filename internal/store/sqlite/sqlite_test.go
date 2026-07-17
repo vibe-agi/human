@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -26,6 +28,59 @@ func openTestStore(t *testing.T) *Store {
 		}
 	})
 	return db
+}
+
+func TestOpenUsesPrivateFileWithoutChangingCallerDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows file modes are ACL-backed")
+	}
+	parent := filepath.Join(t.TempDir(), "caller-owned")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name      string
+		precreate bool
+	}{
+		{name: "new"},
+		{name: "existing broad permissions", precreate: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(parent, test.name+".db")
+			if test.precreate {
+				if err := os.WriteFile(path, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store, err := Open(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			assertFileMode(t, path, 0o600)
+			assertFileMode(t, parent, 0o755)
+		})
+	}
+}
+
+func assertFileMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("%s mode = %04o, want %04o", path, got, want)
+	}
 }
 
 func TestOpenRejectsUnversionedSchema(t *testing.T) {

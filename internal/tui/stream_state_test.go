@@ -64,6 +64,47 @@ func TestAcceptAndRejectOutboxFailuresKeepInboxAssignment(t *testing.T) {
 	}
 }
 
+func TestTerminalEventCommitClearsStaleBusyStatusWithQueuedInbox(t *testing.T) {
+	t.Parallel()
+	client := newFakeClient()
+	first := testAssignment()
+	model := updateModel(t, New(client), networkMessage{Assignment: &first})
+
+	var accept tea.Cmd
+	model, accept = updateModelWithCommand(t, model, press("a", 'a'))
+	model = finishCommand(t, model, accept)
+	if model.active == nil {
+		t.Fatal("first request was not accepted")
+	}
+	model.setReplyValue("auxiliary complete")
+	updated, final := model.finishConversation()
+	model = updated.(Model)
+	if final == nil || model.pending.kind != pendingReply || model.active != nil {
+		t.Fatalf("final response was not staged: %+v", model)
+	}
+
+	second := testAssignment()
+	second.TaskID = "task-next"
+	second.IdempotencyKey = "request-next"
+	model = updateModel(t, model, networkMessage{Assignment: &second})
+	if len(model.assignments) != 1 {
+		t.Fatalf("next request was not queued while final committed: %+v", model)
+	}
+	model, blocked := updateModelWithCommand(t, model, press("a", 'a'))
+	if blocked != nil || !strings.Contains(model.status, "still being committed") {
+		t.Fatalf("accept was not safely blocked during final commit: command=%v model=%+v", blocked, model)
+	}
+
+	model = finishCommand(t, model, final)
+	if model.responseInFlight() || !strings.Contains(model.status, "1 request(s) waiting in Inbox") {
+		t.Fatalf("final acknowledgement left a stale busy state: %+v", model)
+	}
+	model, accept = updateModelWithCommand(t, model, press("a", 'a'))
+	if accept == nil || model.pending.kind != pendingAccept {
+		t.Fatalf("queued request remained unresponsive after final commit: %+v", model)
+	}
+}
+
 func TestRemoteHandoffOnlyAutoAcceptsExactStableIdentity(t *testing.T) {
 	t.Run("matching identity", func(t *testing.T) {
 		client := newFakeClient()

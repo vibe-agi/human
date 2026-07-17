@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vibe-agi/human/internal/sqlitefile"
 	_ "modernc.org/sqlite"
 )
 
@@ -93,7 +94,11 @@ func OpenSQLiteLedger(ctx context.Context, dsn string) (*SQLiteLedger, error) {
 	if strings.TrimSpace(dsn) == "" {
 		return nil, errors.New("caller ledger dsn is required")
 	}
-	ownerLock, err := acquireLedgerOwnerLock(dsn)
+	location, err := sqlitefile.PreparePrivate(dsn, "caller tool ledger")
+	if err != nil {
+		return nil, err
+	}
+	ownerLock, err := acquireLedgerOwnerLock(location)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +108,7 @@ func OpenSQLiteLedger(ctx context.Context, dsn string) (*SQLiteLedger, error) {
 			_ = ownerLock.Close()
 		}
 	}()
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", location.OpenDSN())
 	if err != nil {
 		return nil, err
 	}

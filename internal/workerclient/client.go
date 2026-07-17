@@ -6,10 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	neturl "net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +18,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/completion/canonical"
+	"github.com/vibe-agi/human/internal/userdata"
 	"github.com/vibe-agi/human/internal/workerproto"
 )
 
@@ -110,43 +110,45 @@ type Message struct {
 	RejectedEvent      *completion.Event
 	RejectedAssignment *completion.Assignment
 	RejectedTaskID     string
+	OutboxQuarantine   *OutboxQuarantine
 	ConnectionRestored bool
 	Err                error
 }
 
 type Client struct {
-	connection         *websocket.Conn
-	cancel             context.CancelFunc
-	messages           chan Message
-	writeMu            sync.Mutex
-	clientSeq          uint64
-	serverSeq          atomic.Uint64
-	inflight           map[string]uint64
-	workerMu           sync.RWMutex
-	workerID           string
-	closing            atomic.Bool
-	closeOnce          sync.Once
-	wait               sync.WaitGroup
-	done               chan struct{}
-	wake               chan struct{}
-	rejectedWake       chan struct{}
-	rejectedGeneration atomic.Uint64
-	url                string
-	token              string
-	instanceID         string
-	outbox             *durableOutbox
-	runtime            clientRuntimeConfig
-	closeErr           error
+	connection          *websocket.Conn
+	cancel              context.CancelFunc
+	messages            chan Message
+	writeMu             sync.Mutex
+	clientSeq           uint64
+	serverSeq           atomic.Uint64
+	inflight            map[string]uint64
+	workerMu            sync.RWMutex
+	workerID            string
+	closing             atomic.Bool
+	closeOnce           sync.Once
+	wait                sync.WaitGroup
+	done                chan struct{}
+	wake                chan struct{}
+	rejectedWake        chan struct{}
+	rejectedGeneration  atomic.Uint64
+	quarantineSignature string
+	url                 string
+	token               string
+	instanceID          string
+	outbox              *durableOutbox
+	runtime             clientRuntimeConfig
+	closeErr            error
 }
 
 // Dial uses the private default outbox. Call DialWithOutbox when embedding the
 // client or when the path comes from explicit configuration.
 func Dial(ctx context.Context, url, token string) (*Client, error) {
-	home, err := os.UserHomeDir()
+	outboxPath, err := userdata.Path("worker", "worker-outbox.db")
 	if err != nil {
-		return nil, fmt.Errorf("resolve worker outbox home: %w", err)
+		return nil, fmt.Errorf("resolve worker outbox path: %w", err)
 	}
-	return DialWithOutbox(ctx, url, token, filepath.Join(home, ".human", "worker-outbox.db"))
+	return DialWithOutbox(ctx, url, token, outboxPath)
 }
 
 // DialWithOutbox binds a worker to a durable event outbox and starts its
@@ -247,7 +249,22 @@ func validateWorkerEndpoint(value string) error {
 	if parsed.Host == "" {
 		return errors.New("worker gateway URL requires a host")
 	}
+	if parsed.User != nil || parsed.Fragment != "" {
+		return errors.New("worker gateway URL must not contain credentials or a fragment")
+	}
+	if (parsed.Scheme == "ws" || parsed.Scheme == "http") && !workerEndpointLoopback(parsed.Hostname()) {
+		return errors.New("worker gateway URL must use wss or https for a non-loopback host")
+	}
 	return nil
+}
+
+func workerEndpointLoopback(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "localhost" {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
 }
 
 func (client *Client) Messages() <-chan Message {
@@ -700,6 +717,15 @@ func (client *Client) flush(ctx context.Context) error {
 			return err
 		}
 	}
+	quarantine, err := client.outbox.QuarantineSummary(ctx)
+	if err != nil {
+		return err
+	}
+	signature := fmt.Sprintf("%d\x00%s\x00%s", quarantine.Count, quarantine.Path, strings.Join(quarantine.EventIDs, "\x00"))
+	if quarantine.Count > 0 && signature != client.quarantineSignature {
+		client.quarantineSignature = signature
+		client.deliver(ctx, Message{OutboxQuarantine: &quarantine})
+	}
 	return nil
 }
 
@@ -806,7 +832,7 @@ func (client *Client) signalRejectedReplay(replayAll bool) {
 }
 
 func (client *Client) deliver(ctx context.Context, message Message) {
-	if message.Assignment != nil || message.EventRejected != nil {
+	if message.Assignment != nil || message.EventRejected != nil || message.OutboxQuarantine != nil {
 		// Assignments and per-event rejections are correctness-bearing: losing
 		// either leaves work leased to this worker or leaves the UI operating on
 		// a session the gateway has already closed. Apply backpressure instead of

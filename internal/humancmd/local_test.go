@@ -1,12 +1,14 @@
 package humancmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/vibe-agi/human/gateway"
@@ -59,6 +61,32 @@ func TestLocalCredentialsRejectBroadPermissionsAndUnknownFields(t *testing.T) {
 	}
 	if _, _, err := readLocalCredentials(path); err == nil {
 		t.Fatal("read accepted unknown credential fields")
+	}
+}
+
+func TestLocalCredentialsRejectSymlinkAndOversizedTrailingPayload(t *testing.T) {
+	directory := t.TempDir()
+	valid := `{"version":1,"active":{"caller":{"type":"caller","subject_id":"c","key_id":"ck","secret":"cs"},"worker":{"type":"worker","subject_id":"w","key_id":"wk","secret":"ws"}}}`
+	target := filepath.Join(directory, "target.json")
+	if err := os.WriteFile(target, []byte(valid), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(directory, "credentials-link.json")
+	if err := os.Symlink(target, link); err == nil {
+		if _, _, err := readLocalCredentials(link); err == nil {
+			t.Fatal("credential reader followed a symbolic link")
+		}
+	} else if runtime.GOOS != "windows" {
+		t.Fatal(err)
+	}
+
+	oversized := filepath.Join(directory, "oversized.json")
+	payload := append([]byte(valid), bytes.Repeat([]byte(" "), (64<<10)-len(valid)+1)...)
+	if err := os.WriteFile(oversized, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readLocalCredentials(oversized); err == nil || !strings.Contains(err.Error(), "64 KiB") {
+		t.Fatalf("oversized credential error = %v", err)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/completion/canonical"
+	"github.com/vibe-agi/human/internal/sqlitefile"
 	storeapi "github.com/vibe-agi/human/internal/store"
 	_ "modernc.org/sqlite"
 )
@@ -195,7 +196,11 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	if strings.TrimSpace(dsn) == "" {
 		return nil, errors.New("sqlite dsn is required")
 	}
-	db, err := sql.Open("sqlite", dsn)
+	location, err := sqlitefile.PreparePrivate(dsn, "gateway SQLite database")
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", location.OpenDSN())
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}

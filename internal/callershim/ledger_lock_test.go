@@ -3,11 +3,15 @@ package callershim
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/vibe-agi/human/internal/sqlitefile"
 )
 
 const (
@@ -43,7 +47,11 @@ func TestFileLedgerRejectsSecondOwnerBeforePendingRecovery(t *testing.T) {
 	if err != nil || !pending.Replay || pending.Execution.Status != "pending" {
 		t.Fatalf("live pending after rejected owner = %+v, %v", pending, err)
 	}
-	lockPath, fileBacked, err := ledgerOwnerLockPath(path)
+	location, err := sqlitefile.Resolve(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath, fileBacked, err := ledgerOwnerLockPath(location)
 	if err != nil || !fileBacked {
 		t.Fatalf("owner lock path = %q, %v, %v", lockPath, fileBacked, err)
 	}
@@ -68,6 +76,65 @@ func TestFileLedgerRejectsSecondOwnerBeforePendingRecovery(t *testing.T) {
 	recovered, err := reopened.Begin(context.Background(), key, "digest-lock")
 	if err != nil || !recovered.Replay || recovered.Execution.Status != "indeterminate" {
 		t.Fatalf("recovered previous-owner pending = %+v, %v", recovered, err)
+	}
+}
+
+func TestFileLedgerEncodedURIAndPlainPathShareOwnerLock(t *testing.T) {
+	for _, firstUsesURI := range []bool{false, true} {
+		name := "plain then URI"
+		if firstUsesURI {
+			name = "URI then plain"
+		}
+		t.Run(name, func(t *testing.T) {
+			directory := filepath.Join(t.TempDir(), "directory with spaces")
+			if err := os.Mkdir(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(directory, "ledger with spaces.db")
+			uriPath := filepath.ToSlash(path)
+			if runtime.GOOS == "windows" {
+				uriPath = "/" + uriPath
+			}
+			encodedURI := (&url.URL{Scheme: "file", Path: uriPath}).String()
+			firstDSN, secondDSN := path, encodedURI
+			if firstUsesURI {
+				firstDSN, secondDSN = encodedURI, path
+			}
+
+			first, err := OpenSQLiteLedger(context.Background(), firstDSN)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer first.Close()
+			second, err := OpenSQLiteLedger(context.Background(), secondDSN)
+			if second != nil {
+				_ = second.Close()
+				t.Fatal("URI alias opened a second owner for the same ledger")
+			}
+			if !errors.Is(err, ErrLedgerInUse) {
+				t.Fatalf("second alias error = %v, want owner-lock conflict", err)
+			}
+
+			plainLocation, err := sqlitefile.Resolve(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plainLock, plainBacked, err := ledgerOwnerLockPath(plainLocation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			uriLocation, err := sqlitefile.Resolve(encodedURI)
+			if err != nil {
+				t.Fatal(err)
+			}
+			uriLock, uriBacked, err := ledgerOwnerLockPath(uriLocation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !plainBacked || !uriBacked || plainLock != uriLock {
+				t.Fatalf("alias lock paths = (%q, %v) and (%q, %v)", plainLock, plainBacked, uriLock, uriBacked)
+			}
+		})
 	}
 }
 

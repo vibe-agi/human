@@ -4,6 +4,7 @@
 # 构建产物
 /bin/
 /human
+/dist/
 
 # 本地环境
 .human/

@@ -118,6 +118,103 @@ func TestDurableOutboxRejectsUnversionedSchema(t *testing.T) {
 	}
 }
 
+func TestDurableOutboxQuarantinesOneCorruptRowWithoutBlockingHealthyEvents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	outbox, err := openDurableOutbox(ctx, path, "ws://gateway", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	assignment := completion.Assignment{CallerID: "caller", TaskID: "task", IdempotencyKey: "request"}
+	for _, event := range []completion.Event{
+		{ID: "event-before", Type: completion.EventProgress, Text: "before"},
+		{ID: "event-corrupt", Type: completion.EventProgress, Text: "corrupt me"},
+		{ID: "event-after", Type: completion.EventFinal, Text: "after"},
+	} {
+		if _, err := outbox.Put(ctx, assignment, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := outbox.db.ExecContext(ctx, `
+		UPDATE worker_outbox
+		SET payload = x'7b'
+		WHERE namespace = ? AND event_id = 'event-corrupt'`, outbox.namespace); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := outbox.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].EventID != "event-before" || records[1].EventID != "event-after" {
+		t.Fatalf("healthy outbox records = %+v", records)
+	}
+	summary, err := outbox.QuarantineSummary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Count != 1 || len(summary.EventIDs) != 1 || summary.EventIDs[0] != "event-corrupt" || summary.Path != path {
+		t.Fatalf("quarantine summary = %+v", summary)
+	}
+	var rawPayload []byte
+	if err := outbox.db.QueryRowContext(ctx, `
+		SELECT payload
+		FROM worker_outbox_quarantine
+		WHERE namespace = ? AND event_id = 'event-corrupt'`, outbox.namespace).Scan(&rawPayload); err != nil {
+		t.Fatal(err)
+	}
+	if string(rawPayload) != "{" {
+		t.Fatalf("quarantined raw payload = %q", rawPayload)
+	}
+	if _, err := outbox.Put(ctx, assignment, completion.Event{
+		ID: "event-corrupt", Type: completion.EventProgress, Text: "do not reuse",
+	}); !errors.Is(err, ErrEventQuarantined) {
+		t.Fatalf("quarantined event reuse error = %v", err)
+	}
+}
+
+func TestClientFlushReportsPersistentOutboxQuarantineOnce(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	outbox, err := openDurableOutbox(ctx, filepath.Join(t.TempDir(), "outbox.db"), "ws://gateway", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	assignment := completion.Assignment{CallerID: "caller", TaskID: "task", IdempotencyKey: "request"}
+	event := completion.Event{ID: "event-corrupt", Type: completion.EventProgress, Text: "corrupt me"}
+	if _, err := outbox.Put(ctx, assignment, event); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outbox.db.ExecContext(ctx, `
+		UPDATE worker_outbox SET assignment = x'7b'
+		WHERE namespace = ? AND event_id = ?`, outbox.namespace, event.ID); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{outbox: outbox, messages: make(chan Message, 1)}
+	if err := client.flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case message := <-client.messages:
+		if message.OutboxQuarantine == nil || message.OutboxQuarantine.Count != 1 {
+			t.Fatalf("quarantine message = %+v", message)
+		}
+	default:
+		t.Fatal("flush did not surface quarantined outbox row")
+	}
+	if err := client.flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case message := <-client.messages:
+		t.Fatalf("unchanged quarantine was reported twice: %+v", message)
+	default:
+	}
+}
+
 func TestDurableOutboxEventIDIsIdempotentAndConflictSafe(t *testing.T) {
 	t.Parallel()
 	outbox, err := openDurableOutbox(context.Background(), filepath.Join(t.TempDir(), "outbox.db"), "ws://gateway", "token")

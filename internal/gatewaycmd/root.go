@@ -23,9 +23,10 @@ import (
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/ratelimit"
 	"github.com/vibe-agi/human/internal/store/sqlite"
+	"github.com/vibe-agi/human/internal/userdata"
 )
 
-const Version = "0.1.0-dev"
+const automaticDatabasePath = "auto"
 
 // NewGatewayCommand returns the `human gateway` standalone server and its
 // nested token administration commands.
@@ -44,7 +45,7 @@ func NewGatewayCommand() *cobra.Command {
 			return serve(command.Context(), settings)
 		},
 	}
-	command.PersistentFlags().String("db", ".human/human.db", "SQLite database path")
+	command.PersistentFlags().String("db", automaticDatabasePath, "SQLite database; auto uses the OS user-data directory")
 	mustBind(settings, "db", command.PersistentFlags().Lookup("db"))
 	addServeFlags(command, settings)
 	command.AddCommand(newTokenCommand(settings))
@@ -204,6 +205,17 @@ func openDatabase(ctx context.Context, path string) (*sqlite.Store, error) {
 }
 
 func resolveDatabasePath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", errors.New("gateway database path is required")
+	}
+	if path == automaticDatabasePath {
+		var err error
+		path, err = userdata.Path("gateway", "human.db")
+		if err != nil {
+			return "", fmt.Errorf("resolve automatic gateway database: %w", err)
+		}
+	}
 	if path != ":memory:" && !strings.HasPrefix(path, "file:") {
 		absolute, err := filepath.Abs(path)
 		if err != nil {
@@ -222,17 +234,9 @@ func loadConfig(settings *viper.Viper) error {
 		settings.SetConfigFile(configFile)
 		return settings.ReadInConfig()
 	}
-	settings.SetConfigName("human")
-	settings.AddConfigPath(".")
-	if home, err := os.UserHomeDir(); err == nil {
-		settings.AddConfigPath(filepath.Join(home, ".human"))
-	}
-	if err := settings.ReadInConfig(); err != nil {
-		var notFound viper.ConfigFileNotFoundError
-		if !errors.As(err, &notFound) {
-			return err
-		}
-	}
+	// Standalone gateway commands are commonly run from deployment checkouts.
+	// Treat those directories as untrusted input and load files only when the
+	// operator names one with --config.
 	return nil
 }
 

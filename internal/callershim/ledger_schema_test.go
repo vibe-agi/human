@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -49,6 +51,47 @@ func TestLedgerSchemaInitializesAndReopensCurrentDatabase(t *testing.T) {
 	}
 	if err := ledger.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLedgerUsesPrivateFileWithoutChangingCallerDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows file modes are ACL-backed")
+	}
+	parent := filepath.Join(t.TempDir(), "caller-owned")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "ledger.db")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ledger, err := OpenSQLiteLedger(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertCallerLedgerMode(t, path, 0o600)
+	assertCallerLedgerMode(t, parent, 0o755)
+}
+
+func assertCallerLedgerMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("%s mode = %04o, want %04o", path, got, want)
 	}
 }
 

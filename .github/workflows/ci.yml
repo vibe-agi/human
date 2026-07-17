@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  go:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,10 +17,31 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Format check
-        run: test -z "$(gofmt -l cmd internal)"
+        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
+      - name: Module graph check
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
       - name: Build
         run: go build ./...
       - name: Unit and integration tests
         run: go test -race -count=1 -timeout=5m ./...
       - name: Vet
         run: go vet ./...
+
+  portable-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build all packages
+        run: go build ./...
+      - name: Test platform-specific paths and process handling
+        run: go test -count=1 -timeout=5m ./...

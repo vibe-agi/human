@@ -15,7 +15,11 @@ import (
 
 func TestDialRejectsPermanentlyInvalidEndpointBeforeCreatingOutbox(t *testing.T) {
 	t.Parallel()
-	for _, endpoint := range []string{"127.0.0.1:19080", "ftp://127.0.0.1/worker", "ws:///worker"} {
+	for _, endpoint := range []string{
+		"127.0.0.1:19080", "ftp://127.0.0.1/worker", "ws:///worker",
+		"ws://gateway.example/worker", "http://192.0.2.10/worker",
+		"wss://user:secret@gateway.example/worker", "wss://gateway.example/worker#fragment",
+	} {
 		endpoint := endpoint
 		t.Run(endpoint, func(t *testing.T) {
 			t.Parallel()
@@ -34,6 +38,21 @@ func TestDialRejectsPermanentlyInvalidEndpointBeforeCreatingOutbox(t *testing.T)
 				t.Fatalf("invalid endpoint reached network dial: %v", err)
 			}
 		})
+	}
+}
+
+func TestWorkerEndpointAllowsPlaintextOnlyOnLoopback(t *testing.T) {
+	t.Parallel()
+	for _, endpoint := range []string{
+		"ws://localhost:19080/worker",
+		"http://127.0.0.1:19080/worker",
+		"ws://[::1]:19080/worker",
+		"wss://gateway.example/worker",
+		"https://gateway.example/worker",
+	} {
+		if err := validateWorkerEndpoint(endpoint); err != nil {
+			t.Fatalf("safe worker endpoint %q: %v", endpoint, err)
+		}
 	}
 }
 

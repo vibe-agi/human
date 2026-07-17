@@ -30,13 +30,13 @@ func newShimCommand(settings *viper.Viper) *cobra.Command {
 	flags := command.Flags()
 	flags.String("listen", "127.0.0.1:8181", "local shim listen address")
 	flags.String("upstream", "http://127.0.0.1:8080", "gateway model API base URL")
-	flags.String("caller-token", "", "gateway caller token")
-	flags.String("tool-token", "", "local tool endpoint bearer token")
+	flags.String("caller-token-file", "", "private file containing the gateway caller token (or set HUMAN_SHIM_CALLER_TOKEN)")
+	flags.String("tool-token-file", "", "private file containing the local tool bearer token (or set HUMAN_SHIM_TOOL_TOKEN)")
 	flags.String("caller-id", "", "stable caller id matching the gateway caller principal; retained across token rotation")
 	flags.String("workspace", ".", "caller workspace root")
 	flags.String("workspace-key", "", "stable caller workspace key")
 	flags.String("task-id", "", "stable task id; reuse it with the same ledger across shim restarts")
-	flags.String("ledger", ".human/caller-ledger.db", "durable caller tool ledger path")
+	flags.String("ledger", automaticPrivatePath, "durable caller tool ledger; auto uses OS user data isolated by real workspace")
 	flags.Bool("allow-exec", false, "enable bounded remote command tool calls for this task")
 	flags.Duration("exec-timeout", 30*time.Second, "default remote command timeout")
 	flags.Duration("exec-max-timeout", 5*time.Minute, "maximum remote command timeout")
@@ -44,8 +44,8 @@ func newShimCommand(settings *viper.Viper) *cobra.Command {
 	flags.Duration("shutdown-timeout", 10*time.Second, "graceful shutdown timeout")
 	mustBind(settings, "shim.listen", flags.Lookup("listen"))
 	mustBind(settings, "shim.upstream", flags.Lookup("upstream"))
-	mustBind(settings, "shim.caller_token", flags.Lookup("caller-token"))
-	mustBind(settings, "shim.tool_token", flags.Lookup("tool-token"))
+	mustBind(settings, "shim.caller_token_file", flags.Lookup("caller-token-file"))
+	mustBind(settings, "shim.tool_token_file", flags.Lookup("tool-token-file"))
 	mustBind(settings, "shim.caller_id", flags.Lookup("caller-id"))
 	mustBind(settings, "shim.workspace", flags.Lookup("workspace"))
 	mustBind(settings, "shim.workspace_key", flags.Lookup("workspace-key"))
@@ -60,21 +60,33 @@ func newShimCommand(settings *viper.Viper) *cobra.Command {
 }
 
 func runShim(ctx context.Context, settings *viper.Viper) error {
-	callerToken := strings.TrimSpace(settings.GetString("shim.caller_token"))
-	toolToken := strings.TrimSpace(settings.GetString("shim.tool_token"))
 	callerID := strings.TrimSpace(settings.GetString("shim.caller_id"))
 	workspaceKey := strings.TrimSpace(settings.GetString("shim.workspace_key"))
 	taskID := strings.TrimSpace(settings.GetString("shim.task_id"))
-	if callerToken == "" || toolToken == "" || callerID == "" || workspaceKey == "" || taskID == "" {
-		return errors.New("shim caller-token, tool-token, caller-id, workspace-key, and task-id are required")
+	if callerID == "" || workspaceKey == "" || taskID == "" {
+		return errors.New("shim caller-id, workspace-key, and task-id are required")
+	}
+	callerToken, err := resolveSecret(
+		"HUMAN_SHIM_CALLER_TOKEN", settings.GetString("shim.caller_token_file"), "shim caller token",
+	)
+	if err != nil {
+		return err
+	}
+	toolToken, err := resolveSecret(
+		"HUMAN_SHIM_TOOL_TOKEN", settings.GetString("shim.tool_token_file"), "shim tool token",
+	)
+	if err != nil {
+		return err
 	}
 	root, err := callerfs.OpenRoot(settings.GetString("shim.workspace"))
 	if err != nil {
 		return err
 	}
-	ledgerPath, err := filepath.Abs(settings.GetString("shim.ledger"))
+	ledgerPath, err := resolveWorkspaceDataPath(
+		settings.GetString("shim.ledger"), "caller ledger path", "shim", root.Path(), "caller-ledger.db",
+	)
 	if err != nil {
-		return fmt.Errorf("resolve caller ledger path: %w", err)
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(ledgerPath), 0o700); err != nil {
 		return fmt.Errorf("create caller ledger directory: %w", err)

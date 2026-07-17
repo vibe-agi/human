@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -56,6 +57,15 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if err != nil || gateway.Scheme == "" || gateway.Host == "" {
 		return nil, errors.New("absolute gateway URL is required")
 	}
+	if gateway.Scheme != "http" && gateway.Scheme != "https" {
+		return nil, errors.New("gateway URL must use http or https")
+	}
+	if gateway.Scheme == "http" && !gatewayHostLoopback(gateway.Hostname()) {
+		return nil, errors.New("gateway URL must use https for a non-loopback host")
+	}
+	if gateway.User != nil {
+		return nil, errors.New("gateway URL must not contain credentials")
+	}
 	if config.CallerToken == "" || config.ToolToken == "" || config.CallerID == "" ||
 		config.WorkspaceKey == "" || config.WorkspaceRoot == "" || config.TaskID == "" || config.Executor == nil {
 		return nil, errors.New("caller token, tool token, caller, workspace, task, root, and executor are required")
@@ -84,6 +94,15 @@ func NewServer(config ServerConfig) (*Server, error) {
 	mux.HandleFunc("POST /v1/responses", server.proxyCompletion)
 	server.handler = mux
 	return server, nil
+}
+
+func gatewayHostLoopback(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "localhost" {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
 }
 
 func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Request) {

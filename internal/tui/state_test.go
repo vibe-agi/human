@@ -154,6 +154,63 @@ func TestWorkerStateContinuationSurvivesRestart(t *testing.T) {
 	}
 }
 
+func TestWorkerStateRestoresMultipleParkedContinuationsAcrossRestart(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "worker.db")
+	store, err := workerstate.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := persistentRemoteAssignment("continuation-first-origin")
+	first.CallerID = "caller-first"
+	first.WorkspaceKey = "workspace-first"
+	first.TaskID = "task-first"
+	second := persistentRemoteAssignment("continuation-second-origin")
+	second.CallerID = "caller-second"
+	second.WorkspaceKey = "workspace-second"
+	second.TaskID = "task-second"
+
+	model := New(newFakeClient(), WithStateStore(store))
+	model.rememberContext(first)
+	model.expectContinuation(first, []completion.ToolCall{{ID: "tool-first", Name: "read"}})
+	model.rememberContext(second)
+	model.expectContinuation(second, []completion.ToolCall{{ID: "tool-second", Name: "read"}})
+	if len(model.parkedContinuations) != 1 || model.continueOrigin != second.SessionKey() {
+		t.Fatalf("continuations were not independently staged before restart: %+v", model)
+	}
+	model = flushWorkerState(t, model)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = workerstate.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	restarted := New(newFakeClient(), WithStateStore(store))
+	if len(restarted.parkedContinuations) != 1 ||
+		restarted.parkedContinuations[0].origin != first.SessionKey() ||
+		restarted.continueOrigin != second.SessionKey() {
+		t.Fatalf("restart did not recover every continuation: %+v", restarted)
+	}
+
+	firstResult := toolResultTurn(first, "continuation-first-result", "tool-first")
+	if !restarted.matchesContinuation(firstResult) || restarted.continueOrigin != first.SessionKey() ||
+		len(restarted.parkedContinuations) != 1 ||
+		restarted.parkedContinuations[0].origin != second.SessionKey() {
+		t.Fatalf("first recovered continuation did not resume independently: %+v", restarted)
+	}
+	restarted.clearContinuation()
+	secondResult := toolResultTurn(second, "continuation-second-result", "tool-second")
+	if !restarted.matchesContinuation(secondResult) || restarted.continueOrigin != second.SessionKey() ||
+		len(restarted.parkedContinuations) != 0 {
+		t.Fatalf("second recovered continuation was lost: %+v", restarted)
+	}
+}
+
 func TestWorkerStateRestoresFocusWithoutRestoringOldCommandAuthority(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

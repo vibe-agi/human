@@ -90,6 +90,7 @@ type Model struct {
 	stateRetryAttempt   int
 	stateLoadWarning    string
 	stateWriteWarning   string
+	outboxWarning       string
 }
 
 type connectionState int
@@ -337,6 +338,28 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 		return model, nil
 	case networkMessage:
 		model.invalidateChat()
+		if message.OutboxQuarantine != nil {
+			quarantine := message.OutboxQuarantine
+			identifiers := make([]string, 0, len(quarantine.EventIDs))
+			for _, identifier := range quarantine.EventIDs {
+				identifier = strings.ToValidUTF8(identifier, "�")
+				runes := []rune(identifier)
+				if len(runes) > 128 {
+					identifier = string(runes[:128]) + "…"
+				}
+				identifiers = append(identifiers, terminalSafe(identifier))
+			}
+			detail := fmt.Sprintf("%d corrupt worker outbox event(s) quarantined; healthy events continue", quarantine.Count)
+			if len(identifiers) > 0 {
+				detail += " · event IDs: " + strings.Join(identifiers, ", ")
+			}
+			if strings.TrimSpace(quarantine.Path) != "" {
+				detail += " · raw records retained in " + terminalSafe(quarantine.Path)
+			}
+			model.outboxWarning = detail
+			model.status = "worker outbox corruption isolated"
+			return model, waitForNetwork(model.client)
+		}
 		if message.Err != nil {
 			if errors.Is(message.Err, workerclient.ErrWorkerAlreadyConnected) {
 				model.connection = connectionReconnecting
@@ -928,10 +951,23 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 				model.status = "request rejected"
 			case pendingReply:
 				if model.active == nil {
+					if len(model.assignments) > 0 {
+						model.status = fmt.Sprintf(
+							"response event committed locally · %d request(s) waiting in Inbox",
+							len(model.assignments),
+						)
+					}
 					break
 				}
 				model.status = "stream open · continue replying or hand the turn to the Agent"
 				model.ui.chatFollow = true
+			case pendingCommand, pendingTasks, pendingAdvancedTools:
+				if len(model.assignments) > 0 {
+					model.status = fmt.Sprintf(
+						"response event committed locally · %d request(s) waiting in Inbox",
+						len(model.assignments),
+					)
+				}
 			}
 			followup := model.drainDirtyMirrorReview()
 			model.pruneMirrorCache()

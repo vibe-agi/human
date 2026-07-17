@@ -67,6 +67,15 @@ func newShimHandlerWithCallerToken(
 	return shim, ledger
 }
 
+func TestShimGatewayRequiresTLSForRemoteBearerEndpoint(t *testing.T) {
+	t.Parallel()
+	for _, gatewayURL := range []string{"http://gateway.example/v1", "http://192.0.2.10:8080"} {
+		if _, err := NewServer(ServerConfig{GatewayURL: gatewayURL}); err == nil || !strings.Contains(err.Error(), "must use https") {
+			t.Fatalf("remote plaintext gateway %q error = %v", gatewayURL, err)
+		}
+	}
+}
+
 func TestProxyInjectsStableIdentityAndStreamsGatewayResponse(t *testing.T) {
 	t.Parallel()
 	requests := make(chan *http.Request, 2)

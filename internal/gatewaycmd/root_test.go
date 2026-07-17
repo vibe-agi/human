@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/vibe-agi/human/internal/auth"
 	"github.com/vibe-agi/human/internal/store/sqlite"
+	"github.com/vibe-agi/human/internal/userdata"
 )
 
 func execute(t *testing.T, args ...string) (string, error) {
@@ -63,6 +66,23 @@ func TestTokenIssueAndRevoke(t *testing.T) {
 	}
 }
 
+func TestConfigDoesNotAutoLoadFromWorkingDirectory(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "human.toml"), []byte(
+		"db = '/tmp/untrusted-human.db'\n[serve]\nlisten = '0.0.0.0:1'\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(directory)
+	settings := newSettings()
+	if err := loadConfig(settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings.GetString("db") != "" || settings.GetString("serve.listen") != "" {
+		t.Fatalf("working-directory config was loaded: %+v", settings.AllSettings())
+	}
+}
+
 func TestTokenAdministrationRejectsUnstableIdentifiers(t *testing.T) {
 	t.Parallel()
 	databasePath := filepath.Join(t.TempDir(), "human.db")
@@ -112,6 +132,47 @@ func TestHumanGatewayFormRunsDirectlyAndKeepsTokenCommands(t *testing.T) {
 	for _, path := range [][]string{{"token", "issue"}, {"token", "revoke"}} {
 		if _, _, err := command.Find(path); err != nil {
 			t.Fatalf("find %v: %v", path, err)
+		}
+	}
+}
+
+func TestGatewayDatabaseDefaultsToOSUserData(t *testing.T) {
+	t.Parallel()
+	command := NewGatewayCommand()
+	flag := command.PersistentFlags().Lookup("db")
+	if flag == nil || flag.DefValue != automaticDatabasePath {
+		t.Fatalf("gateway db default = %+v", flag)
+	}
+	got, err := resolveDatabasePath(flag.DefValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := userdata.Path("gateway", "human.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("gateway database = %q, want %q", got, want)
+	}
+}
+
+func TestTokenAdministrationCreatesAutomaticDatabaseOutsideWorkspace(t *testing.T) {
+	dataRoot := t.TempDir()
+	t.Setenv("HUMAN_DATA_HOME", dataRoot)
+	if _, err := execute(t, "token", "issue", "--type", "caller", "--subject", "automatic-caller"); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(dataRoot, "gateway", "human.db")
+	if info, err := os.Stat(databasePath); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("automatic gateway database was not created at %q: info=%v err=%v", databasePath, info, err)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(filepath.Dir(databasePath))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("automatic gateway directory permissions = %o, want private", info.Mode().Perm())
 		}
 	}
 }

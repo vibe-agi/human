@@ -13,8 +13,39 @@ import (
 	"time"
 
 	"github.com/vibe-agi/human/gateway"
+	"github.com/vibe-agi/human/internal/userdata"
 	"github.com/vibe-agi/human/worker"
 )
+
+func TestDefaultConfigScopesPrivateStoresOutsideWorkspace(t *testing.T) {
+	dataRoot := t.TempDir()
+	t.Setenv("HUMAN_DATA_HOME", dataRoot)
+	config, err := DefaultConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := userdata.ResolveGitWorkspace(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantGateway, err := userdata.WorkspacePath("local", workspace, "gateway.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOutbox, err := userdata.WorkspacePath("local", workspace, "worker-outbox.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantState, err := userdata.WorkspacePath("local", workspace, "worker-state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Gateway.DatabasePath != wantGateway || config.Worker.OutboxPath != wantOutbox || config.Worker.StatePath != wantState {
+		t.Fatalf("local private defaults = %q / %q / %q, want %q / %q / %q",
+			config.Gateway.DatabasePath, config.Worker.OutboxPath, config.Worker.StatePath,
+			wantGateway, wantOutbox, wantState)
+	}
+}
 
 func TestOpenConnectsWorkerServesCallerAndClosesIdempotently(t *testing.T) {
 	t.Parallel()

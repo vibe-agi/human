@@ -6,7 +6,28 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/vibe-agi/human/internal/userdata"
 )
+
+func TestDefaultConfigUsesOSUserDataForPrivateStores(t *testing.T) {
+	dataRoot := t.TempDir()
+	t.Setenv("HUMAN_DATA_HOME", dataRoot)
+	config, err := DefaultConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOutbox, err := userdata.Path("worker", "worker-outbox.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantState, err := userdata.Path("worker", "worker-state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.OutboxPath != wantOutbox || config.StatePath != wantState {
+		t.Fatalf("private defaults = %q / %q, want %q / %q", config.OutboxPath, config.StatePath, wantOutbox, wantState)
+	}
+}
 
 func TestOpenValidatesPublicBoundary(t *testing.T) {
 	t.Parallel()

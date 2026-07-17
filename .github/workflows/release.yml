@@ -1,0 +1,78 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify distribution terms
+        run: test -s LICENSE
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify source and race safety
+        run: |
+          make fmt-check tidy-check build vet
+          go test -race -count=1 -timeout=5m ./...
+
+  portable:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build and test platform-specific behavior
+        run: |
+          go build ./...
+          go test -count=1 -timeout=5m ./...
+
+  release:
+    needs: [verify, portable]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify source remains clean
+        run: make check
+      - name: Build release archives
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: BUILD_DATE="$(git show -s --format=%cI "$GITHUB_SHA")" ./scripts/build-release.sh
+      - name: Smoke-test embedded build identity
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          expected="${VERSION#v}"
+          tar -xzf "dist/human_${expected}_linux_amd64.tar.gz" -C /tmp human
+          /tmp/human version --json | tee /tmp/human-version.json
+          jq -e --arg version "$expected" --arg commit "$COMMIT" \
+            '.version == $version and .commit == $commit and .build_date != "unknown"' \
+            /tmp/human-version.json
+      - name: Publish immutable tag release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
