@@ -3,17 +3,14 @@ package sqlite
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/completion/canonical"
 	storeapi "github.com/vibe-agi/human/internal/store"
-	_ "modernc.org/sqlite"
 )
 
 func TestRecoverableRequestsSurviveReopen(t *testing.T) {
@@ -84,14 +81,17 @@ func TestRecoverableRequestsSurviveReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	requests, err := db.ListRecoverableRequests(ctx)
+	snapshot, err := db.ListRecoverableRequests(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(requests) != 1 {
-		t.Fatalf("ListRecoverableRequests() returned %d entries: %+v", len(requests), requests)
+	if len(snapshot.Issues) != 0 {
+		t.Fatalf("ListRecoverableRequests() issues = %+v", snapshot.Issues)
 	}
-	got := requests[0]
+	if len(snapshot.Requests) != 1 {
+		t.Fatalf("ListRecoverableRequests() returned %d entries: %+v", len(snapshot.Requests), snapshot.Requests)
+	}
+	got := snapshot.Requests[0]
 	if !got.Replay || got.Request.RequestKey != (storeapi.RequestKey{
 		CallerID: recoverable.CallerID, IdempotencyKey: recoverable.IdempotencyKey,
 	}) || got.Task.TaskKey != recoverable.TaskKey {
@@ -148,129 +148,187 @@ func TestBeginRequestChecksCanonicalPayloadOnReplay(t *testing.T) {
 	}
 }
 
-func TestOpenMigratesLegacyCanonicalRequestColumnExplicitly(t *testing.T) {
+func TestRawRecoveryQuarantineMakesCorruptRecordsFinite(t *testing.T) {
+	tests := []struct {
+		name      string
+		corrupt   func(*testing.T, *Store, storeapi.BeginRequestInput)
+		wantState completion.State
+	}{
+		{
+			name: "missing canonical payload",
+			corrupt: func(t *testing.T, db *Store, input storeapi.BeginRequestInput) {
+				t.Helper()
+				if _, err := db.db.ExecContext(context.Background(), `
+					UPDATE completion_requests SET canonical_request = X''
+					WHERE caller_id = ? AND idempotency_key = ?`,
+					input.CallerID, input.IdempotencyKey,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantState: completion.StateAdmitted,
+		},
+		{
+			name: "invalid canonical JSON",
+			corrupt: func(t *testing.T, db *Store, input storeapi.BeginRequestInput) {
+				t.Helper()
+				if _, err := db.db.ExecContext(context.Background(), `
+					UPDATE completion_requests SET canonical_request = '{'
+					WHERE caller_id = ? AND idempotency_key = ?`,
+					input.CallerID, input.IdempotencyKey,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantState: completion.StateAdmitted,
+		},
+		{
+			name: "invalid task state",
+			corrupt: func(t *testing.T, db *Store, input storeapi.BeginRequestInput) {
+				t.Helper()
+				if _, err := db.db.ExecContext(context.Background(), `
+					UPDATE completion_tasks SET state = 'impossible'
+					WHERE caller_id = ? AND task_id = ?`, input.CallerID, input.TaskID,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantState: completion.StateFailed,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			db := openTestStore(t)
+			input := requestInput()
+			if _, err := db.BeginRequest(ctx, input); err != nil {
+				t.Fatal(err)
+			}
+			test.corrupt(t, db, input)
+
+			snapshot, err := db.ListRecoverableRequests(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snapshot.Requests) != 0 || len(snapshot.Issues) != 1 {
+				t.Fatalf("corrupt recovery snapshot = %+v", snapshot)
+			}
+			issue := snapshot.Issues[0]
+			if issue.RequestKey != (storeapi.RequestKey{
+				CallerID: input.CallerID, IdempotencyKey: input.IdempotencyKey,
+			}) || issue.Dialect != input.Dialect || issue.ResponseStatus != 0 ||
+				!errors.Is(issue.Err, storeapi.ErrUnrecoverableRequest) {
+				t.Fatalf("recovery issue = %+v", issue)
+			}
+			failure := storeapi.ResponseDecision{
+				StatusCode: 500, ContentType: "application/json",
+				Body: []byte(`{"error":{"code":"recovery_failed"}}`),
+			}
+			quarantine := storeapi.RecoveryQuarantine{
+				RequestKey: issue.RequestKey, Failure: failure,
+			}
+			if err := db.QuarantineRecoveryRequest(ctx, quarantine); err != nil {
+				t.Fatal(err)
+			}
+			// The raw transition is idempotent and cannot duplicate terminal data.
+			if err := db.QuarantineRecoveryRequest(ctx, quarantine); err != nil {
+				t.Fatalf("idempotent quarantine: %v", err)
+			}
+
+			lookup, err := db.LookupRequest(ctx, issue.RequestKey, input.RequestDigest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !lookup.Request.RecoveryQuarantined || !lookup.Request.ResponseComplete ||
+				lookup.Request.Response.StatusCode != 500 ||
+				!bytes.Equal(lookup.Request.Response.Body, failure.Body) ||
+				lookup.Task.State != test.wantState {
+				t.Fatalf("durable raw quarantine = %+v", lookup)
+			}
+			if _, err := db.LookupRequest(ctx, issue.RequestKey, "different-digest"); !errors.Is(err, storeapi.ErrIdempotencyConflict) {
+				t.Fatalf("quarantined digest conflict = %v", err)
+			}
+			replayed, err := db.BeginRequest(ctx, input)
+			if err != nil || !replayed.Replay || !replayed.Request.RecoveryQuarantined {
+				t.Fatalf("same request quarantine replay = %+v, %v", replayed, err)
+			}
+			snapshot, err = db.ListRecoverableRequests(ctx)
+			if err != nil || len(snapshot.Requests) != 0 || len(snapshot.Issues) != 0 {
+				t.Fatalf("quarantine re-entered recovery = %+v, %v", snapshot, err)
+			}
+		})
+	}
+}
+
+func TestRawRecoveryQuarantinePreservesCommitted200AndAppendsTerminal(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "legacy.db")
-	legacy, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = legacy.ExecContext(ctx, `
-		CREATE TABLE completion_tasks (
-		  caller_id TEXT NOT NULL,
-		  task_id TEXT NOT NULL,
-		  workspace_key TEXT NOT NULL,
-		  capability_tier TEXT NOT NULL,
-		  dialect TEXT NOT NULL,
-		  harness_id TEXT NOT NULL,
-		  harness_version TEXT NOT NULL,
-		  workspace_root TEXT NOT NULL,
-		  state TEXT NOT NULL,
-		  lease_owner TEXT NOT NULL DEFAULT '',
-		  revision INTEGER NOT NULL DEFAULT 1,
-		  created_at INTEGER NOT NULL,
-		  updated_at INTEGER NOT NULL,
-		  PRIMARY KEY (caller_id, task_id)
-		);
-		CREATE TABLE completion_requests (
-		  caller_id TEXT NOT NULL,
-		  idempotency_key TEXT NOT NULL,
-		  task_id TEXT NOT NULL,
-		  request_digest TEXT NOT NULL,
-		  response_complete INTEGER NOT NULL DEFAULT 0,
-		  created_at INTEGER NOT NULL,
-		  completed_at INTEGER,
-		  PRIMARY KEY (caller_id, idempotency_key),
-		  FOREIGN KEY (caller_id, task_id)
-		    REFERENCES completion_tasks(caller_id, task_id)
-		);
-		CREATE TABLE completion_response_events (
-		  caller_id TEXT NOT NULL,
-		  idempotency_key TEXT NOT NULL,
-		  sequence INTEGER NOT NULL,
-		  kind TEXT NOT NULL,
-		  data BLOB NOT NULL,
-		  created_at INTEGER NOT NULL,
-		  PRIMARY KEY (caller_id, idempotency_key, sequence),
-		  FOREIGN KEY (caller_id, idempotency_key)
-		    REFERENCES completion_requests(caller_id, idempotency_key)
-		);
-		INSERT INTO completion_tasks (
-		  caller_id, task_id, workspace_key, capability_tier, dialect,
-		  harness_id, harness_version, workspace_root, state, created_at, updated_at
-		) VALUES ('legacy-caller', 'legacy-task', 'legacy-workspace', 'remote_tools',
-		          'anthropic_messages', 'claude-code', '0.1', '/legacy', 'admitted', 1, 1);
-		INSERT INTO completion_requests (
-		  caller_id, idempotency_key, task_id, request_digest, created_at
-		) VALUES ('legacy-caller', 'legacy-request', 'legacy-task', 'legacy-digest', 1);
-		INSERT INTO completion_tasks (
-		  caller_id, task_id, workspace_key, capability_tier, dialect,
-		  harness_id, harness_version, workspace_root, state, created_at, updated_at
-		) VALUES
-		  ('legacy-caller', 'legacy-stream-task', '', 'chat', 'openai_chat', '', '', '', 'completed', 2, 2),
-		  ('legacy-caller', 'legacy-failed-task', '', 'chat', 'openai_chat', '', '', '', 'failed', 3, 3);
-		INSERT INTO completion_requests (
-		  caller_id, idempotency_key, task_id, request_digest,
-		  response_complete, created_at, completed_at
-		) VALUES
-		  ('legacy-caller', 'legacy-stream', 'legacy-stream-task', 'stream-digest', 1, 2, 2),
-		  ('legacy-caller', 'legacy-failed', 'legacy-failed-task', 'failed-digest', 1, 3, 3);
-		INSERT INTO completion_response_events (
-		  caller_id, idempotency_key, sequence, kind, data, created_at
-		) VALUES ('legacy-caller', 'legacy-stream', 1, 'applied', X'7B7D', 2);
-	`)
-	if err != nil {
-		legacy.Close()
-		t.Fatal(err)
-	}
-	if err := legacy.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	db, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	if _, err := db.ListRecoverableRequests(ctx); !errors.Is(err, storeapi.ErrUnrecoverableRequest) ||
-		!strings.Contains(err.Error(), "legacy-caller/legacy-request") {
-		t.Fatalf("legacy incomplete request recovery error = %v", err)
-	}
-	var streamStatus int
-	var streamContentType string
-	if err := db.db.QueryRowContext(ctx, `
-		SELECT response_status, response_content_type
-		FROM completion_requests
-		WHERE caller_id = 'legacy-caller' AND idempotency_key = 'legacy-stream'`,
-	).Scan(&streamStatus, &streamContentType); err != nil {
-		t.Fatal(err)
-	}
-	if streamStatus != 200 || streamContentType != "text/event-stream" {
-		t.Fatalf("legacy stream decision = %d, %q", streamStatus, streamContentType)
-	}
-	var failedStatus int
-	var failedBody []byte
-	if err := db.db.QueryRowContext(ctx, `
-		SELECT response_status, response_body
-		FROM completion_requests
-		WHERE caller_id = 'legacy-caller' AND idempotency_key = 'legacy-failed'`,
-	).Scan(&failedStatus, &failedBody); err != nil {
-		t.Fatal(err)
-	}
-	if failedStatus != 500 || !bytes.Contains(failedBody, []byte("legacy_response_unrecoverable")) {
-		t.Fatalf("legacy ambiguous decision = %d, %q", failedStatus, failedBody)
-	}
-
+	db := openTestStore(t)
 	input := requestInput()
-	input.TaskID = "new-task"
-	input.IdempotencyKey = "new-request"
 	created, err := db.BeginRequest(ctx, input)
 	if err != nil {
-		t.Fatalf("BeginRequest() after legacy migration: %v", err)
+		t.Fatal(err)
 	}
-	if string(mustCanonicalJSON(t, created.Request.CanonicalRequest)) != string(mustCanonicalJSON(t, input.CanonicalRequest)) {
-		t.Fatalf("new canonical payload after migration = %+v", created.Request.CanonicalRequest)
+	if _, err := db.AppendResponseEvent(
+		ctx, created.Request.RequestKey, "stream",
+		[]byte(`{"response_id":"msg_existing","model":"human","created_at_unix":7}`),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AppendResponseEvent(
+		ctx, created.Request.RequestKey, "wire", []byte("event: message_start\ndata: {}\n\n"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BeginResponse(ctx, created.Request.RequestKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(ctx, `
+		UPDATE completion_requests SET canonical_request = X''
+		WHERE caller_id = ? AND idempotency_key = ?`, input.CallerID, input.IdempotencyKey,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := db.ListRecoverableRequests(ctx)
+	if err != nil || len(snapshot.Issues) != 1 {
+		t.Fatalf("committed corrupt snapshot = %+v, %v", snapshot, err)
+	}
+	issue := snapshot.Issues[0]
+	if issue.ResponseStatus != 200 || !bytes.Contains(issue.StreamMetadata, []byte("msg_existing")) {
+		t.Fatalf("committed recovery issue = %+v", issue)
+	}
+	terminal := []byte("event: error\ndata: {\"error\":{\"code\":\"recovery_failed\"}}\n\n")
+	quarantine := storeapi.RecoveryQuarantine{
+		RequestKey: issue.RequestKey,
+		Failure: storeapi.ResponseDecision{
+			StatusCode: 500, ContentType: "application/json", Body: []byte(`{"error":{}}`),
+		},
+		StreamTerminal: terminal,
+	}
+	if err := db.QuarantineRecoveryRequest(ctx, quarantine); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QuarantineRecoveryRequest(ctx, quarantine); err != nil {
+		t.Fatal(err)
+	}
+	lookup, err := db.LookupRequest(ctx, issue.RequestKey, input.RequestDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !lookup.Request.RecoveryQuarantined || !lookup.Request.ResponseComplete ||
+		lookup.Request.Response.StatusCode != 200 || lookup.Task.State != completion.StateFailed {
+		t.Fatalf("committed 200 quarantine = %+v", lookup)
+	}
+	read, err := db.ReadResponse(ctx, issue.RequestKey, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(read.Events) != 3 || !bytes.Equal(read.Events[2].Data, terminal) {
+		t.Fatalf("committed 200 terminal events = %+v", read.Events)
 	}
 }
 

@@ -29,12 +29,13 @@ func (Codec) Dialect() canonical.Dialect {
 }
 
 type messagesRequest struct {
-	Model    string             `json:"model"`
-	Stream   bool               `json:"stream"`
-	System   json.RawMessage    `json:"system"`
-	Messages []anthropicMessage `json:"messages"`
-	Tools    []anthropicTool    `json:"tools"`
-	Metadata map[string]string  `json:"metadata"`
+	Model      string             `json:"model"`
+	Stream     bool               `json:"stream"`
+	System     json.RawMessage    `json:"system"`
+	Messages   []anthropicMessage `json:"messages"`
+	Tools      []anthropicTool    `json:"tools"`
+	Metadata   map[string]string  `json:"metadata"`
+	ToolChoice json.RawMessage    `json:"tool_choice"`
 }
 
 type anthropicMessage struct {
@@ -72,8 +73,8 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 	if err := json.Unmarshal(payload, &wire); err != nil {
 		return canonical.Request{}, fmt.Errorf("decode Anthropic Messages request: %w", err)
 	}
-	if !wire.Stream {
-		return canonical.Request{}, dialect.ErrUnsupportedNonStreaming
+	if err := validateToolChoice(wire.ToolChoice); err != nil {
+		return canonical.Request{}, err
 	}
 
 	system, err := parseSystem(wire.System)
@@ -96,6 +97,9 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 		if err != nil {
 			return canonical.Request{}, fmt.Errorf("message %d content: %w", index, err)
 		}
+		if role == canonical.RoleAssistant && len(blocks) == 0 {
+			continue
+		}
 		request.Messages = append(request.Messages, canonical.Message{Role: role, Blocks: blocks})
 	}
 	for index, tool := range wire.Tools {
@@ -112,6 +116,34 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 		return canonical.Request{}, err
 	}
 	return request, nil
+}
+
+func validateToolChoice(raw json.RawMessage) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var stringChoice string
+	if err := json.Unmarshal(trimmed, &stringChoice); err == nil {
+		if stringChoice == "auto" {
+			return nil
+		}
+		return errors.New("tool_choice is unsupported; omit it or use auto")
+	}
+	var choice struct {
+		Type                   string `json:"type"`
+		Name                   string `json:"name"`
+		DisableParallelToolUse bool   `json:"disable_parallel_tool_use"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&choice); err != nil {
+		return fmt.Errorf("tool_choice: %w", err)
+	}
+	if choice.Type != "auto" || choice.Name != "" || choice.DisableParallelToolUse {
+		return errors.New("tool_choice is unsupported; omit it or use auto with parallel tool use enabled")
+	}
+	return nil
 }
 
 func parseRole(value string) (canonical.Role, error) {
@@ -167,6 +199,9 @@ func parseContent(raw json.RawMessage, role canonical.Role) ([]canonical.Block, 
 	}
 	blocks := make([]canonical.Block, 0, len(wireBlocks))
 	for index, wire := range wireBlocks {
+		if wire.Type == "text" && wire.Text == "" {
+			continue
+		}
 		block, err := parseBlock(wire, role)
 		if err != nil {
 			return nil, fmt.Errorf("block %d: %w", index, err)
@@ -190,11 +225,15 @@ func parseBlock(wire contentBlock, role canonical.Role) (canonical.Block, error)
 		if role != canonical.RoleAssistant {
 			return canonical.Block{}, errors.New("tool_use requires assistant role")
 		}
+		input := wire.Input
+		if input == nil {
+			input = map[string]any{}
+		}
 		return canonical.Block{
 			Type:       canonical.BlockToolUse,
 			ToolCallID: wire.ID,
 			ToolName:   wire.Name,
-			Input:      wire.Input,
+			Input:      input,
 		}, nil
 	case "tool_result":
 		if role != canonical.RoleUser {

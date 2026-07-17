@@ -119,12 +119,13 @@ func (store *transientWorkerEventStore) RecordWorkerEventReceipt(
 	ctx context.Context,
 	key storeapi.RequestKey,
 	eventID string,
+	workerID string,
 	digest string,
 ) (storeapi.WorkerEventReceipt, error) {
 	if store.fail(faultReceipt, eventID) {
 		return storeapi.WorkerEventReceipt{}, errInjectedWorkerEventStage
 	}
-	return store.CompletionStore.RecordWorkerEventReceipt(ctx, key, eventID, digest)
+	return store.CompletionStore.RecordWorkerEventReceipt(ctx, key, eventID, workerID, digest)
 }
 
 func (store *transientWorkerEventStore) CompleteRequest(ctx context.Context, key storeapi.RequestKey) error {
@@ -293,8 +294,9 @@ func TestWorkerEventStagesResumeOnlineAfterTransientFailure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := database.LookupWorkerEventReceipt(context.Background(), key, final.ID, digest); err != nil {
-				t.Fatalf("terminal receipt after %s = %v", stage, err)
+			receipt, err := database.LookupWorkerEventReceipt(context.Background(), key, final.ID)
+			if err != nil || receipt.Digest != digest {
+				t.Fatalf("terminal receipt after %s = %+v, %v", stage, receipt, err)
 			}
 			lookup, err := database.LookupRequest(context.Background(), key, mustRequestDigest(t, body))
 			if err != nil || !lookup.Request.ResponseComplete || lookup.Task.State != completion.StateCompleted {
@@ -433,8 +435,9 @@ func TestSyntheticExpiryRetriesTransientStepWithoutWorkerOutbox(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.LookupWorkerEventReceipt(context.Background(), key, terminal.ID, digest); err != nil {
-		t.Fatalf("synthetic expiry receipt = %v", err)
+	receipt, err := database.LookupWorkerEventReceipt(context.Background(), key, terminal.ID)
+	if err != nil || receipt.Digest != digest {
+		t.Fatalf("synthetic expiry receipt = %+v, %v", receipt, err)
 	}
 }
 
@@ -484,13 +487,13 @@ func TestResponsesStepWriteFailureReusesFirstStatefulEncoding(t *testing.T) {
 	if response.err != nil || response.status != http.StatusOK {
 		t.Fatalf("Responses retry = %d, %q, %v", response.status, response.body, response.err)
 	}
-	for sequence := 0; sequence <= 2; sequence++ {
+	for sequence := 0; sequence <= 8; sequence++ {
 		needle := []byte(fmt.Sprintf(`"sequence_number":%d`, sequence))
 		if count := bytes.Count(response.body, needle); count != 1 {
 			t.Fatalf("Responses sequence %d count = %d, body = %q", sequence, count, response.body)
 		}
 	}
-	if strings.Contains(string(response.body), `"sequence_number":3`) {
+	if strings.Contains(string(response.body), `"sequence_number":9`) {
 		t.Fatalf("Responses encoder drifted after retry: %q", response.body)
 	}
 	assertSingleWorkerEventStages(t, database, storeapi.RequestKey{
@@ -680,13 +683,14 @@ func TestRecoverResumesEveryInterruptedWorkerEventStage(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := database.LookupWorkerEventReceipt(context.Background(), key, final.ID, digest); err != nil {
-				t.Fatalf("recovered receipt after %s = %v", stage, err)
+			receipt, err := database.LookupWorkerEventReceipt(context.Background(), key, final.ID)
+			if err != nil || receipt.Digest != digest {
+				t.Fatalf("recovered receipt after %s = %+v, %v", stage, receipt, err)
 			}
 			assertSingleWorkerEventStages(t, database, key, final.ID)
-			recoverable, err := database.ListRecoverableRequests(context.Background())
-			if err != nil || len(recoverable) != 0 {
-				t.Fatalf("requests still recoverable after %s = %+v, %v", stage, recoverable, err)
+			snapshot, err := database.ListRecoverableRequests(context.Background())
+			if err != nil || len(snapshot.Requests) != 0 || len(snapshot.Issues) != 0 {
+				t.Fatalf("requests still recoverable after %s = %+v, %v", stage, snapshot, err)
 			}
 
 			replayServer := httptest.NewServer(restarted)
@@ -815,17 +819,18 @@ func TestResponsesStepFailureRestartRebuildsPriorStreamState(t *testing.T) {
 	if response.err != nil || response.status != http.StatusOK {
 		t.Fatalf("Responses restart replay = %d, %q, %v", response.status, response.body, response.err)
 	}
-	for sequence := 0; sequence <= 3; sequence++ {
+	for sequence := 0; sequence <= 9; sequence++ {
 		needle := []byte(fmt.Sprintf(`"sequence_number":%d`, sequence))
 		if count := bytes.Count(response.body, needle); count != 1 {
 			t.Fatalf("Responses restart sequence %d count = %d, body = %q", sequence, count, response.body)
 		}
 	}
-	if strings.Contains(string(response.body), `"sequence_number":4`) {
+	if strings.Contains(string(response.body), `"sequence_number":10`) {
 		t.Fatalf("Responses sequence drifted across restart: %q", response.body)
 	}
 	createdAt := regexp.MustCompile(`"created_at":([0-9]+)`).FindAllSubmatch(response.body, -1)
-	if len(createdAt) != 2 || !bytes.Equal(createdAt[0][1], createdAt[1][1]) {
+	if len(createdAt) != 3 || !bytes.Equal(createdAt[0][1], createdAt[1][1]) ||
+		!bytes.Equal(createdAt[1][1], createdAt[2][1]) {
 		t.Fatalf("Responses creation seed changed across restart: %q", response.body)
 	}
 	assertSingleWorkerEventStages(t, database, storeapi.RequestKey{

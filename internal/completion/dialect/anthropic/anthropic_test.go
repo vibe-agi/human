@@ -7,7 +7,6 @@ import (
 
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/completion/canonical"
-	"github.com/vibe-agi/human/internal/completion/dialect"
 )
 
 func TestDecodeMessagesRequest(t *testing.T) {
@@ -84,17 +83,54 @@ func TestDecodeURLImageAndNestedToolResult(t *testing.T) {
 	}
 }
 
-func TestDecodeRejectsNonStreamingAndInvalidRoles(t *testing.T) {
+func TestDecodeAcceptsNonStreamingAndRejectsInvalidRoles(t *testing.T) {
 	t.Parallel()
 	codec := New()
-	if _, err := codec.Decode([]byte(`{"model":"m","stream":false,"messages":[{"role":"user","content":"hello"}]}`)); err != dialect.ErrUnsupportedNonStreaming {
-		t.Fatalf("non-streaming error = %v", err)
+	request, err := codec.Decode([]byte(`{"model":"m","stream":false,"messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil || request.Stream {
+		t.Fatalf("non-streaming request = %+v, %v", request, err)
 	}
 	if _, err := codec.Decode([]byte(`{"model":"m","stream":true,"messages":[{"role":"system","content":"hello"}]}`)); err == nil {
 		t.Fatal("system message role accepted")
 	}
 	if _, err := codec.Decode([]byte(`{"model":"m","stream":true,"messages":[{"role":"user","content":[{"type":"tool_use","id":"x","name":"read","input":{}}]}]}`)); err == nil {
 		t.Fatal("user tool_use accepted")
+	}
+}
+
+func TestDecodeAnthropicToolChoiceDefaultsAndEmptyInput(t *testing.T) {
+	t.Parallel()
+	for _, choice := range []string{`"auto"`, `{"type":"auto"}`, `{"type":"auto","disable_parallel_tool_use":false}`} {
+		payload := `{
+  "model":"m","stream":true,
+  "messages":[
+    {"role":"user","content":"hello"},
+    {"role":"assistant","content":[{"type":"tool_use","id":"toolu-empty","name":"empty","input":null}]}
+  ],
+  "tool_choice":` + choice + `
+}`
+		request, err := New().Decode([]byte(payload))
+		if err != nil {
+			t.Fatalf("tool_choice %s rejected: %v", choice, err)
+		}
+		if got := request.Messages[1].Blocks[0].Input; got == nil || len(got) != 0 {
+			t.Fatalf("empty tool input = %#v, want non-nil empty object", got)
+		}
+	}
+}
+
+func TestDecodeAnthropicRejectsUnsupportedToolChoice(t *testing.T) {
+	t.Parallel()
+	for _, choice := range []string{
+		`{"type":"any"}`,
+		`{"type":"tool","name":"read_file"}`,
+		`{"type":"auto","disable_parallel_tool_use":true}`,
+		`{"type":"auto","future_control":true}`,
+	} {
+		payload := `{"model":"m","stream":true,"messages":[{"role":"user","content":"hello"}],"tool_choice":` + choice + `}`
+		if _, err := New().Decode([]byte(payload)); err == nil {
+			t.Fatalf("tool_choice %s accepted", choice)
+		}
 	}
 }
 
@@ -165,6 +201,26 @@ func TestAnthropicToolUseStream(t *testing.T) {
 		if !strings.Contains(string(frames[index.frame]), index.want) {
 			t.Fatalf("frame %d = %q", index.frame, frames[index.frame])
 		}
+	}
+}
+
+func TestAnthropicNilToolInputEncodedAsObject(t *testing.T) {
+	t.Parallel()
+	stream := New().NewStream("msg-empty", "human-expert")
+	if _, err := stream.Start(); err != nil {
+		t.Fatal(err)
+	}
+	frames, done, err := stream.Encode(completion.Event{
+		Type: completion.EventToolCalls,
+		ToolCalls: []completion.ToolCall{{
+			ID: "toolu-empty", Name: "no_arguments", Input: nil,
+		}},
+	})
+	if err != nil || !done || len(frames) != 5 {
+		t.Fatalf("Encode() = %q, %v, %v", frames, done, err)
+	}
+	if !strings.Contains(string(frames[1]), `"partial_json":"{}"`) {
+		t.Fatalf("nil tool input frame = %q", frames[1])
 	}
 }
 

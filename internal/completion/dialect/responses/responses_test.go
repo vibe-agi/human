@@ -8,7 +8,6 @@ import (
 
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/completion/canonical"
-	"github.com/vibe-agi/human/internal/completion/dialect"
 )
 
 func TestDecodeResponsesRequest(t *testing.T) {
@@ -32,8 +31,7 @@ func TestDecodeResponsesRequest(t *testing.T) {
     "type":"function","name":"read_file","description":"read a file",
     "parameters":{"type":"object","properties":{"path":{"type":"string"}}},
     "strict":true
-  }],
-  "temperature":0.1
+  }]
 }`)
 
 	request, err := New().Decode(payload)
@@ -94,31 +92,50 @@ func TestDecodeStringInputAndStructuredFunctionOutput(t *testing.T) {
 func TestDecodeResponsesRejectsUnsupportedShapes(t *testing.T) {
 	t.Parallel()
 	codec := New()
+	nonStreaming, err := codec.Decode([]byte(`{"model":"m","stream":false,"input":"hello"}`))
+	if err != nil || nonStreaming.Stream {
+		t.Fatalf("non-streaming request = %+v, %v", nonStreaming, err)
+	}
 	tests := []struct {
 		name    string
 		payload string
 		wantErr error
 	}{
 		{
-			name:    "non streaming",
-			payload: `{"model":"m","stream":false,"input":"hello"}`,
-			wantErr: dialect.ErrUnsupportedNonStreaming,
-		},
-		{
 			name:    "non string instructions",
 			payload: `{"model":"m","stream":true,"instructions":[{"role":"developer","content":"x"}],"input":"hello"}`,
-		},
-		{
-			name:    "built in tool",
-			payload: `{"model":"m","stream":true,"input":"hello","tools":[{"type":"web_search"}]}`,
 		},
 		{
 			name:    "missing function output call id",
 			payload: `{"model":"m","stream":true,"input":[{"type":"function_call_output","output":"x"}]}`,
 		},
 		{
-			name:    "unsupported input item",
-			payload: `{"model":"m","stream":true,"input":[{"type":"reasoning","summary":[]}]}`,
+			name:    "required tool choice",
+			payload: `{"model":"m","stream":true,"input":"hello","tool_choice":"required"}`,
+		},
+		{
+			name:    "specific tool choice",
+			payload: `{"model":"m","stream":true,"input":"hello","tool_choice":{"type":"function","name":"read_file"}}`,
+		},
+		{
+			name:    "structured text format",
+			payload: `{"model":"m","stream":true,"input":"hello","text":{"format":{"type":"json_schema","name":"answer","schema":{"type":"object"}}}}`,
+		},
+		{
+			name:    "text format with hidden schema",
+			payload: `{"model":"m","stream":true,"input":"hello","text":{"format":{"type":"text","schema":{"type":"object"}}}}`,
+		},
+		{
+			name:    "unknown text control",
+			payload: `{"model":"m","stream":true,"input":"hello","text":{"future_control":true}}`,
+		},
+		{
+			name:    "unknown top level control",
+			payload: `{"model":"m","stream":true,"input":"hello","temperature":0.1}`,
+		},
+		{
+			name:    "previous response",
+			payload: `{"model":"m","stream":true,"input":"hello","previous_response_id":"resp_previous"}`,
 		},
 	}
 	for _, test := range tests {
@@ -133,6 +150,18 @@ func TestDecodeResponsesRejectsUnsupportedShapes(t *testing.T) {
 				t.Fatalf("error = %v, want %v", err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestDecodeResponsesAllowsDefaultOutputControls(t *testing.T) {
+	t.Parallel()
+	_, err := New().Decode([]byte(`{
+  "model":"m","stream":true,"input":"hello",
+  "tool_choice":"auto","text":{"format":{"type":"text"},"verbosity":"medium"},
+  "previous_response_id":null,"parallel_tool_calls":true
+}`))
+	if err != nil {
+		t.Fatalf("Decode() rejected supported defaults: %v", err)
 	}
 }
 
@@ -153,30 +182,53 @@ func TestResponsesTextStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(start) != 2 {
+		t.Fatalf("start frames = %d, want 2", len(start))
+	}
 	created := assertEvent(t, start[0], "response.created", 0)
 	response := created["response"].(map[string]any)
 	if response["id"] != "resp-1" || response["status"] != "in_progress" || response["created_at"] != float64(100) {
 		t.Fatalf("created response = %#v", response)
 	}
+	assertEvent(t, start[1], "response.in_progress", 1)
 	if got := string(stream.Heartbeat()); got != ": ping\n\n" {
 		t.Fatalf("heartbeat = %q", got)
 	}
 
 	progress, done, err := stream.Encode(completion.Event{Type: completion.EventProgress, Text: "working"})
-	if err != nil || done || len(progress) != 1 {
+	if err != nil || done || len(progress) != 3 {
 		t.Fatalf("progress = %q, %v, %v", progress, done, err)
 	}
-	delta := assertEvent(t, progress[0], "response.output_text.delta", 1)
+	added := assertEvent(t, progress[0], "response.output_item.added", 2)
+	item := added["item"].(map[string]any)
+	if item["id"] != "msg_resp-1" || item["status"] != "in_progress" || len(item["content"].([]any)) != 0 {
+		t.Fatalf("added output item = %#v", item)
+	}
+	partAdded := assertEvent(t, progress[1], "response.content_part.added", 3)
+	part := partAdded["part"].(map[string]any)
+	if part["type"] != "output_text" || part["text"] != "" {
+		t.Fatalf("added content part = %#v", partAdded)
+	}
+	delta := assertEvent(t, progress[2], "response.output_text.delta", 4)
 	if delta["delta"] != "working" || delta["item_id"] != "msg_resp-1" {
 		t.Fatalf("delta = %#v", delta)
 	}
 
 	final, done, err := stream.Encode(completion.Event{Type: completion.EventFinal, Text: " done"})
-	if err != nil || !done || len(final) != 2 {
+	if err != nil || !done || len(final) != 5 {
 		t.Fatalf("final = %q, %v, %v", final, done, err)
 	}
-	assertEvent(t, final[0], "response.output_text.delta", 2)
-	completed := assertEvent(t, final[1], "response.completed", 3)
+	assertEvent(t, final[0], "response.output_text.delta", 5)
+	textDone := assertEvent(t, final[1], "response.output_text.done", 6)
+	if textDone["text"] != "working done" {
+		t.Fatalf("text done = %#v", textDone)
+	}
+	assertEvent(t, final[2], "response.content_part.done", 7)
+	itemDone := assertEvent(t, final[3], "response.output_item.done", 8)
+	if itemDone["item"].(map[string]any)["status"] != "completed" {
+		t.Fatalf("item done = %#v", itemDone)
+	}
+	completed := assertEvent(t, final[4], "response.completed", 9)
 	response = completed["response"].(map[string]any)
 	if response["status"] != "completed" || response["completed_at"] != float64(101) {
 		t.Fatalf("completed response = %#v", response)
@@ -205,18 +257,34 @@ func TestResponsesToolStream(t *testing.T) {
 			{ID: "call-2", Name: "search", Input: map[string]any{"query": "needle"}},
 		},
 	})
-	if err != nil || !done || len(frames) != 3 {
+	if err != nil || !done || len(frames) != 12 {
 		t.Fatalf("tool frames = %q, %v, %v", frames, done, err)
 	}
-	first := assertEvent(t, frames[0], "response.function_call_arguments.done", 2)
-	second := assertEvent(t, frames[1], "response.function_call_arguments.done", 3)
+	assertEvent(t, frames[0], "response.output_text.done", 5)
+	assertEvent(t, frames[1], "response.content_part.done", 6)
+	assertEvent(t, frames[2], "response.output_item.done", 7)
+	firstAdded := assertEvent(t, frames[3], "response.output_item.added", 8)
+	if firstAdded["item"].(map[string]any)["status"] != "in_progress" {
+		t.Fatalf("first added tool = %#v", firstAdded)
+	}
+	firstDelta := assertEvent(t, frames[4], "response.function_call_arguments.delta", 9)
+	first := assertEvent(t, frames[5], "response.function_call_arguments.done", 10)
+	assertEvent(t, frames[6], "response.output_item.done", 11)
+	assertEvent(t, frames[7], "response.output_item.added", 12)
+	secondDelta := assertEvent(t, frames[8], "response.function_call_arguments.delta", 13)
+	second := assertEvent(t, frames[9], "response.function_call_arguments.done", 14)
+	assertEvent(t, frames[10], "response.output_item.done", 15)
 	if first["item_id"] != "fc_call-1" || first["name"] != "read_file" || first["output_index"] != float64(1) {
 		t.Fatalf("first tool event = %#v", first)
 	}
-	if second["output_index"] != float64(2) || !strings.Contains(second["arguments"].(string), `"query":"needle"`) {
+	if firstDelta["delta"] != first["arguments"] {
+		t.Fatalf("first tool delta/done = %#v / %#v", firstDelta, first)
+	}
+	if second["output_index"] != float64(2) || !strings.Contains(second["arguments"].(string), `"query":"needle"`) ||
+		secondDelta["delta"] != second["arguments"] {
 		t.Fatalf("second tool event = %#v", second)
 	}
-	completed := assertEvent(t, frames[2], "response.completed", 4)
+	completed := assertEvent(t, frames[11], "response.completed", 16)
 	response := completed["response"].(map[string]any)
 	output := response["output"].([]any)
 	if len(output) != 3 {
@@ -246,9 +314,12 @@ func TestResponsesErrorAndAdmissionError(t *testing.T) {
 	if err != nil || !done || len(frames) != 1 {
 		t.Fatalf("error frames = %q, %v, %v", frames, done, err)
 	}
-	payload := assertEvent(t, frames[0], "error", 1)
-	if payload["code"] != "human_rejected" || payload["message"] != "human rejected task" || payload["param"] != nil {
-		t.Fatalf("error = %#v", payload)
+	payload := assertEvent(t, frames[0], "response.failed", 2)
+	response := payload["response"].(map[string]any)
+	responseError := response["error"].(map[string]any)
+	if response["status"] != "failed" || response["completed_at"] != nil ||
+		responseError["code"] != "server_error" || responseError["message"] != "human rejected task" {
+		t.Fatalf("failed response = %#v", response)
 	}
 }
 

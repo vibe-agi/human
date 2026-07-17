@@ -26,6 +26,7 @@ import (
 	"github.com/vibe-agi/human/internal/completion/hub"
 	"github.com/vibe-agi/human/internal/ratelimit"
 	storeapi "github.com/vibe-agi/human/internal/store"
+	"github.com/vibe-agi/human/internal/workerproto"
 )
 
 const (
@@ -45,9 +46,10 @@ const (
 )
 
 type streamMetadata struct {
-	ResponseID    string `json:"response_id"`
-	Model         string `json:"model"`
-	CreatedAtUnix int64  `json:"created_at_unix"`
+	ResponseID     string                   `json:"response_id"`
+	Model          string                   `json:"model"`
+	CreatedAtUnix  int64                    `json:"created_at_unix"`
+	ToolCallPolicy canonical.ToolCallPolicy `json:"tool_call_policy,omitempty"`
 }
 
 type persistedStep struct {
@@ -58,14 +60,19 @@ type persistedStep struct {
 }
 
 type Config struct {
-	Models            []string
-	MaxBodyBytes      int64
-	HeartbeatInterval time.Duration
-	MaxPending        time.Duration
-	RateLimit         ratelimit.Config   // zero values select the limiter defaults
-	RateLimiter       *ratelimit.Limiter // when set, overrides RateLimit
-	AuditPayload      bool
-	AuditPayloadTTL   time.Duration
+	Models                      []string
+	MaxBodyBytes                int64
+	MaxWorkerMessageBytes       int64
+	HeartbeatInterval           time.Duration
+	StreamWriteTimeout          time.Duration
+	MaxPending                  time.Duration
+	RateLimit                   ratelimit.Config   // zero values select the limiter defaults
+	RateLimiter                 *ratelimit.Limiter // when set, overrides RateLimit
+	AuditPayload                bool
+	AuditPayloadTTL             time.Duration
+	DisableCodexAutoIdempotency bool // emergency kill switch for recognized Codex turn keys
+	WorkerRouter                WorkerRouter
+	Logger                      *slog.Logger
 }
 
 func (config Config) withDefaults() Config {
@@ -73,16 +80,28 @@ func (config Config) withDefaults() Config {
 		config.Models = []string{"human-expert"}
 	}
 	if config.MaxBodyBytes <= 0 {
-		config.MaxBodyBytes = 16 << 20
+		config.MaxBodyBytes = workerproto.MaxWireMessageBytes
+	}
+	if config.MaxWorkerMessageBytes <= 0 {
+		config.MaxWorkerMessageBytes = workerproto.MaxWireMessageBytes
+	}
+	if config.MaxBodyBytes > config.MaxWorkerMessageBytes {
+		config.MaxBodyBytes = config.MaxWorkerMessageBytes
 	}
 	if config.HeartbeatInterval <= 0 {
 		config.HeartbeatInterval = 15 * time.Second
+	}
+	if config.StreamWriteTimeout <= 0 {
+		config.StreamWriteTimeout = 10 * time.Second
 	}
 	if config.MaxPending <= 0 {
 		config.MaxPending = 10 * time.Minute
 	}
 	if config.AuditPayloadTTL <= 0 {
 		config.AuditPayloadTTL = 7 * 24 * time.Hour
+	}
+	if config.Logger == nil {
+		config.Logger = slog.Default()
 	}
 	return config
 }
@@ -99,6 +118,9 @@ type Server struct {
 	handler          http.Handler
 	runMu            sync.RWMutex
 	runContext       context.Context
+	runWait          sync.WaitGroup
+	responses        responseNotifier
+	logger           *slog.Logger
 }
 
 type auditRun struct {
@@ -137,6 +159,7 @@ func NewServer(
 	server := &Server{
 		config: config, store: store, auth: authenticator,
 		hub: workerHub, adapters: adapters, codecs: codecs,
+		logger:           config.Logger,
 		admissionLimiter: admissionLimiter, runContext: context.Background(),
 	}
 	server.audit, _ = store.(storeapi.AuditStore)
@@ -171,7 +194,7 @@ func (server *Server) beginAudit(
 		ID: id, CallerID: task.CallerID, WorkspaceKey: task.WorkspaceKey,
 		TaskID: task.TaskID, Dialect: task.Dialect, KeyID: principal.KeyID, CreatedAt: now,
 	}); err != nil {
-		slog.Error("create audit metadata", "audit_id", id, "error", err)
+		server.logger.Error("create audit metadata", "audit_id", id, "error", err)
 		return nil
 	}
 	if server.config.AuditPayload {
@@ -179,7 +202,7 @@ func (server *Server) beginAudit(
 			AuditID: id, Kind: "request", Data: bytes.Clone(requestPayload),
 			CreatedAt: now, ExpiresAt: now.Add(server.config.AuditPayloadTTL),
 		}); err != nil {
-			slog.Error("store request audit payload", "audit_id", id, "error", err)
+			server.logger.Error("store request audit payload", "audit_id", id, "error", err)
 		}
 	}
 	return &auditRun{id: id, admittedAt: now}
@@ -212,21 +235,21 @@ func (server *Server) completeAudit(
 	if _, err := server.audit.CompleteAuditMetadata(
 		ctx, audit.id, pending.Milliseconds(), generation.Milliseconds(), errorCode,
 	); err != nil {
-		slog.Error("complete audit metadata", "audit_id", audit.id, "error", err)
+		server.logger.Error("complete audit metadata", "audit_id", audit.id, "error", err)
 	}
 	if !server.config.AuditPayload {
 		return
 	}
 	events, err := server.store.ListResponseEvents(ctx, requestKey, 0)
 	if err != nil {
-		slog.Error("load response audit payload", "audit_id", audit.id, "error", err)
+		server.logger.Error("load response audit payload", "audit_id", audit.id, "error", err)
 		return
 	}
 	var payload bytes.Buffer
 	for _, event := range events {
 		wire, err := responseEventWireData(event)
 		if err != nil {
-			slog.Error("decode response audit event", "audit_id", audit.id, "sequence", event.Sequence, "error", err)
+			server.logger.Error("decode response audit event", "audit_id", audit.id, "sequence", event.Sequence, "error", err)
 			return
 		}
 		payload.Write(wire)
@@ -238,7 +261,7 @@ func (server *Server) completeAudit(
 		AuditID: audit.id, Kind: "response", Data: payload.Bytes(),
 		CreatedAt: completedAt, ExpiresAt: completedAt.Add(server.config.AuditPayloadTTL),
 	}); err != nil {
-		slog.Error("store response audit payload", "audit_id", audit.id, "error", err)
+		server.logger.Error("store response audit payload", "audit_id", audit.id, "error", err)
 	}
 }
 
@@ -248,7 +271,8 @@ func (*Server) health(response http.ResponseWriter, _ *http.Request) {
 }
 
 func (server *Server) models(response http.ResponseWriter, request *http.Request) {
-	if _, err := server.authenticate(request); err != nil {
+	principal, err := server.authenticate(request)
+	if err != nil || principal.Type != auth.PrincipalCaller {
 		response.Header().Set("Content-Type", "application/json")
 		response.WriteHeader(http.StatusUnauthorized)
 		_, _ = response.Write([]byte(`{"error":{"message":"unauthorized","type":"authentication_error"}}`))
@@ -286,7 +310,12 @@ func (server *Server) serveCompletion(response http.ResponseWriter, request *htt
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(response, request.Body, server.config.MaxBodyBytes))
 	if err != nil {
-		server.writeAPIError(response, codec, http.StatusBadRequest, "invalid_request", "request body is too large or unreadable")
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			server.writeAPIError(response, codec, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the worker wire limit")
+		} else {
+			server.writeAPIError(response, codec, http.StatusBadRequest, "invalid_request", "request body is unreadable")
+		}
 		return
 	}
 	canonicalRequest, err := codec.Decode(body)
@@ -300,7 +329,30 @@ func (server *Server) serveCompletion(response http.ResponseWriter, request *htt
 		return
 	}
 
-	identity, tier := server.identity(request, callerID)
+	identity, tier, err := server.identity(request, callerID)
+	if err != nil {
+		server.writeAPIError(response, codec, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if tier != completion.TierChat {
+		if err := completeOpenCodeIdentity(&identity, request.Header, request.UserAgent(), canonicalRequest); err != nil {
+			server.writeAPIError(response, codec, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		if err := resumeOpenCodeTask(request.Context(), server.store, &identity); err != nil {
+			server.writeAPIError(response, codec, http.StatusInternalServerError, "store_error", "failed to resolve harness continuation")
+			return
+		}
+		if identity.IdempotencyKey == "" {
+			identity.IdempotencyKey, err = resolveOpenCodeIdempotencyKey(
+				"", identity, tier, request.UserAgent(), canonicalRequest, body,
+			)
+			if err != nil {
+				server.writeAPIError(response, codec, http.StatusBadRequest, "invalid_request", err.Error())
+				return
+			}
+		}
+	}
 	var resolvedProfile *adapter.Profile
 	if tier != completion.TierChat {
 		profile, known := server.adapters.Resolve(identity.HarnessID, identity.HarnessVersion)
@@ -311,22 +363,37 @@ func (server *Server) serveCompletion(response http.ResponseWriter, request *htt
 			)
 			return
 		}
-		if !known || identity.Validate(tier) != nil {
+		if !known || identity.Validate(tier) != nil ||
+			isOpenCodeAuxiliaryRequest(profile, canonicalRequest) {
 			tier = completion.TierChat
 		} else {
 			resolvedProfile = &profile
 		}
 	}
 	if tier == completion.TierChat {
-		canonicalRequest.Tools = nil
+		// Basic/Chat never accepts a caller-supplied stable task namespace,
+		// whether it was requested directly or reached by safe downgrade. Each
+		// completion owns a fresh task; request-level idempotency remains valid
+		// for exact replay.
+		identity.TaskID = ""
 		identity.WorkspaceKey = ""
 		identity.HarnessID = ""
 		identity.HarnessVersion = ""
+		identity.HarnessSessionID = ""
 		identity.Root = ""
 		identity.ExecAllowed = false
 	}
 
 	idempotencyKey := identity.IdempotencyKey
+	if idempotencyKey == "" && !server.config.DisableCodexAutoIdempotency {
+		idempotencyKey, err = resolveRequestIdempotencyKey(
+			identity.IdempotencyKey, callerID, tier, request.Header, request.UserAgent(), canonicalRequest, body,
+		)
+		if err != nil {
+			server.writeAPIError(response, codec, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+	}
 	if idempotencyKey == "" {
 		idempotencyKey, err = canonical.NewOpaqueID("request_")
 		if err != nil {
@@ -338,10 +405,13 @@ func (server *Server) serveCompletion(response http.ResponseWriter, request *htt
 	lookup, err := server.store.LookupRequest(request.Context(), requestKey, digest)
 	switch {
 	case err == nil:
-		server.replayResponse(response, request, lookup, digest)
+		server.replayResponse(response, request, lookup)
 		return
 	case errors.Is(err, storeapi.ErrIdempotencyConflict):
 		server.writeAPIError(response, codec, http.StatusConflict, "idempotency_conflict", "idempotency key was already used for a different request")
+		return
+	case errors.Is(err, storeapi.ErrReplayPayloadExpired):
+		server.writeAPIError(response, codec, http.StatusGone, "replay_payload_expired", "exact replay payload has expired; use a new idempotency key")
 		return
 	case !errors.Is(err, storeapi.ErrNotFound):
 		server.writeAPIError(response, codec, http.StatusInternalServerError, "store_error", "failed to inspect request state")
@@ -369,17 +439,59 @@ func (server *Server) serveCompletion(response http.ResponseWriter, request *htt
 	}
 	taskKey := storeapi.TaskKey{CallerID: callerID, TaskID: taskID}
 	preferredWorker := ""
+	existingTask := false
 	if existing, getErr := server.store.GetTask(request.Context(), taskKey); getErr == nil {
+		existingTask = true
 		preferredWorker = existing.LeaseOwner
+		if !completion.IsStableKey(preferredWorker) {
+			server.writeAPIError(response, codec, http.StatusInternalServerError, "task_owner_missing", "existing task has no valid worker owner")
+			return
+		}
 	} else if !errors.Is(getErr, storeapi.ErrNotFound) {
 		server.writeAPIError(response, codec, http.StatusInternalServerError, "store_error", "failed to inspect task state")
 		return
 	}
+	if !existingTask && server.config.WorkerRouter != nil {
+		routeIdentity := identity
+		routeIdentity.TaskID = taskID
+		routeIdentity.IdempotencyKey = idempotencyKey
+		routeRequest := request.Clone(request.Context())
+		routeRequest.Body = io.NopCloser(bytes.NewReader(body))
+		routeRequest.ContentLength = int64(len(body))
+		routeRequest.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
+		preferredWorker, err = server.config.WorkerRouter.RouteWorker(request.Context(), WorkerRouteRequest{
+			HTTPRequest: routeRequest,
+			Caller:      principal,
+			Model:       canonicalRequest.Model,
+			Tier:        tier,
+			Identity:    routeIdentity,
+		})
+		_ = routeRequest.Body.Close()
+		switch {
+		case errors.Is(err, ErrWorkerRouteDenied):
+			server.writeAPIError(response, codec, http.StatusForbidden, "worker_route_denied", "worker routing policy denied this task")
+			return
+		case err != nil:
+			server.logger.Error("route new completion task", "caller_id", callerID, "task_id", taskID, "error", err)
+			server.writeAPIError(response, codec, http.StatusInternalServerError, "worker_route_error", "worker routing policy failed")
+			return
+		case preferredWorker != "" && !completion.IsStableKey(preferredWorker):
+			server.logger.Error("worker router returned invalid subject", "caller_id", callerID, "task_id", taskID)
+			server.writeAPIError(response, codec, http.StatusInternalServerError, "worker_route_error", "worker routing policy returned an invalid worker subject")
+			return
+		}
+	}
 	reservation, err := server.hub.Reserve(preferredWorker)
 	if err != nil {
 		status := codec.OverloadedStatus()
+		code := "overloaded"
+		if preferredWorker != "" && errors.Is(err, hub.ErrNoWorker) {
+			code = "worker_unavailable"
+		}
 		response.Header().Set("Retry-After", "5")
-		server.writeAPIError(response, codec, status, "overloaded", err.Error())
+		server.writeAPIError(response, codec, status, code, err.Error())
 		return
 	}
 	reservationTransferred := false
@@ -388,13 +500,39 @@ func (server *Server) serveCompletion(response http.ResponseWriter, request *htt
 			reservation.Release()
 		}
 	}()
+	workerRoot := assignmentWorkspaceRoot(tier, identity.Root, resolvedProfile)
+	assignment := completion.Assignment{
+		CallerID: callerID, WorkspaceKey: identity.WorkspaceKey,
+		TaskID: taskID, IdempotencyKey: idempotencyKey,
+		LeaseOwner:     reservation.WorkerID(),
+		CapabilityTier: tier, HarnessID: identity.HarnessID, HarnessVersion: identity.HarnessVersion,
+		HarnessSessionID: identity.HarnessSessionID,
+		Root:             workerRoot, ExecAllowed: identity.ExecAllowed, Adapter: resolvedProfile,
+		Request: canonicalRequest,
+	}
+	if err := workerproto.ValidateEnvelopeSize(
+		workerproto.MessageAssignment, assignment, server.config.MaxWorkerMessageBytes,
+	); err != nil {
+		response.Header().Set(headerIdempotencyKey, idempotencyKey)
+		if errors.Is(err, workerproto.ErrMessageTooLarge) {
+			server.writeAPIError(
+				response, codec, http.StatusRequestEntityTooLarge, "request_too_large",
+				"canonical request exceeds the worker wire limit",
+			)
+		} else {
+			server.writeAPIError(response, codec, http.StatusBadRequest, "invalid_request", "request cannot be encoded for the worker")
+		}
+		return
+	}
 
 	begin, err := server.store.BeginRequest(request.Context(), storeapi.BeginRequestInput{
 		Task: storeapi.Task{
 			TaskKey: taskKey, WorkspaceKey: identity.WorkspaceKey,
 			CapabilityTier: tier, Dialect: codec.Dialect(),
 			HarnessID: identity.HarnessID, HarnessVersion: identity.HarnessVersion,
-			Root: identity.Root, ExecAllowed: identity.ExecAllowed,
+			HarnessSessionID: identity.HarnessSessionID,
+			Root:             identity.Root, ExecAllowed: identity.ExecAllowed,
+			LeaseOwner: assignment.LeaseOwner,
 		},
 		IdempotencyKey:   idempotencyKey,
 		RequestDigest:    digest,
@@ -405,6 +543,8 @@ func (server *Server) serveCompletion(response http.ResponseWriter, request *htt
 		switch {
 		case errors.Is(err, storeapi.ErrIdempotencyConflict):
 			server.writeAPIError(response, codec, http.StatusConflict, "idempotency_conflict", err.Error())
+		case errors.Is(err, storeapi.ErrReplayPayloadExpired):
+			server.writeAPIError(response, codec, http.StatusGone, "replay_payload_expired", "exact replay payload has expired; use a new idempotency key")
 		case errors.Is(err, storeapi.ErrTaskConflict), errors.Is(err, storeapi.ErrTaskNotReady),
 			errors.Is(err, storeapi.ErrToolResultsMissing), errors.Is(err, storeapi.ErrToolCallConflict):
 			server.writeAPIError(response, codec, http.StatusConflict, "task_reconciliation_conflict", err.Error())
@@ -414,7 +554,7 @@ func (server *Server) serveCompletion(response http.ResponseWriter, request *htt
 		return
 	}
 	if begin.Replay {
-		server.replayResponse(response, request, begin, digest)
+		server.replayResponse(response, request, begin)
 		return
 	}
 	audit := server.beginAudit(request.Context(), principal, begin.Task, requestKey, body)
@@ -424,29 +564,37 @@ func (server *Server) serveCompletion(response http.ResponseWriter, request *htt
 		server.failBeforeStream(response, codec, begin.Task, requestKey, audit, "internal_error", errors.New("failed to allocate response id"))
 		return
 	}
-	streamSeed := dialect.StreamSeed{CreatedAtUnix: time.Now().UTC().Unix()}
+	streamSeed := dialect.StreamSeed{
+		CreatedAtUnix:  time.Now().UTC().Unix(),
+		ToolCallPolicy: canonicalRequest.ToolCallPolicy,
+	}
 	metadata, err := json.Marshal(streamMetadata{
 		ResponseID: responseID, Model: canonicalRequest.Model,
-		CreatedAtUnix: streamSeed.CreatedAtUnix,
+		CreatedAtUnix: streamSeed.CreatedAtUnix, ToolCallPolicy: streamSeed.ToolCallPolicy,
 	})
 	if err != nil {
 		server.failBeforeStream(response, codec, begin.Task, requestKey, audit, "internal_error", err)
 		return
 	}
-	streamCheckpoint, err := server.store.AppendResponseEvent(request.Context(), requestKey, responseEventStream, metadata)
+	streamCheckpoint, err := server.appendResponseEvent(request.Context(), requestKey, responseEventStream, metadata)
 	if err != nil {
 		server.failBeforeStream(response, codec, begin.Task, requestKey, audit, "store_error", err)
 		return
 	}
-	stream := codec.NewStream(responseID, canonicalRequest.Model, streamSeed)
-	startFrames, err := stream.Start()
+	var encoder dialect.Encoder
+	if canonicalRequest.Stream {
+		encoder = codec.NewStream(responseID, canonicalRequest.Model, streamSeed)
+	} else {
+		encoder = codec.NewAggregate(responseID, canonicalRequest.Model, streamSeed)
+	}
+	startFrames, err := encoder.Start()
 	if err != nil {
-		server.failBeforeStream(response, codec, begin.Task, requestKey, audit, "stream_start_failed", err)
+		server.failBeforeStream(response, codec, begin.Task, requestKey, audit, "response_start_failed", err)
 		return
 	}
 	startSequence := streamCheckpoint.Sequence
 	for _, frame := range startFrames {
-		persisted, err := server.store.AppendResponseEvent(request.Context(), requestKey, responseEventWire, frame)
+		persisted, err := server.appendResponseEvent(request.Context(), requestKey, responseEventWire, frame)
 		if err != nil {
 			server.failBeforeStream(response, codec, begin.Task, requestKey, audit, "store_error", err)
 			return
@@ -454,47 +602,54 @@ func (server *Server) serveCompletion(response http.ResponseWriter, request *htt
 		startSequence = persisted.Sequence
 	}
 
-	if _, ok := response.(http.Flusher); !ok {
-		server.failBeforeStream(response, codec, begin.Task, requestKey, audit, "streaming_unsupported", errors.New("HTTP response writer does not support flushing"))
-		return
+	if canonicalRequest.Stream {
+		if _, ok := response.(http.Flusher); !ok {
+			server.failBeforeStream(response, codec, begin.Task, requestKey, audit, "streaming_unsupported", errors.New("HTTP response writer does not support flushing"))
+			return
+		}
+		begin.Request, err = server.beginResponse(request.Context(), begin.Request)
+		if err != nil {
+			server.failBeforeStream(response, codec, begin.Task, requestKey, audit, "store_error", fmt.Errorf("commit streaming response boundary: %w", err))
+			return
+		}
 	}
-	begin.Request, err = server.store.BeginResponse(request.Context(), requestKey)
-	if err != nil {
-		server.failBeforeStream(response, codec, begin.Task, requestKey, audit, "store_error", fmt.Errorf("commit streaming response boundary: %w", err))
-		return
-	}
-	virtualRoot := ""
-	if tier != completion.TierChat {
-		virtualRoot = "/workspace"
-	}
-	assignment := completion.Assignment{
-		CallerID: callerID, WorkspaceKey: identity.WorkspaceKey,
-		TaskID: taskID, IdempotencyKey: idempotencyKey,
-		CapabilityTier: tier, HarnessID: identity.HarnessID, HarnessVersion: identity.HarnessVersion,
-		Root: virtualRoot, ExecAllowed: identity.ExecAllowed, Adapter: resolvedProfile,
-		Request: canonicalRequest,
-	}
-
-	// Once 200 is durable, the daemon—not this HTTP request—owns admission.
-	// The gate preserves flush-before-Enqueue while the client is present. If
-	// the client disappears, opening the gate abandons only that socket; the
-	// durable request still progresses and can be replayed by an online retry.
+	// BeginRequest plus the response-mode checkpoint transfer admission to the
+	// daemon. Streaming keeps the stronger flush-before-Enqueue gate after its
+	// durable 200 decision. Non-streaming opens the gate while HTTP is still
+	// undecided; its terminal event atomically commits status plus the one body.
+	// In either mode, losing this socket does not cancel durable work.
 	dispatchReady := make(chan struct{})
 	reservationTransferred = true
-	go server.dispatchCommittedRequest(
-		server.runtimeContext(), dispatchReady, reservation, assignment,
-		stream, begin.Task, begin.Request, audit,
-	)
+	server.startBackground(func() {
+		server.dispatchCommittedRequest(
+			server.runtimeContext(), dispatchReady, reservation, assignment,
+			encoder, begin.Task, begin.Request, audit,
+		)
+	})
 
+	if !canonicalRequest.Stream {
+		close(dispatchReady)
+		decided, err := server.awaitResponseDecision(request.Context(), begin)
+		if err != nil {
+			var ok bool
+			decided, ok = server.resolveResponseDecisionAfterError(begin)
+			if !ok {
+				abortUndecidedHTTPResponse()
+				return
+			}
+		}
+		server.writeResponseDecision(response, decided.Task, decided.Request)
+		return
+	}
 	cursor, err := server.beginFreshStreamingResponse(response, request, begin, startFrames, startSequence)
 	close(dispatchReady)
 	if err != nil {
 		if request.Context().Err() == nil && server.runtimeContext().Err() == nil {
-			slog.Error("start durable completion response", "caller_id", callerID, "idempotency_key", idempotencyKey, "error", err)
+			server.logger.Error("start durable completion response", "caller_id", callerID, "idempotency_key", idempotencyKey, "error", err)
 		}
 		return
 	}
-	server.continueStreamingResponse(response, request, begin, digest, cursor)
+	server.continueStreamingResponse(response, request, begin, cursor)
 }
 
 // beginFreshStreamingResponse writes the exact frames that were just made
@@ -514,7 +669,7 @@ func (server *Server) beginFreshStreamingResponse(
 	if lookup.Request.Response.StatusCode != http.StatusOK {
 		return streamReplayCursor{}, fmt.Errorf("stream response status is %d", lookup.Request.Response.StatusCode)
 	}
-	flusher, ok := response.(http.Flusher)
+	_, ok := response.(http.Flusher)
 	if !ok {
 		return streamReplayCursor{}, errors.New("HTTP response writer does not support flushing")
 	}
@@ -522,16 +677,15 @@ func (server *Server) beginFreshStreamingResponse(
 	response.Header().Set(headerTaskID, lookup.Task.TaskID)
 	response.Header().Set(headerIdempotencyKey, lookup.Request.IdempotencyKey)
 	response.WriteHeader(http.StatusOK)
-	cursor := streamReplayCursor{flusher: flusher, sequence: startSequence}
-	for _, frame := range startFrames {
-		if len(frame) == 0 {
-			continue
-		}
-		if _, err := response.Write(frame); err != nil {
-			return cursor, err
-		}
+	streamWriter := newStreamResponseWriter(response, server.config.StreamWriteTimeout)
+	cursor := streamReplayCursor{
+		flush:    streamWriter.flush,
+		send:     streamWriter.writeAndFlush,
+		sequence: startSequence, started: true,
 	}
-	flusher.Flush()
+	if err := cursor.send(startFrames...); err != nil {
+		return cursor, err
+	}
 	return cursor, nil
 }
 
@@ -540,12 +694,18 @@ func (server *Server) dispatchCommittedRequest(
 	ready <-chan struct{},
 	reservation *hub.Reservation,
 	assignment completion.Assignment,
-	stream dialect.Stream,
+	stream dialect.Encoder,
 	task storeapi.Task,
 	request storeapi.Request,
 	audit *auditRun,
 ) {
 	defer reservation.Release()
+	// Admission assigns a concrete transport owner before the protocol state
+	// advances from admitted to leased. Keep that owner in this session-local
+	// task snapshot so even reject-before-accept and synthetic terminal events
+	// receive an ownership-complete durable receipt. TransitionTask remains the
+	// authority for when the lease becomes part of persisted task state.
+	task.LeaseOwner = assignment.LeaseOwner
 	select {
 	case <-ctx.Done():
 		return
@@ -557,7 +717,8 @@ func (server *Server) dispatchCommittedRequest(
 	events, err := reservation.Enqueue(assignment)
 	if err != nil {
 		event := completion.Event{
-			Type: completion.EventUnavailable, ErrorCode: "worker_unavailable", Error: err.Error(),
+			Type: completion.EventUnavailable, WorkerID: workerproto.GatewayEventOwner,
+			ErrorCode: "worker_unavailable", Error: err.Error(),
 		}
 		pendingSteps := make(map[string]persistedStep)
 		_, done, persistErr := server.persistAndApplyEventWithRetry(
@@ -565,7 +726,7 @@ func (server *Server) dispatchCommittedRequest(
 			request.RequestKey, task.State, pendingSteps, event,
 		)
 		if persistErr != nil {
-			slog.Error("persist post-admission worker loss", "caller_id", request.CallerID,
+			server.logger.Error("persist post-admission worker loss", "caller_id", request.CallerID,
 				"idempotency_key", request.IdempotencyKey, "error", persistErr)
 			return
 		}
@@ -578,13 +739,19 @@ func (server *Server) dispatchCommittedRequest(
 }
 
 func (server *Server) consumeSession(
-	stream dialect.Stream,
+	stream dialect.Encoder,
 	task storeapi.Task,
 	request storeapi.Request,
 	events <-chan *hub.Delivery,
 	audit *auditRun,
 ) {
 	ctx := server.runtimeContext()
+	abortOnReturn := true
+	defer func() {
+		if abortOnReturn {
+			_ = server.hub.Abort(request.CallerID, request.IdempotencyKey)
+		}
+	}()
 	heartbeats := time.NewTicker(server.config.HeartbeatInterval)
 	defer heartbeats.Stop()
 	remaining := server.config.MaxPending - time.Since(request.CreatedAt)
@@ -600,24 +767,29 @@ func (server *Server) consumeSession(
 		case <-ctx.Done():
 			return
 		case <-heartbeats.C:
-			if _, err := server.store.AppendResponseEvent(ctx, request.RequestKey, responseEventWire, stream.Heartbeat()); err != nil {
-				slog.Error("persist completion heartbeat", "caller_id", request.CallerID, "idempotency_key", request.IdempotencyKey, "error", err)
+			heartbeat := stream.Heartbeat()
+			if len(heartbeat) == 0 {
+				continue
+			}
+			if _, err := server.appendResponseEvent(ctx, request.RequestKey, responseEventWire, heartbeat); err != nil {
+				server.logger.Error("persist completion heartbeat", "caller_id", request.CallerID, "idempotency_key", request.IdempotencyKey, "error", err)
 				continue
 			}
 		case <-expiry.C:
 			event := completion.Event{
-				Type: completion.EventExpired, ErrorCode: "human_timeout",
+				Type: completion.EventExpired, WorkerID: workerproto.GatewayEventOwner, ErrorCode: "human_timeout",
 				Error: "human response exceeded max_pending",
 			}
 			next, done, err := server.persistAndApplyEventWithRetry(
 				ctx, stream, task, request.CanonicalRequest, request.RequestKey, current, pendingSteps, event,
 			)
 			if err != nil {
-				slog.Error("expire completion session", "caller_id", request.CallerID, "idempotency_key", request.IdempotencyKey, "error", err)
+				server.logger.Error("expire completion session", "caller_id", request.CallerID, "idempotency_key", request.IdempotencyKey, "error", err)
 				return
 			}
 			current = next
 			_ = server.hub.Abort(request.CallerID, request.IdempotencyKey)
+			abortOnReturn = false
 			if done {
 				server.completeAudit(context.Background(), audit, request.RequestKey, event.ErrorCode)
 			}
@@ -627,9 +799,18 @@ func (server *Server) consumeSession(
 			next, done, err := server.persistAndApplyEventWithRetry(
 				ctx, stream, task, request.CanonicalRequest, request.RequestKey, current, pendingSteps, event,
 			)
-			delivery.Commit(err)
+			commitErr := err
+			var rejected *rejectableWorkerEventError
+			if errors.As(err, &rejected) {
+				// This event reached the durable completion processor and failed
+				// validation before any of its effects became durable. Tell workerws
+				// to reject exactly this outbox item; reconnecting cannot make it
+				// valid and would otherwise permanently block later worker events.
+				commitErr = hub.RejectEvent(err)
+			}
+			delivery.Commit(commitErr)
 			if err != nil {
-				slog.Error("process completion event", "caller_id", request.CallerID, "idempotency_key", request.IdempotencyKey, "event_id", event.ID, "error", err)
+				server.logger.Error("process completion event", "caller_id", request.CallerID, "idempotency_key", request.IdempotencyKey, "event_id", event.ID, "error", err)
 				continue
 			}
 			current = next
@@ -637,6 +818,9 @@ func (server *Server) consumeSession(
 				audit.acceptedAt = time.Now().UTC()
 			}
 			if done {
+				// Commit(nil) has already released the terminal publisher, which
+				// owns successful session retirement and its compact replay receipt.
+				abortOnReturn = false
 				server.completeAudit(context.Background(), audit, request.RequestKey, event.ErrorCode)
 				return
 			}
@@ -650,6 +834,24 @@ type retryableEventStageError struct {
 
 func (failure *retryableEventStageError) Error() string { return failure.err.Error() }
 func (failure *retryableEventStageError) Unwrap() error { return failure.err }
+
+// rejectableWorkerEventError is reserved for validation failures discovered
+// before any response step or state effect is durable. Errors after that
+// boundary must keep the outbox item for recovery instead of falsely NACKing an
+// event whose partial commit still has to be reconciled.
+type rejectableWorkerEventError struct {
+	err error
+}
+
+func (failure *rejectableWorkerEventError) Error() string { return failure.err.Error() }
+func (failure *rejectableWorkerEventError) Unwrap() error { return failure.err }
+
+type invalidTaskToolCallIDError struct {
+	err error
+}
+
+func (failure *invalidTaskToolCallIDError) Error() string { return failure.err.Error() }
+func (failure *invalidTaskToolCallIDError) Unwrap() error { return failure.err }
 
 func workerEventStageStoreError(operation string, err error) error {
 	wrapped := fmt.Errorf("%s: %w", operation, err)
@@ -678,7 +880,7 @@ func unrecoverableWorkerEvent(format string, arguments ...any) error {
 // (which have no worker outbox) an online recovery path.
 func (server *Server) persistAndApplyEventWithRetry(
 	ctx context.Context,
-	stream dialect.Stream,
+	stream dialect.Encoder,
 	task storeapi.Task,
 	request canonical.Request,
 	requestKey storeapi.RequestKey,
@@ -723,7 +925,7 @@ func (server *Server) persistAndApplyEventWithRetry(
 
 func (server *Server) persistAndApplyEvent(
 	ctx context.Context,
-	stream dialect.Stream,
+	stream dialect.Encoder,
 	task storeapi.Task,
 	request canonical.Request,
 	requestKey storeapi.RequestKey,
@@ -731,6 +933,10 @@ func (server *Server) persistAndApplyEvent(
 	pendingSteps map[string]persistedStep,
 	event completion.Event,
 ) (completion.State, bool, error) {
+	// The session-local owner exists from admission, before the persisted task
+	// formally transitions through leased. Preserve it across the authoritative
+	// task refresh below for reject-before-accept and synthetic receipts.
+	assignedWorkerID := task.LeaseOwner
 	if event.ID == "" {
 		var err error
 		event.ID, err = canonical.NewOpaqueID("event_")
@@ -765,7 +971,16 @@ func (server *Server) persistAndApplyEvent(
 			}
 		} else {
 			if err := server.validateEventState(task, request, current, event); err != nil {
-				return current, false, err
+				return current, false, &rejectableWorkerEventError{err: err}
+			}
+			if event.Type == completion.EventToolCalls {
+				if err := server.validateNewToolCallIDs(ctx, task, event.ToolCalls); err != nil {
+					var invalid *invalidTaskToolCallIDError
+					if errors.As(err, &invalid) {
+						return current, false, &rejectableWorkerEventError{err: err}
+					}
+					return current, false, workerEventStageStoreError("validate task tool-call ids", err)
+				}
 			}
 			encodedAtUnix := time.Now().UTC().Unix()
 			frames, done, encodeErr := stream.Encode(event, dialect.EventSeed{EncodedAtUnix: encodedAtUnix})
@@ -782,7 +997,7 @@ func (server *Server) persistAndApplyEvent(
 		if marshalErr != nil {
 			return current, false, fmt.Errorf("marshal durable worker event: %w", marshalErr)
 		}
-		if _, appendErr := server.store.AppendWorkerResponseEvent(
+		if _, appendErr := server.appendWorkerResponseEvent(
 			ctx, requestKey, responseEventStep, event.ID, eventDigest, stepPayload,
 		); appendErr != nil {
 			// A transaction may have committed even if its caller observed an
@@ -807,7 +1022,7 @@ func (server *Server) persistAndApplyEvent(
 		if err != nil {
 			return current, false, workerEventStageStoreError("apply worker event state", err)
 		}
-		if _, appendErr := server.store.AppendWorkerResponseEvent(
+		if _, appendErr := server.appendWorkerResponseEvent(
 			ctx, requestKey, responseEventApplied, event.ID, eventDigest, stages.payload,
 		); appendErr != nil {
 			persisted, verifyErr := server.loadWorkerEventStages(ctx, requestKey, event, eventDigest)
@@ -824,29 +1039,92 @@ func (server *Server) persistAndApplyEvent(
 	}
 
 	if stages.step.Done {
-		if completeErr := server.store.CompleteRequest(ctx, requestKey); completeErr != nil {
+		var completeErr error
+		var expectedDecision *storeapi.ResponseDecision
+		if request.Stream {
+			completeErr = server.completeRequest(ctx, requestKey)
+		} else {
+			decision, decisionErr := nonStreamingDecision(request.Dialect, stages.step.Event, stages.step.Wire)
+			if decisionErr != nil {
+				return next, false, decisionErr
+			}
+			expectedDecision = &decision
+			_, completeErr = server.completeNonStreamingResponse(ctx, requestKey, decision)
+		}
+		if completeErr != nil {
 			requestDigest, digestErr := request.Digest()
 			if digestErr != nil {
 				return next, false, digestErr
 			}
 			lookup, lookupErr := server.store.LookupRequest(ctx, requestKey, requestDigest)
-			if lookupErr != nil || !lookup.Request.ResponseComplete {
+			decisionMatches := expectedDecision == nil || responseDecisionsEqual(lookup.Request.Response, *expectedDecision)
+			if lookupErr != nil || !lookup.Request.ResponseComplete || !decisionMatches {
 				if lookupErr != nil {
 					return next, false, workerEventStageStoreError("verify durable response completion", lookupErr)
 				}
 				return next, false, workerEventStageStoreError("complete durable response", completeErr)
 			}
+			// The Store may have committed before its caller observed an
+			// error. The durable re-read above is authoritative; wake HTTP
+			// waiters just as the normal wrapper path would have done.
+			server.responses.notify(requestKey)
 		}
 	}
-	if _, receiptErr := server.store.RecordWorkerEventReceipt(ctx, requestKey, event.ID, eventDigest); receiptErr != nil {
-		if _, lookupErr := server.store.LookupWorkerEventReceipt(
-			ctx, requestKey, event.ID, eventDigest,
-		); lookupErr != nil {
+	receiptWorkerID := event.WorkerID
+	if receiptWorkerID == "" {
+		receiptWorkerID = task.LeaseOwner
+	}
+	if receiptWorkerID == "" {
+		receiptWorkerID = assignedWorkerID
+	}
+	if strings.TrimSpace(receiptWorkerID) == "" {
+		return next, false, unrecoverableWorkerEvent(
+			"worker event %q has no durable owner for its receipt", event.ID,
+		)
+	}
+	if _, receiptErr := server.store.RecordWorkerEventReceipt(
+		ctx, requestKey, event.ID, receiptWorkerID, eventDigest,
+	); receiptErr != nil {
+		receipt, lookupErr := server.store.LookupWorkerEventReceipt(ctx, requestKey, event.ID)
+		if lookupErr != nil || receipt.WorkerID != receiptWorkerID || receipt.Digest != eventDigest {
 			return next, false, workerEventStageStoreError("record worker event receipt", receiptErr)
 		}
 	}
 	delete(pendingSteps, event.ID)
 	return next, stages.step.Done, nil
+}
+
+func nonStreamingDecision(requestDialect canonical.Dialect, event completion.Event, body []byte) (storeapi.ResponseDecision, error) {
+	if len(body) == 0 {
+		return storeapi.ResponseDecision{}, errors.New("terminal non-streaming event produced an empty body")
+	}
+	decision := storeapi.ResponseDecision{
+		StatusCode: http.StatusOK, ContentType: "application/json", Body: bytes.Clone(body),
+	}
+	switch event.Type {
+	case completion.EventFinal, completion.EventClarification, completion.EventToolCalls:
+	case completion.EventRejected:
+		decision.StatusCode = http.StatusConflict
+	case completion.EventExpired:
+		decision.StatusCode = http.StatusGatewayTimeout
+	case completion.EventUnavailable:
+		if requestDialect == canonical.DialectAnthropic {
+			decision.StatusCode = 529
+		} else {
+			decision.StatusCode = http.StatusServiceUnavailable
+		}
+		decision.RetryAfter = "5"
+	case completion.EventFailed:
+		decision.StatusCode = http.StatusInternalServerError
+	default:
+		return storeapi.ResponseDecision{}, fmt.Errorf("non-streaming response ended with unsupported event %q", event.Type)
+	}
+	return decision, nil
+}
+
+func responseDecisionsEqual(left, right storeapi.ResponseDecision) bool {
+	return left.StatusCode == right.StatusCode && left.ContentType == right.ContentType &&
+		left.RetryAfter == right.RetryAfter && bytes.Equal(left.Body, right.Body)
 }
 
 type workerEventStages struct {
@@ -883,7 +1161,7 @@ func (server *Server) loadWorkerEventStages(
 	event completion.Event,
 	eventDigest string,
 ) (workerEventStages, error) {
-	events, err := server.store.ListResponseEvents(ctx, requestKey, 0)
+	events, err := server.store.ListWorkerEventStages(ctx, requestKey, event.ID)
 	if err != nil {
 		return workerEventStages{}, fmt.Errorf("list durable worker event stages: %w", err)
 	}
@@ -1043,16 +1321,39 @@ func (server *Server) applyEventState(
 				return current, err
 			}
 		case completion.EventClarification:
-			if current == completion.StateAwaitingCaller {
+			next := completion.StateAwaitingCaller
+			if task.CapabilityTier == completion.TierChat {
+				// Chat clients observe clarification as a normal stop response and
+				// carry any user's follow-up in a new, independent completion.
+				next = completion.StateCompleted
+			}
+			if current == next {
 				break
 			}
 			if current != completion.StateResponded {
 				return current, unrecoverableWorkerEvent("clarification cannot resume from state %q", current)
 			}
-			if err := transition(completion.StateAwaitingCaller, ""); err != nil {
+			if err := transition(next, ""); err != nil {
 				return current, err
 			}
 		case completion.EventToolCalls:
+			// Chat clients execute their own declared tools and submit the result
+			// in a new, independent completion. They do not carry our stable
+			// task identity across requests, so this response is terminal and
+			// must not create caller-shim execution records that can never be
+			// reconciled. Adapter-gated tiers retain the durable tool loop below.
+			if task.CapabilityTier == completion.TierChat {
+				if current == completion.StateCompleted {
+					break
+				}
+				if current != completion.StateResponded {
+					return current, unrecoverableWorkerEvent("Chat tool response cannot resume from state %q", current)
+				}
+				if err := transition(completion.StateCompleted, ""); err != nil {
+					return current, err
+				}
+				break
+			}
 			for _, call := range event.ToolCalls {
 				digest, err := toolCallDigest(call)
 				if err != nil {
@@ -1115,46 +1416,107 @@ func (server *Server) applyEventState(
 }
 
 func (server *Server) validateToolCalls(task storeapi.Task, request canonical.Request, calls []completion.ToolCall) error {
-	if task.CapabilityTier == completion.TierChat {
-		return errors.New("Chat-tier tasks cannot dispatch tools")
+	if request.ToolCallPolicy == canonical.ToolCallsSerial && len(calls) > 1 {
+		return fmt.Errorf("serial tool-call policy allows one call, got %d", len(calls))
 	}
-	profile, ok := server.adapters.Resolve(task.HarnessID, task.HarnessVersion)
-	if !ok {
-		return errors.New("task has no exact harness adapter")
-	}
-	declared := make(map[string]struct{}, len(request.Tools))
+	type toolIdentity struct{ namespace, name string }
+	declared := make(map[toolIdentity]struct{}, len(request.Tools))
 	for _, tool := range request.Tools {
-		declared[tool.Name] = struct{}{}
+		declared[toolIdentity{namespace: tool.Namespace, name: tool.Name}] = struct{}{}
 	}
 	seen := make(map[string]struct{}, len(calls))
 	for _, call := range calls {
-		if strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Name) == "" {
+		if strings.TrimSpace(call.ID) == "" || call.ID != strings.TrimSpace(call.ID) {
 			return errors.New("tool calls require stable ids and names")
+		}
+		if err := canonical.ValidateToolIdentity(call.Namespace, call.Name); err != nil {
+			return fmt.Errorf("tool call %q has invalid identity: %w", call.ID, err)
 		}
 		if _, duplicate := seen[call.ID]; duplicate {
 			return fmt.Errorf("duplicate tool call id %q", call.ID)
 		}
 		seen[call.ID] = struct{}{}
-		if _, ok := declared[call.Name]; !ok {
-			return fmt.Errorf("tool %q was not declared by the caller", call.Name)
-		}
-		if !profile.AllowsTool(call.Name) {
-			return fmt.Errorf("tool %q is not allowed by adapter %s", call.Name, profile.Key())
-		}
-		if profile.IsExecTool(call.Name) && !task.ExecAllowed {
-			return fmt.Errorf("exec tool %q is disabled by default", call.Name)
+		identity := toolIdentity{namespace: call.Namespace, name: call.Name}
+		if _, ok := declared[identity]; !ok {
+			return fmt.Errorf("tool %q was not declared by the caller", call.QualifiedName())
 		}
 	}
 	if len(calls) == 0 {
 		return errors.New("tool_calls response contains no calls")
 	}
+	if task.CapabilityTier == completion.TierChat {
+		return nil
+	}
+	profile, ok := server.adapters.Resolve(task.HarnessID, task.HarnessVersion)
+	if !ok {
+		return errors.New("task has no exact harness adapter")
+	}
+	for _, call := range calls {
+		var authorization adapter.ToolAuthorization
+		var classified bool
+		if call.Namespace == "" {
+			authorization, classified = profile.AuthorizeTool(call.Name)
+		}
+		if (!classified || authorization == adapter.ToolAuthorizationPrivileged) && !task.ExecAllowed {
+			if !classified {
+				return fmt.Errorf("unclassified caller tool %q requires explicit authorization (X-Human-Allow-Exec: true)", call.QualifiedName())
+			}
+			return fmt.Errorf("privileged caller tool %q requires explicit authorization (X-Human-Allow-Exec: true)", call.QualifiedName())
+		}
+	}
 	return nil
 }
 
-// Recover reconstructs every durable, incomplete completion session before
-// humand starts accepting traffic. A record that predates the durable stream
-// metadata/step format is rejected explicitly instead of being redispatched
-// with a fabricated or mismatched response stream.
+// validateNewToolCallIDs enforces task-wide tool-call identity before the
+// response step becomes durable. A worker event may be replayed with the same
+// event ID and digest through the durable event-stage path, but a distinct
+// event must never reuse a tool_call_id: doing so would make a later caller
+// result ambiguous and used to leave the rejected event at the head of the
+// worker outbox forever.
+func (server *Server) validateNewToolCallIDs(
+	ctx context.Context,
+	task storeapi.Task,
+	calls []completion.ToolCall,
+) error {
+	if task.CapabilityTier == completion.TierChat {
+		return nil
+	}
+	for _, call := range calls {
+		digest, err := toolCallDigest(call)
+		if err != nil {
+			return &invalidTaskToolCallIDError{err: fmt.Errorf(
+				"tool call %q cannot be encoded: %w", call.ID, err,
+			)}
+		}
+		execution, err := server.store.LookupToolExecution(ctx, storeapi.ToolExecutionKey{
+			CallerID: task.CallerID, TaskID: task.TaskID, ToolCallID: call.ID,
+		})
+		if errors.Is(err, storeapi.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if execution.RequestDigest == digest {
+			return &invalidTaskToolCallIDError{err: fmt.Errorf(
+				"%w: tool call id %q was already dispatched for this task",
+				storeapi.ErrToolCallConflict, call.ID,
+			)}
+		}
+		return &invalidTaskToolCallIDError{err: fmt.Errorf(
+			"%w: tool call id %q was reused with different input",
+			storeapi.ErrToolCallConflict, call.ID,
+		)}
+	}
+	return nil
+}
+
+// Recover reconstructs every trustworthy, incomplete completion session before
+// gateway starts accepting traffic. Record-local corruption is quarantined
+// into a durable terminal response so unrelated sessions can still recover.
+// If that terminal response cannot be persisted, recovery aborts: accepting
+// traffic would leave the affected idempotency key attached to an incomplete
+// response with no finite replay.
 func (server *Server) Recover(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("recovery context is required")
@@ -1163,12 +1525,39 @@ func (server *Server) Recover(ctx context.Context) error {
 	server.runContext = ctx
 	server.runMu.Unlock()
 
-	requests, err := server.store.ListRecoverableRequests(ctx)
+	snapshot, err := server.store.ListRecoverableRequests(ctx)
 	if err != nil {
 		return fmt.Errorf("list recoverable completion requests: %w", err)
 	}
-	for _, request := range requests {
+	for _, issue := range snapshot.Issues {
+		if err := server.quarantineRecoveryIssue(ctx, issue); err != nil {
+			return fmt.Errorf(
+				"persist recovery quarantine for %s/%s: %w",
+				issue.CallerID, issue.IdempotencyKey, err,
+			)
+		}
+		server.logRecoveryQuarantine(issue.RequestKey, issue.Err)
+	}
+	for _, request := range snapshot.Requests {
 		if err := server.recoverRequest(ctx, request); err != nil {
+			if errors.Is(err, storeapi.ErrUnrecoverableRequest) {
+				if terminalErr := server.failClosedRecoveryRequest(ctx, request); terminalErr != nil {
+					return fmt.Errorf(
+						"persist recovery failure for %s/%s after unrecoverable request (%v): %w",
+						request.Request.CallerID,
+						request.Request.IdempotencyKey,
+						err,
+						terminalErr,
+					)
+				}
+				server.logger.Error(
+					"failed closed unrecoverable completion request",
+					"caller_id", request.Request.CallerID,
+					"idempotency_key", request.Request.IdempotencyKey,
+					"error", err,
+				)
+				continue
+			}
 			return fmt.Errorf(
 				"recover completion request %s/%s: %w",
 				request.Request.CallerID, request.Request.IdempotencyKey, err,
@@ -1176,6 +1565,256 @@ func (server *Server) Recover(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (server *Server) quarantineRecoveryIssue(
+	ctx context.Context,
+	issue storeapi.RecoveryIssue,
+) error {
+	const message = "durable completion could not be recovered safely; start a new request identity"
+	failure := storeapi.ResponseDecision{
+		StatusCode:  http.StatusInternalServerError,
+		ContentType: "application/json",
+		Body: []byte(
+			`{"error":{"type":"server_error","code":"recovery_failed","message":"` + message + `"}}`,
+		),
+	}
+	var terminal []byte
+	if codec, ok := server.codecForDialect(issue.Dialect); ok {
+		failure.Body = codec.AdmissionError(
+			http.StatusInternalServerError, "recovery_failed", message,
+		)
+		if issue.ResponseStatus == http.StatusOK {
+			metadata := streamMetadata{
+				ResponseID: recoveryFailureResponseID(issue.RequestKey, issue.Dialect),
+				Model:      "human-expert", CreatedAtUnix: 1,
+			}
+			// The opaque checkpoint is optional: corrupt/missing metadata must not
+			// prevent finite quarantine. When valid, preserve the response identity
+			// already visible on the committed stream.
+			var stored streamMetadata
+			if json.Unmarshal(issue.StreamMetadata, &stored) == nil {
+				if strings.TrimSpace(stored.ResponseID) != "" {
+					metadata.ResponseID = stored.ResponseID
+				}
+				if strings.TrimSpace(stored.Model) != "" {
+					metadata.Model = stored.Model
+				}
+				if stored.CreatedAtUnix > 0 {
+					metadata.CreatedAtUnix = stored.CreatedAtUnix
+				}
+				metadata.ToolCallPolicy = stored.ToolCallPolicy
+			}
+			encoder := codec.NewStream(
+				metadata.ResponseID, metadata.Model,
+				dialect.StreamSeed{
+					CreatedAtUnix: metadata.CreatedAtUnix, ToolCallPolicy: metadata.ToolCallPolicy,
+				},
+			)
+			if _, err := encoder.Start(); err != nil {
+				return fmt.Errorf("initialize recovery quarantine stream: %w", err)
+			}
+			frames, done, err := encoder.Encode(completion.Event{
+				ID:        "recovery_failed_" + stableRecoverySuffix(issue.RequestKey),
+				Type:      completion.EventFailed,
+				ErrorCode: "recovery_failed",
+				Error:     "recovery_failed: durable completion could not be recovered safely",
+			}, dialect.EventSeed{EncodedAtUnix: metadata.CreatedAtUnix})
+			if err != nil {
+				return fmt.Errorf("encode recovery quarantine terminal: %w", err)
+			}
+			if !done || len(frames) == 0 {
+				return errors.New("recovery quarantine codec produced no terminal frame")
+			}
+			terminal = bytes.Join(frames, nil)
+			if issue.Dialect == canonical.DialectResponses {
+				events, err := server.store.ListResponseEvents(ctx, issue.RequestKey, 0)
+				if err != nil {
+					return fmt.Errorf("read Responses quarantine sequence: %w", err)
+				}
+				terminal, err = resequenceResponsesRecoveryTerminal(terminal, events)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	} else if issue.ResponseStatus == http.StatusOK {
+		// An unknown/corrupt task dialect cannot be made dialect-perfect. A
+		// standard SSE error is still deterministic and finite, and preserves the
+		// already-committed 200 transport boundary.
+		terminal = []byte(
+			"event: error\n" +
+				`data: {"error":{"type":"server_error","code":"recovery_failed","message":"` +
+				"durable completion could not be recovered safely" + `"}}` + "\n\n",
+		)
+	}
+	return server.store.QuarantineRecoveryRequest(ctx, storeapi.RecoveryQuarantine{
+		RequestKey: issue.RequestKey, Failure: failure, StreamTerminal: terminal,
+	})
+}
+
+// resequenceResponsesRecoveryTerminal keeps response.failed strictly after
+// any durable deltas emitted before canonical_request became unreadable. The
+// fresh encoder starts at sequence 2; a partially streamed response may be
+// further ahead even though reconstructing its full semantic output is no
+// longer safe.
+func resequenceResponsesRecoveryTerminal(
+	terminal []byte,
+	events []storeapi.ResponseEvent,
+) ([]byte, error) {
+	maxSequence := int64(-1)
+	for _, event := range events {
+		wire, err := responseEventWireData(event)
+		if err != nil {
+			return nil, fmt.Errorf("inspect durable Responses recovery event: %w", err)
+		}
+		for _, block := range bytes.Split(wire, []byte("\n\n")) {
+			for _, line := range bytes.Split(block, []byte("\n")) {
+				if !bytes.HasPrefix(line, []byte("data: ")) {
+					continue
+				}
+				decoder := json.NewDecoder(bytes.NewReader(bytes.TrimPrefix(line, []byte("data: "))))
+				decoder.UseNumber()
+				var payload struct {
+					SequenceNumber json.Number `json:"sequence_number"`
+				}
+				if decoder.Decode(&payload) != nil || payload.SequenceNumber == "" {
+					continue
+				}
+				sequence, err := payload.SequenceNumber.Int64()
+				if err == nil && sequence > maxSequence {
+					maxSequence = sequence
+				}
+			}
+		}
+	}
+	dataPrefix := []byte("data: ")
+	dataStart := bytes.Index(terminal, dataPrefix)
+	if dataStart < 0 {
+		return nil, errors.New("Responses recovery terminal has no data payload")
+	}
+	dataStart += len(dataPrefix)
+	dataEndOffset := bytes.Index(terminal[dataStart:], []byte("\n\n"))
+	if dataEndOffset < 0 {
+		return nil, errors.New("Responses recovery terminal is not a complete SSE event")
+	}
+	dataEnd := dataStart + dataEndOffset
+	decoder := json.NewDecoder(bytes.NewReader(terminal[dataStart:dataEnd]))
+	decoder.UseNumber()
+	var payload map[string]any
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode Responses recovery terminal: %w", err)
+	}
+	payload["sequence_number"] = maxSequence + 1
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode Responses recovery terminal: %w", err)
+	}
+	result := make([]byte, 0, len(terminal)-dataEnd+dataStart+len(encoded))
+	result = append(result, terminal[:dataStart]...)
+	result = append(result, encoded...)
+	result = append(result, terminal[dataEnd:]...)
+	return result, nil
+}
+
+// failClosedRecoveryRequest converts a record-local reconstruction failure
+// into a durable terminal response whenever its canonical request and task
+// identity are still trustworthy. That preserves isolation without leaving an
+// idempotency key attached to an endless/incomplete replay.
+func (server *Server) failClosedRecoveryRequest(
+	ctx context.Context,
+	recovered storeapi.BeginRequestResult,
+) error {
+	codec, ok := server.codecForDialect(recovered.Task.Dialect)
+	if !ok {
+		return fmt.Errorf("no codec for dialect %q", recovered.Task.Dialect)
+	}
+	decision := storeapi.ResponseDecision{
+		StatusCode: http.StatusInternalServerError, ContentType: "application/json",
+		Body: codec.AdmissionError(
+			http.StatusInternalServerError,
+			"recovery_failed",
+			"durable completion could not be recovered safely; start a new request identity",
+		),
+	}
+	// Before phase B, preserve the task for an explicit new-key retry and make
+	// the old key replay one immutable 500 response.
+	if recovered.Request.Response.StatusCode == 0 &&
+		(recovered.Task.State == completion.StateAdmitted || recovered.Task.State == completion.StateReconciled) {
+		_, err := server.failRequest(ctx, recovered.Request.RequestKey, recovered.Task.State, decision)
+		return err
+	}
+
+	request := recovered.Request.CanonicalRequest
+	seedUnix := recovered.Request.CreatedAt.UTC().Unix()
+	if seedUnix <= 0 {
+		seedUnix = 1
+	}
+	responseID := recoveryFailureResponseID(recovered.Request.RequestKey, request.Dialect)
+	seed := dialect.StreamSeed{CreatedAtUnix: seedUnix, ToolCallPolicy: request.ToolCallPolicy}
+	var encoder dialect.Encoder
+	if request.Stream {
+		encoder = codec.NewStream(responseID, request.Model, seed)
+	} else {
+		encoder = codec.NewAggregate(responseID, request.Model, seed)
+	}
+	// Some encoders initialize lifecycle state in Start. Existing verified wire
+	// remains untouched; only the deterministic failure step below is appended.
+	if _, err := encoder.Start(); err != nil {
+		return fmt.Errorf("initialize recovery failure encoder: %w", err)
+	}
+	if request.Stream && recovered.Request.Response.StatusCode == 0 {
+		decided, err := server.beginResponse(ctx, recovered.Request)
+		if err != nil {
+			return fmt.Errorf("commit recovery failure stream boundary: %w", err)
+		}
+		recovered.Request = decided
+	}
+	event := completion.Event{
+		ID:        "recovery_failed_" + stableRecoverySuffix(recovered.Request.RequestKey),
+		Type:      completion.EventFailed,
+		WorkerID:  workerproto.GatewayEventOwner,
+		ErrorCode: "recovery_failed",
+		Error:     "durable completion could not be recovered safely",
+	}
+	_, done, err := server.persistAndApplyEvent(
+		ctx, encoder, recovered.Task, request, recovered.Request.RequestKey,
+		recovered.Task.State, make(map[string]persistedStep), event,
+	)
+	if err != nil {
+		return err
+	}
+	if !done {
+		return errors.New("recovery failure event did not terminate response")
+	}
+	return nil
+}
+
+func stableRecoverySuffix(key storeapi.RequestKey) string {
+	digest := sha256.Sum256([]byte(key.CallerID + "\x00" + key.IdempotencyKey))
+	return hex.EncodeToString(digest[:12])
+}
+
+func recoveryFailureResponseID(key storeapi.RequestKey, requestDialect canonical.Dialect) string {
+	prefix := "response_recovery_"
+	switch requestDialect {
+	case canonical.DialectOpenAIChat:
+		prefix = "chatcmpl_recovery_"
+	case canonical.DialectResponses:
+		prefix = "resp_recovery_"
+	case canonical.DialectAnthropic:
+		prefix = "msg_recovery_"
+	}
+	return prefix + stableRecoverySuffix(key)
+}
+
+func (server *Server) logRecoveryQuarantine(key storeapi.RequestKey, err error) {
+	server.logger.Error(
+		"quarantined unrecoverable completion request",
+		"caller_id", key.CallerID,
+		"idempotency_key", key.IdempotencyKey,
+		"error", err,
+	)
 }
 
 func (server *Server) recoverRequest(ctx context.Context, recovered storeapi.BeginRequestResult) error {
@@ -1195,7 +1834,7 @@ func (server *Server) recoverRequest(ctx context.Context, recovered storeapi.Beg
 		return err
 	}
 	var metadata *streamMetadata
-	hasStartWire := false
+	startWireFrames := make([][]byte, 0)
 	steps := make([]persistedStep, 0)
 	appliedSteps := make(map[string]persistedStep)
 	for _, event := range events {
@@ -1211,7 +1850,7 @@ func (server *Server) recoverRequest(ctx context.Context, recovered storeapi.Beg
 			}
 			metadata = &decoded
 		case responseEventWire:
-			hasStartWire = true
+			startWireFrames = append(startWireFrames, event.Data)
 		case responseEventStep:
 			var step persistedStep
 			if err := json.Unmarshal(event.Data, &step); err != nil || !validPersistedStep(step) {
@@ -1245,13 +1884,13 @@ func (server *Server) recoverRequest(ctx context.Context, recovered storeapi.Beg
 		}
 		created := streamMetadata{
 			ResponseID: responseID, Model: request.Model,
-			CreatedAtUnix: time.Now().UTC().Unix(),
+			CreatedAtUnix: time.Now().UTC().Unix(), ToolCallPolicy: request.ToolCallPolicy,
 		}
 		payload, err := json.Marshal(created)
 		if err != nil {
 			return err
 		}
-		if _, err := server.store.AppendResponseEvent(ctx, recovered.Request.RequestKey, responseEventStream, payload); err != nil {
+		if _, err := server.appendResponseEvent(ctx, recovered.Request.RequestKey, responseEventStream, payload); err != nil {
 			return fmt.Errorf("create recovery stream checkpoint: %w", err)
 		}
 		metadata = &created
@@ -1268,31 +1907,72 @@ func (server *Server) recoverRequest(ctx context.Context, recovered storeapi.Beg
 			storeapi.ErrUnrecoverableRequest, metadata.Model, request.Model,
 		)
 	}
-	stream := codec.NewStream(metadata.ResponseID, metadata.Model, dialect.StreamSeed{
-		CreatedAtUnix: metadata.CreatedAtUnix,
-	})
-	startFrames, err := stream.Start()
+	seed := dialect.StreamSeed{
+		CreatedAtUnix: metadata.CreatedAtUnix, ToolCallPolicy: request.ToolCallPolicy,
+	}
+	var encoder dialect.Encoder
+	if request.Stream {
+		encoder = codec.NewStream(metadata.ResponseID, metadata.Model, seed)
+	} else {
+		encoder = codec.NewAggregate(metadata.ResponseID, metadata.Model, seed)
+	}
+	startFrames, err := encoder.Start()
 	if err != nil {
-		return fmt.Errorf("restore stream start: %w", err)
+		return fmt.Errorf("restore response encoder start: %w", err)
 	}
-	if !hasStartWire {
-		if len(steps) != 0 || len(appliedSteps) != 0 ||
-			recovered.Task.State != completion.StateAdmitted && recovered.Task.State != completion.StateReconciled {
-			return fmt.Errorf("%w: stream checkpoint has no start frame", storeapi.ErrUnrecoverableRequest)
+	if request.Stream {
+		persistedStartCount := min(len(startWireFrames), len(startFrames))
+		for index := 0; index < persistedStartCount; index++ {
+			if !bytes.Equal(startWireFrames[index], startFrames[index]) {
+				return fmt.Errorf(
+					"%w: durable stream start frame %d does not match its deterministic encoding",
+					storeapi.ErrUnrecoverableRequest, index,
+				)
+			}
 		}
-		if err := server.persistFrames(ctx, recovered.Request.RequestKey, startFrames); err != nil {
-			return fmt.Errorf("create recovery stream start: %w", err)
+		if len(startWireFrames) < len(startFrames) {
+			if len(steps) != 0 || len(appliedSteps) != 0 ||
+				recovered.Request.Response.StatusCode != 0 ||
+				recovered.Task.State != completion.StateAdmitted && recovered.Task.State != completion.StateReconciled {
+				return fmt.Errorf(
+					"%w: stream checkpoint contains only %d of %d start frames",
+					storeapi.ErrUnrecoverableRequest, len(startWireFrames), len(startFrames),
+				)
+			}
+			// Start may contain multiple protocol lifecycle frames. A crash can
+			// occur between their individual durable appends, before phase B or
+			// dispatch becomes observable. The existing frames were verified as
+			// an exact prefix above, so append only the missing deterministic tail.
+			if err := server.persistFrames(
+				ctx, recovered.Request.RequestKey, startFrames[len(startWireFrames):],
+			); err != nil {
+				return fmt.Errorf("complete recovery stream start: %w", err)
+			}
 		}
 	}
-	if recovered.Request.Response.StatusCode == 0 {
-		decided, err := server.store.BeginResponse(ctx, recovered.Request.RequestKey)
-		if err != nil {
-			return fmt.Errorf("commit recovered streaming response boundary: %w", err)
+	if !request.Stream && (len(startWireFrames) != 0 || len(startFrames) != 0) {
+		return fmt.Errorf("%w: non-streaming response contains stream wire", storeapi.ErrUnrecoverableRequest)
+	}
+	if request.Stream {
+		if recovered.Request.Response.StatusCode == 0 {
+			decided, err := server.beginResponse(ctx, recovered.Request)
+			if err != nil {
+				return fmt.Errorf("commit recovered streaming response boundary: %w", err)
+			}
+			recovered.Request = decided
+		} else if recovered.Request.Response.StatusCode != http.StatusOK {
+			return fmt.Errorf(
+				"%w: incomplete request has terminal HTTP status %d",
+				storeapi.ErrUnrecoverableRequest, recovered.Request.Response.StatusCode,
+			)
 		}
-		recovered.Request = decided
-	} else if recovered.Request.Response.StatusCode != http.StatusOK {
+	} else if recovered.Request.ResponseComplete {
+		if recovered.Request.Response.StatusCode == 0 || len(recovered.Request.Response.Body) == 0 {
+			return fmt.Errorf("%w: completed non-streaming request has no HTTP decision", storeapi.ErrUnrecoverableRequest)
+		}
+	} else if recovered.Request.Response.StatusCode != 0 {
 		return fmt.Errorf(
-			"%w: incomplete request has terminal HTTP status %d",
+			"%w: incomplete non-streaming request already has HTTP status %d",
 			storeapi.ErrUnrecoverableRequest, recovered.Request.Response.StatusCode,
 		)
 	}
@@ -1311,7 +1991,7 @@ func (server *Server) recoverRequest(ctx context.Context, recovered storeapi.Beg
 		}
 	}
 	for index, step := range steps {
-		frames, done, err := stream.Encode(step.Event, dialect.EventSeed{
+		frames, done, err := encoder.Encode(step.Event, dialect.EventSeed{
 			EncodedAtUnix: step.EncodedAtUnix,
 		})
 		if err != nil {
@@ -1348,7 +2028,7 @@ func (server *Server) recoverRequest(ctx context.Context, recovered storeapi.Beg
 			if err != nil {
 				return err
 			}
-			if _, err := server.store.AppendWorkerResponseEvent(
+			if _, err := server.appendWorkerResponseEvent(
 				ctx, recovered.Request.RequestKey, responseEventApplied,
 				step.Event.ID, eventDigest, payload,
 			); err != nil {
@@ -1363,12 +2043,33 @@ func (server *Server) recoverRequest(ctx context.Context, recovered storeapi.Beg
 			if index != len(steps)-1 {
 				return fmt.Errorf("%w: durable response contains events after terminal step", storeapi.ErrUnrecoverableRequest)
 			}
-			if err := server.store.CompleteRequest(ctx, recovered.Request.RequestKey); err != nil {
-				return err
+			if request.Stream {
+				if err := server.completeRequest(ctx, recovered.Request.RequestKey); err != nil {
+					return err
+				}
+			} else {
+				decision, err := nonStreamingDecision(request.Dialect, step.Event, step.Wire)
+				if err != nil {
+					return err
+				}
+				if recovered.Request.ResponseComplete {
+					if !responseDecisionsEqual(recovered.Request.Response, decision) {
+						return fmt.Errorf(
+							"%w: completed non-streaming response disagrees with terminal step",
+							storeapi.ErrUnrecoverableRequest,
+						)
+					}
+				} else if _, err := server.completeNonStreamingResponse(ctx, recovered.Request.RequestKey, decision); err != nil {
+					return err
+				}
 			}
 		}
+		receiptWorkerID := step.Event.WorkerID
+		if receiptWorkerID == "" {
+			receiptWorkerID = recovered.Task.LeaseOwner
+		}
 		if _, err := server.store.RecordWorkerEventReceipt(
-			ctx, recovered.Request.RequestKey, step.Event.ID, eventDigest,
+			ctx, recovered.Request.RequestKey, step.Event.ID, receiptWorkerID, eventDigest,
 		); err != nil {
 			return fmt.Errorf("record recovered worker event receipt %q: %w", step.Event.ID, err)
 		}
@@ -1392,12 +2093,8 @@ func (server *Server) recoverRequest(ctx context.Context, recovered storeapi.Beg
 	}
 	recovered.Task = latestTask
 	preferredWorker := latestTask.LeaseOwner
-	if current == completion.StateAdmitted {
-		if preferredWorker != "" {
-			return fmt.Errorf("%w: admitted task unexpectedly has a lease owner", storeapi.ErrUnrecoverableRequest)
-		}
-	} else if preferredWorker == "" {
-		return fmt.Errorf("%w: sticky task state %q has no lease owner", storeapi.ErrUnrecoverableRequest, current)
+	if !completion.IsStableKey(preferredWorker) {
+		return fmt.Errorf("%w: task state %q has no valid worker owner", storeapi.ErrUnrecoverableRequest, current)
 	}
 	assignment, err := server.assignmentFrom(recovered.Task, recovered.Request)
 	if err != nil {
@@ -1411,7 +2108,9 @@ func (server *Server) recoverRequest(ctx context.Context, recovered storeapi.Beg
 		return err
 	}
 	recovered.Task.State = current
-	go server.consumeSession(stream, recovered.Task, recovered.Request, deliveries, nil)
+	server.startBackground(func() {
+		server.consumeSession(encoder, recovered.Task, recovered.Request, deliveries, nil)
+	})
 	return nil
 }
 
@@ -1424,13 +2123,14 @@ func (server *Server) assignmentFrom(task storeapi.Task, request storeapi.Reques
 		CallerID: task.CallerID, WorkspaceKey: task.WorkspaceKey,
 		TaskID: task.TaskID, IdempotencyKey: request.IdempotencyKey,
 		HarnessID: task.HarnessID, HarnessVersion: task.HarnessVersion,
-		Root: task.Root, ExecAllowed: task.ExecAllowed,
+		HarnessSessionID: task.HarnessSessionID,
+		Root:             task.Root, ExecAllowed: task.ExecAllowed,
 	}
 	if err := identity.Validate(task.CapabilityTier); err != nil {
 		return completion.Assignment{}, fmt.Errorf("%w: invalid routing identity: %v", storeapi.ErrUnrecoverableRequest, err)
 	}
 	var profile *adapter.Profile
-	virtualRoot := ""
+	workerRoot := ""
 	if task.CapabilityTier != completion.TierChat {
 		resolved, ok := server.adapters.Resolve(task.HarnessID, task.HarnessVersion)
 		if !ok {
@@ -1440,16 +2140,23 @@ func (server *Server) assignmentFrom(task storeapi.Task, request storeapi.Reques
 			)
 		}
 		profile = &resolved
-		virtualRoot = "/workspace"
+		workerRoot = assignmentWorkspaceRoot(task.CapabilityTier, task.Root, profile)
 	}
-	return completion.Assignment{
+	assignment := completion.Assignment{
 		CallerID: task.CallerID, WorkspaceKey: task.WorkspaceKey,
 		TaskID: task.TaskID, IdempotencyKey: request.IdempotencyKey,
 		LeaseOwner: task.LeaseOwner, CapabilityTier: task.CapabilityTier,
 		HarnessID: task.HarnessID, HarnessVersion: task.HarnessVersion,
-		Root: virtualRoot, ExecAllowed: task.ExecAllowed, Adapter: profile,
+		HarnessSessionID: task.HarnessSessionID,
+		Root:             workerRoot, ExecAllowed: task.ExecAllowed, Adapter: profile,
 		Request: request.CanonicalRequest,
-	}, nil
+	}
+	if err := workerproto.ValidateEnvelopeSize(
+		workerproto.MessageAssignment, assignment, server.config.MaxWorkerMessageBytes,
+	); err != nil {
+		return completion.Assignment{}, fmt.Errorf("%w: assignment exceeds worker wire limit: %v", storeapi.ErrUnrecoverableRequest, err)
+	}
+	return assignment, nil
 }
 
 func (server *Server) codecForDialect(value canonical.Dialect) (dialect.Codec, bool) {
@@ -1464,22 +2171,171 @@ func (server *Server) codecForDialect(value canonical.Dialect) (dialect.Codec, b
 func (server *Server) runtimeContext() context.Context {
 	server.runMu.RLock()
 	defer server.runMu.RUnlock()
+	if server.runContext == nil {
+		return context.Background()
+	}
 	return server.runContext
 }
 
+func (server *Server) startBackground(run func()) {
+	server.runWait.Add(1)
+	go func() {
+		defer server.runWait.Done()
+		run()
+	}()
+}
+
+// Wait blocks until all completion sessions started by this server have
+// stopped. Callers must first stop accepting HTTP traffic and cancel the
+// context passed to Recover; this keeps SQLite open until consumer cleanup and
+// audit writes have finished.
+func (server *Server) Wait() {
+	server.runWait.Wait()
+}
+
 type streamReplayCursor struct {
-	flusher  http.Flusher
+	flush    func() error
+	send     func(...[]byte) error
 	sequence int64
+	started  bool
+}
+
+type streamResponseWriter struct {
+	response   http.ResponseWriter
+	controller *http.ResponseController
+	timeout    time.Duration
+}
+
+func newStreamResponseWriter(response http.ResponseWriter, timeout time.Duration) streamResponseWriter {
+	return streamResponseWriter{
+		response: response, controller: http.NewResponseController(response), timeout: timeout,
+	}
+}
+
+func (writer streamResponseWriter) flush() error {
+	return writer.controller.Flush()
+}
+
+// writeAndFlush bounds one transport write without imposing an absolute
+// deadline on the stream. A caller may legitimately wait for a Human for
+// minutes; only a socket that has stopped consuming an available SSE frame is
+// released. ResponseWriter implementations without deadline support retain
+// the standard net/http behavior.
+func (writer streamResponseWriter) writeAndFlush(chunks ...[]byte) (resultErr error) {
+	deadlineSet := false
+	if writer.timeout > 0 {
+		err := writer.controller.SetWriteDeadline(time.Now().Add(writer.timeout))
+		switch {
+		case err == nil:
+			deadlineSet = true
+		case errors.Is(err, http.ErrNotSupported):
+			// Test recorders and some embedding middleware cannot expose the
+			// underlying connection deadline. Continue with their old behavior.
+		default:
+			return fmt.Errorf("set SSE write deadline: %w", err)
+		}
+	}
+	if deadlineSet {
+		defer func() {
+			if err := writer.controller.SetWriteDeadline(time.Time{}); resultErr == nil && err != nil {
+				resultErr = fmt.Errorf("clear SSE write deadline: %w", err)
+			}
+		}()
+	}
+	for _, chunk := range chunks {
+		if len(chunk) == 0 {
+			continue
+		}
+		written, err := writer.response.Write(chunk)
+		if err != nil {
+			return err
+		}
+		if written != len(chunk) {
+			return io.ErrShortWrite
+		}
+	}
+	return writer.flush()
+}
+
+func (cursor streamReplayCursor) writeAndFlush(
+	response http.ResponseWriter,
+	chunks ...[]byte,
+) error {
+	if cursor.send != nil {
+		return cursor.send(chunks...)
+	}
+	for _, chunk := range chunks {
+		if len(chunk) == 0 {
+			continue
+		}
+		written, err := response.Write(chunk)
+		if err != nil {
+			return err
+		}
+		if written != len(chunk) {
+			return io.ErrShortWrite
+		}
+	}
+	if cursor.flush == nil {
+		return errors.New("HTTP response writer does not support flushing")
+	}
+	return cursor.flush()
+}
+
+// abortUndecidedHTTPResponse is used only before any response header has been
+// written. A normal handler return would make net/http synthesize an empty 200,
+// which is observably different from the durable response chosen on recovery.
+func abortUndecidedHTTPResponse() {
+	panic(http.ErrAbortHandler)
+}
+
+func (server *Server) resolveResponseDecisionAfterError(
+	lookup storeapi.BeginRequestResult,
+) (storeapi.BeginRequestResult, bool) {
+	read, ok := server.readDurableDecisionAfterError(lookup.Request.RequestKey)
+	if !ok {
+		return storeapi.BeginRequestResult{}, false
+	}
+	if !lookup.Request.CanonicalRequest.Stream &&
+		(!read.ResponseComplete || len(read.Response.Body) == 0) {
+		return storeapi.BeginRequestResult{}, false
+	}
+	lookup.Request.Response = read.Response
+	lookup.Request.ResponseComplete = read.ResponseComplete
+	return lookup, true
 }
 
 func (server *Server) replayResponse(
 	response http.ResponseWriter,
 	request *http.Request,
 	lookup storeapi.BeginRequestResult,
-	digest string,
 ) {
-	decided, err := server.awaitResponseDecision(request.Context(), lookup, digest)
+	decided, err := server.awaitResponseDecision(request.Context(), lookup)
 	if err != nil {
+		var ok bool
+		decided, ok = server.resolveResponseDecisionAfterError(lookup)
+		if !ok {
+			abortUndecidedHTTPResponse()
+			return
+		}
+	}
+	if decided.Request.RecoveryQuarantined {
+		if decided.Request.Response.StatusCode != http.StatusOK {
+			server.writeResponseDecision(response, decided.Task, decided.Request)
+			return
+		}
+		cursor, err := server.beginStreamingResponse(request.Context(), response, decided)
+		if err != nil {
+			if !cursor.started {
+				abortUndecidedHTTPResponse()
+			}
+			return
+		}
+		server.continueStreamingResponse(response, request, decided, cursor)
+		return
+	}
+	if !decided.Request.CanonicalRequest.Stream {
+		server.writeResponseDecision(response, decided.Task, decided.Request)
 		return
 	}
 	if decided.Request.Response.StatusCode != http.StatusOK {
@@ -1488,11 +2344,26 @@ func (server *Server) replayResponse(
 	}
 	cursor, err := server.beginStreamingResponse(request.Context(), response, decided)
 	if err != nil {
-		slog.Error("replay durable completion response", "caller_id", decided.Request.CallerID,
+		if errors.Is(err, storeapi.ErrReplayPayloadExpired) {
+			codec, ok := server.codecForDialect(decided.Task.Dialect)
+			if !ok {
+				abortUndecidedHTTPResponse()
+				return
+			}
+			server.writeAPIError(
+				response, codec, http.StatusGone, "replay_payload_expired",
+				"exact replay payload has expired; use a new idempotency key",
+			)
+			return
+		}
+		server.logger.Error("replay durable completion response", "caller_id", decided.Request.CallerID,
 			"idempotency_key", decided.Request.IdempotencyKey, "error", err)
+		if !cursor.started {
+			abortUndecidedHTTPResponse()
+		}
 		return
 	}
-	server.continueStreamingResponse(response, request, decided, digest, cursor)
+	server.continueStreamingResponse(response, request, decided, cursor)
 }
 
 // awaitResponseDecision prevents a concurrent duplicate from inferring 200
@@ -1502,26 +2373,30 @@ func (server *Server) replayResponse(
 func (server *Server) awaitResponseDecision(
 	ctx context.Context,
 	lookup storeapi.BeginRequestResult,
-	digest string,
 ) (storeapi.BeginRequestResult, error) {
+	ctx, cancelContext := server.responseReadContext(ctx)
+	defer cancelContext()
 	if lookup.Request.Response.StatusCode != 0 {
 		return lookup, nil
 	}
-	poll := time.NewTicker(50 * time.Millisecond)
-	defer poll.Stop()
 	for {
-		select {
-		case <-ctx.Done():
-			return storeapi.BeginRequestResult{}, ctx.Err()
-		case <-poll.C:
-		}
-		refreshed, err := server.store.LookupRequest(ctx, lookup.Request.RequestKey, digest)
+		wakeup, cancel := server.responses.subscribe(lookup.Request.RequestKey)
+		read, err := server.store.ReadResponse(ctx, lookup.Request.RequestKey, math.MaxInt64)
 		if err != nil {
+			cancel()
 			return storeapi.BeginRequestResult{}, err
 		}
-		if refreshed.Request.Response.StatusCode != 0 {
-			return refreshed, nil
+		if read.Response.StatusCode != 0 {
+			cancel()
+			lookup.Request.Response = read.Response
+			lookup.Request.ResponseComplete = read.ResponseComplete
+			return lookup, nil
 		}
+		if err := waitForResponseChange(ctx, wakeup); err != nil {
+			cancel()
+			return storeapi.BeginRequestResult{}, err
+		}
+		cancel()
 	}
 }
 
@@ -1535,42 +2410,63 @@ func (server *Server) beginStreamingResponse(
 	if lookup.Request.Response.StatusCode != http.StatusOK {
 		return streamReplayCursor{}, fmt.Errorf("stream response status is %d", lookup.Request.Response.StatusCode)
 	}
-	flusher, ok := response.(http.Flusher)
+	_, ok := response.(http.Flusher)
 	if !ok {
 		return streamReplayCursor{}, errors.New("HTTP response writer does not support flushing")
 	}
-	events, err := server.listResponseEventsBeforeReplay(ctx, lookup.Request.RequestKey)
+	read, err := server.readResponseBeforeReplay(ctx, lookup.Request.RequestKey)
 	if err != nil {
 		return streamReplayCursor{}, err
+	}
+	if read.Response.StatusCode != http.StatusOK {
+		return streamReplayCursor{}, fmt.Errorf(
+			"stream response snapshot status is %d", read.Response.StatusCode,
+		)
+	}
+	type preparedEvent struct {
+		sequence int64
+		wire     []byte
+	}
+	prepared := make([]preparedEvent, 0, len(read.Events))
+	for _, event := range read.Events {
+		wire, err := responseEventWireData(event)
+		if err != nil {
+			return streamReplayCursor{}, err
+		}
+		prepared = append(prepared, preparedEvent{sequence: event.Sequence, wire: wire})
 	}
 	setSSEHeaders(response)
 	response.Header().Set(headerTaskID, lookup.Task.TaskID)
 	response.Header().Set(headerIdempotencyKey, lookup.Request.IdempotencyKey)
 	response.WriteHeader(http.StatusOK)
-	cursor := streamReplayCursor{flusher: flusher}
-	for _, event := range events {
-		wire, err := responseEventWireData(event)
-		if err != nil {
-			return cursor, err
-		}
-		if len(wire) != 0 {
-			_, _ = response.Write(wire)
-		}
-		cursor.sequence = event.Sequence
+	streamWriter := newStreamResponseWriter(response, server.config.StreamWriteTimeout)
+	cursor := streamReplayCursor{
+		flush:   streamWriter.flush,
+		send:    streamWriter.writeAndFlush,
+		started: true,
 	}
-	flusher.Flush()
+	frames := make([][]byte, 0, len(prepared))
+	for _, event := range prepared {
+		if len(event.wire) != 0 {
+			frames = append(frames, event.wire)
+		}
+		cursor.sequence = event.sequence
+	}
+	if err := cursor.send(frames...); err != nil {
+		return cursor, err
+	}
 	return cursor, nil
 }
 
-// listResponseEventsBeforeReplay retries the only store read between a durable
-// 200 decision and the first byte of an idempotent replay. Returning a transient
-// store failure here would otherwise make net/http synthesize an empty 200. Once
-// the SSE response is observable, continueStreamingResponse deliberately keeps
-// its disconnect-and-replay behavior instead of retrying reads on the socket.
-func (server *Server) listResponseEventsBeforeReplay(
+// readResponseBeforeReplay pins the response decision, retention tombstone,
+// completion flag, and all currently durable events in one Store snapshot
+// before making a 200 observable. A purge racing the earlier idempotency lookup
+// therefore yields either an explicit 410 or a complete in-memory replay, never
+// a truncated success.
+func (server *Server) readResponseBeforeReplay(
 	requestContext context.Context,
 	requestKey storeapi.RequestKey,
-) ([]storeapi.ResponseEvent, error) {
+) (storeapi.ResponseRead, error) {
 	runtimeContext := server.runtimeContext()
 	ctx, cancel := context.WithCancel(requestContext)
 	stopRuntimeCancel := context.AfterFunc(runtimeContext, cancel)
@@ -1583,18 +2479,21 @@ func (server *Server) listResponseEventsBeforeReplay(
 	}
 
 	for {
-		events, err := server.store.ListResponseEvents(ctx, requestKey, 0)
+		read, err := server.store.ReadResponse(ctx, requestKey, 0)
 		if err == nil {
-			return events, nil
+			if read.PayloadPruned {
+				return storeapi.ResponseRead{}, storeapi.ErrReplayPayloadExpired
+			}
+			return read, nil
 		}
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return storeapi.ResponseRead{}, ctx.Err()
 		}
 		retry := time.NewTimer(50 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			retry.Stop()
-			return nil, ctx.Err()
+			return storeapi.ResponseRead{}, ctx.Err()
 		case <-retry.C:
 		}
 	}
@@ -1604,53 +2503,83 @@ func (server *Server) continueStreamingResponse(
 	response http.ResponseWriter,
 	request *http.Request,
 	lookup storeapi.BeginRequestResult,
-	digest string,
 	cursor streamReplayCursor,
 ) {
-	poll := time.NewTicker(50 * time.Millisecond)
-	defer poll.Stop()
+	ctx, cancelContext := server.responseReadContext(request.Context())
+	defer cancelContext()
 	for {
-		events, err := server.store.ListResponseEvents(request.Context(), lookup.Request.RequestKey, cursor.sequence)
+		wakeup, cancel := server.responses.subscribe(lookup.Request.RequestKey)
+		read, err := server.store.ReadResponse(ctx, lookup.Request.RequestKey, cursor.sequence)
 		if err != nil {
+			cancel()
 			return
 		}
-		for _, event := range events {
+		for _, event := range read.Events {
 			wire, err := responseEventWireData(event)
 			if err != nil {
+				cancel()
 				return
 			}
 			if len(wire) != 0 {
-				_, _ = response.Write(wire)
-				cursor.flusher.Flush()
+				if cursor.writeAndFlush(response, wire) != nil {
+					cancel()
+					return
+				}
 			}
 			cursor.sequence = event.Sequence
 		}
-		refreshed, err := server.store.LookupRequest(request.Context(), lookup.Request.RequestKey, digest)
-		if err != nil {
+		if read.ResponseComplete {
+			cancel()
 			return
 		}
-		if refreshed.Request.ResponseComplete {
+		if err := waitForResponseChange(ctx, wakeup); err != nil {
+			cancel()
 			return
 		}
-		select {
-		case <-request.Context().Done():
-			return
-		case <-poll.C:
-		}
+		cancel()
 	}
 }
 
-func (server *Server) identity(request *http.Request, callerID string) (completion.RoutingIdentity, completion.CapabilityTier) {
+func (server *Server) identity(
+	request *http.Request,
+	callerID string,
+) (completion.RoutingIdentity, completion.CapabilityTier, error) {
 	tier, err := completion.ParseCapabilityTier(request.Header.Get(headerCapabilityTier))
 	if err != nil {
-		tier = completion.TierChat
+		return completion.RoutingIdentity{}, "", err
 	}
 	return completion.RoutingIdentity{
 		CallerID: callerID, WorkspaceKey: request.Header.Get(headerWorkspaceKey),
 		TaskID: request.Header.Get(headerTaskID), IdempotencyKey: request.Header.Get(headerIdempotencyKey),
 		HarnessID: request.Header.Get(headerHarnessID), HarnessVersion: request.Header.Get(headerHarnessVersion),
 		Root: request.Header.Get(headerWorkspaceRoot), ExecAllowed: strings.EqualFold(strings.TrimSpace(request.Header.Get(headerAllowExec)), "true"),
-	}, tier
+	}, tier, nil
+}
+
+func assignmentWorkspaceRoot(
+	tier completion.CapabilityTier,
+	callerRoot string,
+	profile *adapter.Profile,
+) string {
+	if tier == completion.TierChat || profile == nil {
+		return ""
+	}
+	if profile.PathStyle == adapter.PathAbsolute {
+		return callerRoot
+	}
+	return "/workspace"
+}
+
+// isOpenCodeAuxiliaryRequest isolates provider-owned title/summary calls from
+// the durable Workspace task selected by static OpenCode provider headers.
+// The exact captured auxiliary shape has no tools. A request that declares
+// even a non-builtin tool remains in the Workspace task: the Human may use any
+// caller-declared native tool, while adapter-specific mirror features still
+// fail closed unless their exact mapping is present.
+func isOpenCodeAuxiliaryRequest(profile adapter.Profile, request canonical.Request) bool {
+	return profile.HarnessID == adapter.OpenCodeID &&
+		profile.HarnessVersion == adapter.OpenCodeVersion &&
+		len(request.Tools) == 0
 }
 
 // validateCallerDeclaration treats every caller-id header value as an
@@ -1675,19 +2604,12 @@ func validateCallerDeclaration(header http.Header, principalCallerID string) (st
 }
 
 func (server *Server) authenticate(request *http.Request) (auth.Principal, error) {
-	secret := strings.TrimSpace(request.Header.Get("X-Api-Key"))
-	if authorization := request.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(authorization), "bearer ") {
-		secret = strings.TrimSpace(authorization[len("Bearer "):])
-	}
-	if secret == "" {
-		return auth.Principal{}, auth.ErrUnauthorized
-	}
-	return server.auth.Authenticate(request.Context(), secret)
+	return server.auth.AuthenticateRequest(request)
 }
 
 func (server *Server) persistFrames(ctx context.Context, key storeapi.RequestKey, frames [][]byte) error {
 	for _, frame := range frames {
-		if _, err := server.store.AppendResponseEvent(ctx, key, responseEventWire, frame); err != nil {
+		if _, err := server.appendResponseEvent(ctx, key, responseEventWire, frame); err != nil {
 			return err
 		}
 	}
@@ -1726,9 +2648,9 @@ func (server *Server) failBeforeStream(
 		StatusCode: http.StatusInternalServerError, ContentType: "application/json",
 		Body: codec.AdmissionError(http.StatusInternalServerError, code, cause.Error()),
 	}
-	stored, err := server.store.FailRequest(context.Background(), requestKey, task.State, decision)
+	stored, err := server.failRequest(context.Background(), requestKey, task.State, decision)
 	if err != nil {
-		slog.Error("persist pre-stream failure", "caller_id", requestKey.CallerID,
+		server.logger.Error("persist pre-stream failure", "caller_id", requestKey.CallerID,
 			"idempotency_key", requestKey.IdempotencyKey, "error", err)
 		server.writeAPIError(response, codec, http.StatusInternalServerError, "store_error", "failed to persist terminal response")
 		return

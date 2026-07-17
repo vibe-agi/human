@@ -17,11 +17,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"unicode/utf8"
 
 	"github.com/vibe-agi/human/internal/callerfs"
-	"github.com/vibe-agi/human/internal/completion"
-	"github.com/vibe-agi/human/internal/completion/canonical"
 	"github.com/vibe-agi/human/internal/completion/safety"
 )
 
@@ -51,19 +48,50 @@ type Change struct {
 	Reasons     []string
 }
 
+// ReviewDiagnostic describes a scratch-tree entry which Review deliberately
+// did not turn into a caller mutation. Unsupported entries are isolated per
+// path so one build artifact cannot block unrelated source edits, but they
+// remain visible to the Human instead of disappearing silently.
+type ReviewDiagnostic struct {
+	Path   string
+	Reason string
+}
+
 type baselineEntry struct {
 	Fingerprint string `json:"fingerprint"`
 	Blob        string `json:"blob"`
 }
 
+type deliveryIntent struct {
+	ProfileKey      string        `json:"profile_key"`
+	ToolName        string        `json:"tool_name"`
+	Path            string        `json:"path"`
+	Kind            ChangeKind    `json:"kind"`
+	CallDigest      string        `json:"call_digest"`
+	BaseFingerprint string        `json:"base_fingerprint"`
+	Delivered       baselineEntry `json:"delivered,omitempty"`
+	Deleted         bool          `json:"deleted,omitempty"`
+}
+
+type hydrationIntent struct {
+	ProfileKey string `json:"profile_key"`
+	ToolName   string `json:"tool_name"`
+	Path       string `json:"path"`
+	CallDigest string `json:"call_digest"`
+}
+
 type baselineState struct {
-	Entries map[string]baselineEntry `json:"entries"`
-	Results map[string]string        `json:"results,omitempty"`
+	Entries    map[string]baselineEntry   `json:"entries"`
+	Results    map[string]string          `json:"results,omitempty"`
+	Warnings   map[string]string          `json:"warnings,omitempty"`
+	Deliveries map[string]deliveryIntent  `json:"deliveries,omitempty"`
+	Hydrations map[string]hydrationIntent `json:"hydrations,omitempty"`
 }
 
 type ReconcileReport struct {
 	Confirmed []string
 	Failed    map[string]string
+	Warnings  []string
 }
 
 type Workspace struct {
@@ -73,6 +101,7 @@ type Workspace struct {
 	stateDir    string
 	state       baselineState
 	maxFile     int64
+	diagnostics []ReviewDiagnostic
 }
 
 func Open(root, callerID, workspaceKey string) (*Workspace, error) {
@@ -93,7 +122,11 @@ func Open(root, callerID, workspaceKey string) (*Workspace, error) {
 	}
 	workspace := &Workspace{
 		dir: dir, stateDir: stateDir, maxFile: 16 << 20,
-		state: baselineState{Entries: make(map[string]baselineEntry), Results: make(map[string]string)},
+		state: baselineState{
+			Entries: make(map[string]baselineEntry), Results: make(map[string]string),
+			Warnings: make(map[string]string), Deliveries: make(map[string]deliveryIntent),
+			Hydrations: make(map[string]hydrationIntent),
+		},
 	}
 	if err := workspace.load(); err != nil {
 		return nil, err
@@ -116,14 +149,38 @@ func (workspace *Workspace) Hydrate(path string, content []byte, fingerprint str
 	if callerfs.Fingerprint(content) != fingerprint {
 		return ErrBaselineDrift
 	}
-	if err := atomicWrite(target, content, 0o600); err != nil {
-		return err
-	}
 	entry, err := workspace.storeBlob(content, fingerprint)
 	if err != nil {
 		return err
 	}
+	current, readErr := os.ReadFile(target)
+	currentExists := readErr == nil
+	if readErr != nil && !errors.Is(readErr, fs.ErrNotExist) {
+		return readErr
+	}
+	previous, tracked := workspace.state.Entries[relative]
+	localDirty := currentExists
+	if tracked {
+		localDirty = !currentExists || callerfs.Fingerprint(current) != previous.Fingerprint
+	} else if currentExists && callerfs.Fingerprint(current) == fingerprint {
+		localDirty = false
+	}
+	if localDirty {
+		if tracked && previous.Fingerprint == fingerprint {
+			// A repeated read of the same caller baseline must never erase a local
+			// draft. The result is still safe to mark reconciled by the caller.
+			return nil
+		}
+		workspace.state.Entries[relative] = entry
+		workspace.state.Warnings[relative] =
+			"caller content changed while the Human workspace had an unconfirmed draft; merge before sending"
+		return workspace.save()
+	}
+	if err := atomicWrite(target, content, 0o600); err != nil {
+		return err
+	}
 	workspace.state.Entries[relative] = entry
+	delete(workspace.state.Warnings, relative)
 	return workspace.save()
 }
 
@@ -144,6 +201,7 @@ func (workspace *Workspace) Confirm(path, fingerprint string, deleted bool) erro
 			return err
 		}
 		delete(workspace.state.Entries, relative)
+		delete(workspace.state.Warnings, relative)
 		return workspace.save()
 	}
 	content, err := os.ReadFile(target)
@@ -158,119 +216,135 @@ func (workspace *Workspace) Confirm(path, fingerprint string, deleted bool) erro
 		return err
 	}
 	workspace.state.Entries[relative] = entry
+	delete(workspace.state.Warnings, relative)
 	return workspace.save()
 }
 
-// ReconcileRequest consumes previously unseen caller tool results from the
-// full conversation history. Processed IDs are persisted because harnesses
-// resend the entire history on every completion; without this ledger an old
-// read result could overwrite newer worker edits.
-func (workspace *Workspace) ReconcileRequest(request canonical.Request) (ReconcileReport, error) {
-	workspace.reconcileMu.Lock()
-	defer workspace.reconcileMu.Unlock()
-	uses := make(map[string]canonical.Block)
-	for _, message := range request.Messages {
-		for _, block := range message.Blocks {
-			if block.Type == canonical.BlockToolUse {
-				uses[block.ToolCallID] = block
-			}
-		}
-	}
-	report := ReconcileReport{Failed: make(map[string]string)}
-	for _, message := range request.Messages {
-		for _, block := range message.Blocks {
-			if block.Type != canonical.BlockToolResult {
-				continue
-			}
-			use, known := uses[block.ToolCallID]
-			if !known || !strings.HasPrefix(use.ToolName, "human_") {
-				continue
-			}
-			encoded, err := json.Marshal(block)
-			if err != nil {
-				return report, err
-			}
-			sum := sha256.Sum256(encoded)
-			digest := hex.EncodeToString(sum[:])
-			workspace.mu.Lock()
-			previous, processed := workspace.state.Results[block.ToolCallID]
-			workspace.mu.Unlock()
-			if processed {
-				if previous != digest {
-					return report, fmt.Errorf("tool result %s changed after reconciliation", block.ToolCallID)
-				}
-				continue
-			}
-			content, isError, errorMessage, err := decodeToolResponse(block.Output, block.IsError)
-			if err != nil {
-				report.Failed[block.ToolCallID] = err.Error()
-				continue
-			}
-			if isError {
-				if errorMessage == "" {
-					errorMessage = "caller tool returned an error"
-				}
-				report.Failed[block.ToolCallID] = errorMessage
-				if err := workspace.markResult(block.ToolCallID, digest); err != nil {
-					return report, err
-				}
-				continue
-			}
-			if err := workspace.applyToolResult(use, content); err != nil {
-				report.Failed[block.ToolCallID] = err.Error()
-				continue
-			}
-			if err := workspace.markResult(block.ToolCallID, digest); err != nil {
-				return report, err
-			}
-			report.Confirmed = append(report.Confirmed, block.ToolCallID)
-		}
-	}
-	return report, nil
-}
+// ConfirmRename reconciles a caller-confirmed rename into both the scratch
+// tree and its baseline. A caller-side rename may arrive while the scratch
+// tree still has the old path, so treating it as an already-completed local
+// delete followed by a write would drift forever. We only remove/move that
+// source when it still matches the last confirmed baseline; an unconfirmed
+// local edit therefore remains intact and the result fails closed.
+func (workspace *Workspace) ConfirmRename(from, to, fingerprint string) error {
+	workspace.mu.Lock()
+	defer workspace.mu.Unlock()
 
-func (workspace *Workspace) applyToolResult(use canonical.Block, content map[string]any) error {
-	path := stringValue(content["path"])
-	if path == "" {
-		path = stringValue(use.Input["path"])
+	fromRelative, fromTarget, err := workspace.resolve(from)
+	if err != nil {
+		return err
 	}
-	switch use.ToolName {
-	case "human_read_file":
-		fingerprint := stringValue(content["sha256"])
-		encoding := stringValue(content["encoding"])
-		data, err := decodeMirrorContent(stringValue(content["content"]), encoding)
+	toRelative, toTarget, err := workspace.resolve(to)
+	if err != nil {
+		return err
+	}
+	if fromRelative == toRelative || fingerprint == "" {
+		return ErrBaselineDrift
+	}
+
+	fromContent, fromErr := os.ReadFile(fromTarget)
+	fromExists := fromErr == nil
+	if fromErr != nil && !errors.Is(fromErr, fs.ErrNotExist) {
+		return fromErr
+	}
+	if fromExists {
+		entry, tracked := workspace.state.Entries[fromRelative]
+		if !tracked || callerfs.Fingerprint(fromContent) != entry.Fingerprint ||
+			entry.Fingerprint != fingerprint {
+			return ErrBaselineDrift
+		}
+	}
+
+	toContent, toErr := os.ReadFile(toTarget)
+	toExists := toErr == nil
+	if toErr != nil && !errors.Is(toErr, fs.ErrNotExist) {
+		return toErr
+	}
+	if toExists && callerfs.Fingerprint(toContent) != fingerprint {
+		return ErrBaselineDrift
+	}
+	if !fromExists && !toExists {
+		return ErrBaselineDrift
+	}
+	if fromExists && toExists {
+		fromInfo, err := os.Stat(fromTarget)
 		if err != nil {
 			return err
 		}
-		return workspace.Hydrate(path, data, fingerprint)
-	case "human_write_file", "human_edit_file":
-		return workspace.Confirm(path, stringValue(content["sha256"]), false)
-	case "human_delete_file":
-		return workspace.Confirm(path, "", true)
-	case "human_rename_file":
-		from := stringValue(content["from"])
-		to := stringValue(content["to"])
-		if from == "" {
-			from = stringValue(use.Input["from"])
-		}
-		if to == "" {
-			to = stringValue(use.Input["to"])
-		}
-		if err := workspace.Confirm(from, "", true); err != nil {
+		toInfo, err := os.Stat(toTarget)
+		if err != nil {
 			return err
 		}
-		return workspace.Confirm(to, stringValue(content["sha256"]), false)
-	case "human_search", "human_exec":
-		return nil
-	default:
-		return fmt.Errorf("unsupported human shim result %q", use.ToolName)
+		// On a case-insensitive filesystem two differently spelled paths can
+		// resolve to the same directory entry. Hard links have the same shape.
+		// Removing the source in either case could also remove the requested
+		// destination, so leave both the scratch tree and baseline untouched.
+		if os.SameFile(fromInfo, toInfo) {
+			return ErrBaselineDrift
+		}
 	}
+
+	switch {
+	case fromExists && !toExists:
+		// Publish a complete, separate destination inode with an atomic
+		// no-replace operation. If the process stops before removing the source,
+		// replay observes two matching files and safely finishes reconciliation.
+		if err := atomicWriteExclusive(toTarget, fromContent, 0o600); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				return ErrBaselineDrift
+			}
+			return err
+		}
+		toContent, err = os.ReadFile(toTarget)
+		if err != nil || callerfs.Fingerprint(toContent) != fingerprint {
+			if err != nil {
+				return err
+			}
+			return ErrBaselineDrift
+		}
+		if err := os.Remove(fromTarget); err != nil {
+			return err
+		}
+	case fromExists && toExists:
+		// Both paths can legitimately remain after a crash between publishing
+		// the destination and removing the source. They are distinct inodes and
+		// both hashes are confirmed, so removing only the source is safe.
+		if err := os.Remove(fromTarget); err != nil {
+			return err
+		}
+	}
+
+	confirmed, err := os.ReadFile(toTarget)
+	if err != nil || callerfs.Fingerprint(confirmed) != fingerprint {
+		// The destination may have been changed by an editor after our first
+		// verification. Never remove that potentially external content. Restore
+		// the confirmed source under a no-replace rule and leave reconciliation
+		// pending instead.
+		if fromExists {
+			_ = atomicWriteExclusive(fromTarget, fromContent, 0o600)
+		}
+		if err != nil {
+			return err
+		}
+		return ErrBaselineDrift
+	}
+	entry, err := workspace.storeBlob(confirmed, fingerprint)
+	if err != nil {
+		return err
+	}
+	delete(workspace.state.Entries, fromRelative)
+	delete(workspace.state.Warnings, fromRelative)
+	workspace.state.Entries[toRelative] = entry
+	delete(workspace.state.Warnings, toRelative)
+	return workspace.save()
 }
 
 func (workspace *Workspace) markResult(id, digest string) error {
 	workspace.mu.Lock()
 	defer workspace.mu.Unlock()
 	workspace.state.Results[id] = digest
+	delete(workspace.state.Deliveries, id)
+	delete(workspace.state.Hydrations, id)
 	return workspace.save()
 }
 
@@ -333,9 +407,22 @@ func (workspace *Workspace) Review() ([]Change, error) {
 	workspace.mu.Lock()
 	defer workspace.mu.Unlock()
 	current := make(map[string][]byte)
+	skipped := make(map[string]string)
 	err := filepath.WalkDir(workspace.dir, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return walkErr
+			if path == workspace.dir {
+				return walkErr
+			}
+			relative, relErr := filepath.Rel(workspace.dir, path)
+			if relErr != nil {
+				return walkErr
+			}
+			relative = filepath.ToSlash(relative)
+			skipped[relative] = "cannot inspect mirror entry: " + walkErr.Error()
+			if entry != nil && entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		if path == workspace.dir {
 			return nil
@@ -352,30 +439,62 @@ func (workspace *Workspace) Review() ([]Change, error) {
 			return nil
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%w: symlink %s", ErrMirrorEscape, relative)
+			skipped[relative] = "symbolic links are not reviewed or delivered"
+			return nil
 		}
 		info, err := entry.Info()
 		if err != nil {
-			return err
+			skipped[relative] = "cannot inspect mirror file: " + err.Error()
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			skipped[relative] = "non-regular files are not reviewed or delivered"
+			return nil
 		}
 		if info.Size() > workspace.maxFile {
-			return fmt.Errorf("mirror file %s exceeds maximum size", relative)
+			skipped[relative] = fmt.Sprintf(
+				"file size %d exceeds the %d-byte mirror review limit", info.Size(), workspace.maxFile,
+			)
+			return nil
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return err
+			skipped[relative] = "cannot read mirror file: " + err.Error()
+			return nil
+		}
+		if int64(len(data)) > workspace.maxFile {
+			// The file may have grown after Info. Apply the same per-file
+			// isolation to the bytes actually read.
+			skipped[relative] = fmt.Sprintf(
+				"file exceeds the %d-byte mirror review limit", workspace.maxFile,
+			)
+			return nil
 		}
 		current[relative] = data
 		return nil
 	})
 	if err != nil {
+		workspace.diagnostics = nil
 		return nil, err
 	}
+	workspace.diagnostics = workspace.diagnostics[:0]
+	for path, reason := range skipped {
+		workspace.diagnostics = append(workspace.diagnostics, ReviewDiagnostic{Path: path, Reason: reason})
+	}
+	sort.Slice(workspace.diagnostics, func(i, j int) bool {
+		return workspace.diagnostics[i].Path < workspace.diagnostics[j].Path
+	})
 	var changes []Change
 	for path, entry := range workspace.state.Entries {
+		if mirrorPathSkipped(path, skipped) {
+			// A tracked file replaced by an unsupported node is not a delete.
+			// Keep its confirmed baseline intact until the Human restores a
+			// regular, reviewable file or explicitly removes the path.
+			continue
+		}
 		content, exists := current[path]
 		if !exists {
-			changes = append(changes, changeWithWarning(Change{
+			changes = append(changes, workspace.changeWithWarning(Change{
 				Kind: ChangeDelete, Path: path, ExpectedSHA: entry.Fingerprint,
 			}))
 			continue
@@ -391,14 +510,14 @@ func (workspace *Workspace) Review() ([]Change, error) {
 		if callerfs.Fingerprint(oldContent) != entry.Fingerprint {
 			return nil, fmt.Errorf("%w: corrupted baseline for %s", ErrBaselineDrift, path)
 		}
-		changes = append(changes, changeWithWarning(Change{
+		changes = append(changes, workspace.changeWithWarning(Change{
 			Kind: ChangeEdit, Path: path, OldContent: oldContent,
 			NewContent: content, ExpectedSHA: entry.Fingerprint,
 		}))
 		delete(current, path)
 	}
 	for path, content := range current {
-		changes = append(changes, changeWithWarning(Change{
+		changes = append(changes, workspace.changeWithWarning(Change{
 			Kind: ChangeWrite, Path: path, NewContent: content,
 			ExpectedSHA: callerfs.AbsentFingerprint,
 		}))
@@ -407,54 +526,21 @@ func (workspace *Workspace) Review() ([]Change, error) {
 	return changes, nil
 }
 
-func BuildToolCalls(changes []Change) ([]completion.ToolCall, error) {
-	calls := make([]completion.ToolCall, 0, len(changes))
-	for _, change := range changes {
-		if change.Warning == safety.SeverityBlock {
-			return nil, fmt.Errorf("blocked mirror change %s: %s", change.Path, strings.Join(change.Reasons, "; "))
+func mirrorPathSkipped(path string, skipped map[string]string) bool {
+	for ignored := range skipped {
+		if path == ignored || strings.HasPrefix(path, strings.TrimSuffix(ignored, "/")+"/") {
+			return true
 		}
-		id, err := canonical.NewOpaqueID("tool_")
-		if err != nil {
-			return nil, err
-		}
-		virtualPath := "/workspace/" + filepath.ToSlash(change.Path)
-		call := completion.ToolCall{ID: id}
-		switch change.Kind {
-		case ChangeEdit:
-			if utf8.Valid(change.OldContent) && utf8.Valid(change.NewContent) {
-				call.Name = "human_edit_file"
-				call.Input = map[string]any{
-					"path": virtualPath, "old_string": string(change.OldContent),
-					"new_string": string(change.NewContent), "expected_sha256": change.ExpectedSHA,
-				}
-			} else {
-				call.Name = "human_write_file"
-				call.Input = map[string]any{
-					"path": virtualPath, "content": base64.StdEncoding.EncodeToString(change.NewContent),
-					"encoding": "base64", "expected_sha256": change.ExpectedSHA,
-				}
-			}
-		case ChangeWrite:
-			call.Name = "human_write_file"
-			encoding := "utf-8"
-			content := string(change.NewContent)
-			if !utf8.Valid(change.NewContent) {
-				encoding = "base64"
-				content = base64.StdEncoding.EncodeToString(change.NewContent)
-			}
-			call.Input = map[string]any{
-				"path": virtualPath, "content": content, "encoding": encoding,
-				"expected_sha256": callerfs.AbsentFingerprint,
-			}
-		case ChangeDelete:
-			call.Name = "human_delete_file"
-			call.Input = map[string]any{"path": virtualPath, "expected_sha256": change.ExpectedSHA}
-		default:
-			return nil, fmt.Errorf("unknown mirror change kind %q", change.Kind)
-		}
-		calls = append(calls, call)
 	}
-	return calls, nil
+	return false
+}
+
+// ReviewDiagnostics returns the per-file exclusions from the most recent
+// Review. The copy keeps callers from mutating Workspace state.
+func (workspace *Workspace) ReviewDiagnostics() []ReviewDiagnostic {
+	workspace.mu.Lock()
+	defer workspace.mu.Unlock()
+	return append([]ReviewDiagnostic(nil), workspace.diagnostics...)
 }
 
 func (workspace *Workspace) resolve(path string) (string, string, error) {
@@ -511,6 +597,15 @@ func (workspace *Workspace) load() error {
 	if workspace.state.Results == nil {
 		workspace.state.Results = make(map[string]string)
 	}
+	if workspace.state.Warnings == nil {
+		workspace.state.Warnings = make(map[string]string)
+	}
+	if workspace.state.Deliveries == nil {
+		workspace.state.Deliveries = make(map[string]deliveryIntent)
+	}
+	if workspace.state.Hydrations == nil {
+		workspace.state.Hydrations = make(map[string]hydrationIntent)
+	}
 	return nil
 }
 
@@ -550,7 +645,39 @@ func atomicWrite(path string, content []byte, mode fs.FileMode) error {
 	return os.Rename(name, path)
 }
 
-func changeWithWarning(change Change) Change {
+// atomicWriteExclusive publishes complete content without replacing an
+// existing destination. The temporary file and destination intentionally have
+// a different inode from any source file so crash recovery can distinguish a
+// duplicate copy from a case-insensitive path alias.
+func atomicWriteExclusive(path string, content []byte, mode fs.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".human-mirror-rename-*")
+	if err != nil {
+		return err
+	}
+	name := temporary.Name()
+	defer os.Remove(name)
+	if err := temporary.Chmod(mode); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(content); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Link(name, path)
+}
+
+func (workspace *Workspace) changeWithWarning(change Change) Change {
 	operation := safety.OperationWrite
 	if change.Kind == ChangeDelete {
 		operation = safety.OperationDelete
@@ -563,5 +690,11 @@ func changeWithWarning(change Change) Change {
 	}
 	change.Warning = decision.Severity
 	change.Reasons = decision.Reasons
+	if warning := strings.TrimSpace(workspace.state.Warnings[change.Path]); warning != "" {
+		if change.Warning == safety.SeverityAllow {
+			change.Warning = safety.SeverityWarn
+		}
+		change.Reasons = append(change.Reasons, warning)
+	}
 	return change
 }

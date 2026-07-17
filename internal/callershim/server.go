@@ -13,6 +13,7 @@ import (
 
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/completion/adapter"
+	"github.com/vibe-agi/human/internal/workerproto"
 )
 
 const (
@@ -67,7 +68,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("invalid caller shim identity: %w", err)
 	}
 	if config.MaxBodyBytes <= 0 {
-		config.MaxBodyBytes = 16 << 20
+		config.MaxBodyBytes = workerproto.MaxWireMessageBytes
 	}
 	client := config.HTTPClient
 	if client == nil {
@@ -96,7 +97,12 @@ func (*Server) health(response http.ResponseWriter, _ *http.Request) {
 func (server *Server) proxyCompletion(response http.ResponseWriter, request *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(response, request.Body, server.config.MaxBodyBytes))
 	if err != nil {
-		http.Error(response, "request body is too large or unreadable", http.StatusBadRequest)
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(response, "request body exceeds the worker wire limit", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(response, "request body is unreadable", http.StatusBadRequest)
+		}
 		return
 	}
 	taskID := strings.TrimSpace(server.config.TaskID)
@@ -166,7 +172,12 @@ func (server *Server) executeTool(response http.ResponseWriter, request *http.Re
 	decoder.DisallowUnknownFields()
 	var toolRequest ToolRequest
 	if err := decoder.Decode(&toolRequest); err != nil {
-		http.Error(response, "invalid tool request: "+err.Error(), http.StatusBadRequest)
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(response, "tool request exceeds the worker wire limit", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(response, "invalid tool request: "+err.Error(), http.StatusBadRequest)
+		}
 		return
 	}
 	// A tool-call source is not trusted to select its ledger namespace. If

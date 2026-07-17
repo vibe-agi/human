@@ -1,5 +1,5 @@
-// Package humandcmd assembles the humand daemon and administration CLI.
-package humandcmd
+// Package gatewaycmd assembles the standalone gateway and administration CLI.
+package gatewaycmd
 
 import (
 	"context"
@@ -18,139 +18,113 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	publicgateway "github.com/vibe-agi/human/gateway"
 	"github.com/vibe-agi/human/internal/auth"
-	"github.com/vibe-agi/human/internal/completion/adapter"
-	"github.com/vibe-agi/human/internal/completion/dialect"
-	"github.com/vibe-agi/human/internal/completion/dialect/anthropic"
-	"github.com/vibe-agi/human/internal/completion/dialect/openai"
-	"github.com/vibe-agi/human/internal/completion/dialect/responses"
-	"github.com/vibe-agi/human/internal/completion/gateway"
-	"github.com/vibe-agi/human/internal/completion/hub"
+	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/ratelimit"
 	"github.com/vibe-agi/human/internal/store/sqlite"
-	completionworkerws "github.com/vibe-agi/human/internal/workerws"
 )
 
 const Version = "0.1.0-dev"
 
-func New() *cobra.Command {
-	settings := viper.New()
-	settings.SetEnvPrefix("HUMAN")
-	settings.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
-	settings.AutomaticEnv()
-
-	root := &cobra.Command{
-		Use:           "humand",
-		Short:         "Human Agent gateway daemon",
-		SilenceUsage:  true,
-		SilenceErrors: true,
+// NewGatewayCommand returns the `human gateway` standalone server and its
+// nested token administration commands.
+func NewGatewayCommand() *cobra.Command {
+	settings := newSettings()
+	command := &cobra.Command{
+		Use: "gateway", Short: "run the standalone Human Agent gateway",
+		SilenceUsage: true, SilenceErrors: true,
 		PersistentPreRunE: func(command *cobra.Command, _ []string) error {
+			if configFlag := command.Flag("config"); configFlag != nil && configFlag.Value.String() != "" {
+				settings.Set("config", configFlag.Value.String())
+			}
 			return loadConfig(settings)
 		},
-	}
-	root.PersistentFlags().String("config", "", "configuration file (toml/yaml/json)")
-	root.PersistentFlags().String("db", ".human/human.db", "SQLite database path")
-	mustBind(settings, "config", root.PersistentFlags().Lookup("config"))
-	mustBind(settings, "db", root.PersistentFlags().Lookup("db"))
-
-	root.AddCommand(newServeCommand(settings))
-	root.AddCommand(newTokenCommand(settings))
-	root.AddCommand(newMigrateCommand(settings))
-	root.AddCommand(&cobra.Command{
-		Use: "version", Short: "print version",
-		Run: func(command *cobra.Command, _ []string) {
-			fmt.Fprintln(command.OutOrStdout(), Version)
-		},
-	})
-	return root
-}
-
-func newServeCommand(settings *viper.Viper) *cobra.Command {
-	command := &cobra.Command{
-		Use:   "serve",
-		Short: "run model API and worker WebSocket endpoints",
 		RunE: func(command *cobra.Command, _ []string) error {
 			return serve(command.Context(), settings)
 		},
 	}
+	command.PersistentFlags().String("db", ".human/human.db", "SQLite database path")
+	mustBind(settings, "db", command.PersistentFlags().Lookup("db"))
+	addServeFlags(command, settings)
+	command.AddCommand(newTokenCommand(settings))
+	return command
+}
+
+func newSettings() *viper.Viper {
+	settings := viper.New()
+	settings.SetEnvPrefix("HUMAN")
+	settings.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
+	settings.AutomaticEnv()
+	return settings
+}
+
+func addServeFlags(command *cobra.Command, settings *viper.Viper) {
 	flags := command.Flags()
 	flags.String("listen", "127.0.0.1:8080", "HTTP listen address")
 	flags.Int("queue-capacity", 32, "maximum admitted and active requests")
 	flags.Duration("heartbeat", 15*time.Second, "SSE heartbeat interval")
+	flags.Duration("stream-write-timeout", 10*time.Second, "maximum time for one SSE write and flush")
 	flags.Duration("max-pending", 10*time.Minute, "maximum time waiting for a human response")
+	flags.Bool("disable-codex-auto-idempotency", false, "disable automatic retry identity for recognized Codex turns")
 	flags.Float64("rate-limit", ratelimit.DefaultRatePerSecond, "new requests admitted per second for each API key")
 	flags.Int("rate-burst", ratelimit.DefaultBurst, "maximum per-key admission burst")
 	flags.Bool("audit-payload", false, "retain request and response payloads in addition to metadata")
 	flags.Duration("audit-payload-ttl", 7*24*time.Hour, "retention period for explicitly enabled audit payloads")
+	flags.Duration("replay-payload-grace", 24*time.Hour, "exact idempotent replay retention after request completion")
 	flags.Duration("shutdown-timeout", 10*time.Second, "graceful shutdown timeout")
 	mustBind(settings, "serve.listen", flags.Lookup("listen"))
 	mustBind(settings, "serve.queue_capacity", flags.Lookup("queue-capacity"))
 	mustBind(settings, "serve.heartbeat", flags.Lookup("heartbeat"))
+	mustBind(settings, "serve.stream_write_timeout", flags.Lookup("stream-write-timeout"))
 	mustBind(settings, "serve.max_pending", flags.Lookup("max-pending"))
+	mustBind(settings, "serve.disable_codex_auto_idempotency", flags.Lookup("disable-codex-auto-idempotency"))
 	mustBind(settings, "serve.rate_limit", flags.Lookup("rate-limit"))
 	mustBind(settings, "serve.rate_burst", flags.Lookup("rate-burst"))
 	mustBind(settings, "audit.payload", flags.Lookup("audit-payload"))
 	mustBind(settings, "audit.payload_ttl", flags.Lookup("audit-payload-ttl"))
+	mustBind(settings, "serve.replay_payload_grace", flags.Lookup("replay-payload-grace"))
 	mustBind(settings, "serve.shutdown_timeout", flags.Lookup("shutdown-timeout"))
-	return command
 }
 
 func serve(ctx context.Context, settings *viper.Viper) error {
+	replayPayloadGrace := settings.GetDuration("serve.replay_payload_grace")
+	if replayPayloadGrace <= 0 {
+		return errors.New("replay payload grace must be positive")
+	}
 	databasePath, err := resolveDatabasePath(settings.GetString("db"))
-	if err != nil {
-		return err
-	}
-	database, err := sqlite.Open(ctx, databasePath)
-	if err != nil {
-		return err
-	}
-	defer database.Close()
-	if _, err := database.PurgeExpiredAuditPayloads(ctx, time.Now()); err != nil {
-		return fmt.Errorf("purge expired audit payloads: %w", err)
-	}
-	authenticator := auth.NewService(database)
-	workerHub := hub.New(settings.GetInt("serve.queue_capacity"))
-	completionWorkerServer, err := completionworkerws.New(
-		completionworkerws.Config{}, authenticator, workerHub, database,
-	)
-	if err != nil {
-		return err
-	}
-	gatewayServer, err := gateway.NewServer(gateway.Config{
-		HeartbeatInterval: settings.GetDuration("serve.heartbeat"),
-		MaxPending:        settings.GetDuration("serve.max_pending"),
-		RateLimit: ratelimit.Config{
-			RatePerSecond: settings.GetFloat64("serve.rate_limit"),
-			Burst:         settings.GetInt("serve.rate_burst"),
-		},
-		AuditPayload:    settings.GetBool("audit.payload"),
-		AuditPayloadTTL: settings.GetDuration("audit.payload_ttl"),
-	}, database, authenticator, workerHub, adapter.NewDefaultRegistry(), map[string]dialect.Codec{
-		"/v1/chat/completions": openai.New(),
-		"/v1/messages":         anthropic.New(),
-		"/v1/responses":        responses.New(),
-	})
 	if err != nil {
 		return err
 	}
 	runContext, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := gatewayServer.Recover(runContext); err != nil {
-		return fmt.Errorf("recover incomplete completion requests: %w", err)
+	config := publicgateway.DefaultConfig()
+	config.DatabasePath = databasePath
+	config.QueueCapacity = settings.GetInt("serve.queue_capacity")
+	config.HeartbeatInterval = settings.GetDuration("serve.heartbeat")
+	config.StreamWriteTimeout = settings.GetDuration("serve.stream_write_timeout")
+	config.MaxPending = settings.GetDuration("serve.max_pending")
+	config.DisableCodexAutoIdempotency = settings.GetBool("serve.disable_codex_auto_idempotency")
+	config.RateLimit.RatePerSecond = settings.GetFloat64("serve.rate_limit")
+	config.RateLimit.Burst = settings.GetInt("serve.rate_burst")
+	config.AuditPayload = settings.GetBool("audit.payload")
+	config.AuditPayloadTTL = settings.GetDuration("audit.payload_ttl")
+	config.ReplayPayloadGrace = replayPayloadGrace
+	gatewayServer, err := publicgateway.Open(runContext, config)
+	if err != nil {
+		return err
 	}
-	mux := http.NewServeMux()
-	registerServeRoutes(mux, completionWorkerServer, gatewayServer)
+	defer gatewayServer.Close()
 	httpServer := &http.Server{
 		Addr:              settings.GetString("serve.listen"),
-		Handler:           requestLog(mux),
+		Handler:           requestLog(gatewayServer),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
 
-	go purgeAuditPayloads(runContext, database)
 	errorsChannel := make(chan error, 1)
 	go func() {
-		slog.Info("humand listening", "address", httpServer.Addr)
+		slog.Info("human gateway listening", "address", httpServer.Addr)
 		err := httpServer.ListenAndServe()
 		if !errors.Is(err, http.ErrServerClosed) {
 			errorsChannel <- err
@@ -165,33 +139,9 @@ func serve(ctx context.Context, settings *viper.Viper) error {
 		shutdownContext, cancel := context.WithTimeout(context.Background(), settings.GetDuration("serve.shutdown_timeout"))
 		defer cancel()
 		if err := httpServer.Shutdown(shutdownContext); err != nil {
-			return fmt.Errorf("shutdown humand: %w", err)
+			return fmt.Errorf("shutdown gateway: %w", err)
 		}
 		return <-errorsChannel
-	}
-}
-
-func registerServeRoutes(
-	mux *http.ServeMux,
-	completionWorker http.Handler,
-	gateway http.Handler,
-) {
-	mux.Handle("/internal/v1/worker/ws", completionWorker)
-	mux.Handle("/", gateway)
-}
-
-func purgeAuditPayloads(ctx context.Context, database *sqlite.Store) {
-	ticker := time.NewTicker(time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-ticker.C:
-			if _, err := database.PurgeExpiredAuditPayloads(ctx, now); err != nil && ctx.Err() == nil {
-				slog.Error("purge expired audit payloads", "error", err)
-			}
-		}
 	}
 }
 
@@ -201,8 +151,8 @@ func newTokenCommand(settings *viper.Viper) *cobra.Command {
 		Use: "issue", Short: "issue a caller or worker token",
 		RunE: func(command *cobra.Command, _ []string) error {
 			subject := strings.TrimSpace(settings.GetString("token.subject"))
-			if subject == "" {
-				return errors.New("token subject is required")
+			if !completion.IsStableKey(subject) {
+				return errors.New("token subject must be a stable key")
 			}
 			database, err := openDatabase(command.Context(), settings.GetString("db"))
 			if err != nil {
@@ -228,8 +178,8 @@ func newTokenCommand(settings *viper.Viper) *cobra.Command {
 		Use: "revoke", Short: "revoke an API token by key id",
 		RunE: func(command *cobra.Command, _ []string) error {
 			keyID := strings.TrimSpace(settings.GetString("token.key_id"))
-			if keyID == "" {
-				return errors.New("token key id is required")
+			if !completion.IsStableKey(keyID) {
+				return errors.New("token key id must be a stable key")
 			}
 			database, err := openDatabase(command.Context(), settings.GetString("db"))
 			if err != nil {
@@ -243,23 +193,6 @@ func newTokenCommand(settings *viper.Viper) *cobra.Command {
 	mustBind(settings, "token.key_id", revoke.Flags().Lookup("key-id"))
 	command.AddCommand(issue, revoke)
 	return command
-}
-
-func newMigrateCommand(settings *viper.Viper) *cobra.Command {
-	return &cobra.Command{
-		Use: "migrate", Short: "create or upgrade the SQLite schema",
-		RunE: func(command *cobra.Command, _ []string) error {
-			databasePath, err := resolveDatabasePath(settings.GetString("db"))
-			if err != nil {
-				return err
-			}
-			database, err := sqlite.Open(command.Context(), databasePath)
-			if err != nil {
-				return err
-			}
-			return database.Close()
-		},
-	}
 }
 
 func openDatabase(ctx context.Context, path string) (*sqlite.Store, error) {

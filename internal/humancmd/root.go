@@ -9,12 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	tea "charm.land/bubbletea/v2"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
-	"github.com/vibe-agi/human/internal/tui"
-	"github.com/vibe-agi/human/internal/workerclient"
+	"github.com/vibe-agi/human/internal/gatewaycmd"
+	workerlib "github.com/vibe-agi/human/worker"
 )
 
 func New() *cobra.Command {
@@ -23,25 +22,47 @@ func New() *cobra.Command {
 	settings.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 	settings.AutomaticEnv()
 	command := &cobra.Command{
-		Use: "human", Short: "Human Agent worker TUI",
+		Use: "human", Short: "Human-as-model local runtime, gateway, and worker",
 		SilenceUsage: true, SilenceErrors: true,
+		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 		PersistentPreRunE: func(_ *cobra.Command, _ []string) error { return loadConfig(settings) },
+	}
+	command.PersistentFlags().String("config", "", "configuration file (toml/yaml/json)")
+	mustBind(settings, "config", command.PersistentFlags().Lookup("config"))
+	workerCommand := &cobra.Command{
+		Use: "worker", Short: "connect this Human worker to a gateway",
 		RunE: func(command *cobra.Command, _ []string) error {
 			return run(command.Context(), settings)
 		},
 	}
-	command.PersistentFlags().String("config", "", "configuration file (toml/yaml/json)")
-	command.Flags().String("gateway", "ws://127.0.0.1:8080/internal/v1/worker/ws", "humand worker WebSocket URL")
-	command.Flags().String("token", "", "worker token")
-	command.Flags().String("mirror-root", "~/mirror", "worker-local workspace mirror root")
-	command.Flags().String("outbox", "~/.human/worker-outbox.db", "private SQLite outbox for unacknowledged worker events")
-	mustBind(settings, "config", command.PersistentFlags().Lookup("config"))
-	mustBind(settings, "gateway.url", command.Flags().Lookup("gateway"))
-	mustBind(settings, "gateway.token", command.Flags().Lookup("token"))
-	mustBind(settings, "workspace.mirror_root", command.Flags().Lookup("mirror-root"))
-	mustBind(settings, "worker.outbox", command.Flags().Lookup("outbox"))
+	addWorkerFlags(workerCommand.Flags())
+	for key, name := range map[string]string{
+		"gateway.url": "gateway", "gateway.token": "token",
+		"workspace.mirror_root": "mirror-root", "workspace.auto_send": "workspace-auto-send",
+		"worker.outbox": "outbox", "worker.state_db": "state-db",
+	} {
+		mustBind(settings, key, workerCommand.Flags().Lookup(name))
+	}
+	command.AddCommand(workerCommand)
+	command.AddCommand(gatewaycmd.NewGatewayCommand())
+	command.AddCommand(newLocalCommand(settings))
 	command.AddCommand(newShimCommand(settings))
+	command.AddCommand(&cobra.Command{
+		Use: "version", Short: "print version",
+		Run: func(command *cobra.Command, _ []string) {
+			fmt.Fprintln(command.OutOrStdout(), gatewaycmd.Version)
+		},
+	})
 	return command
+}
+
+func addWorkerFlags(flags *pflag.FlagSet) {
+	flags.String("gateway", "ws://127.0.0.1:8080/internal/v1/worker/ws", "gateway worker WebSocket URL")
+	flags.String("token", "", "worker token")
+	flags.String("mirror-root", "~/mirror", "worker-local workspace mirror root")
+	flags.Bool("workspace-auto-send", false, "send clean mirror changes after live detection and fresh review")
+	flags.String("outbox", "~/.human/worker-outbox.db", "private SQLite outbox for unacknowledged worker events")
+	flags.String("state-db", "~/.human/worker-state.db", "private SQLite TUI recovery state; empty disables persistence")
 }
 
 func run(ctx context.Context, settings *viper.Viper) error {
@@ -61,17 +82,32 @@ func run(ctx context.Context, settings *viper.Viper) error {
 	if err != nil {
 		return err
 	}
-	client, err := workerclient.DialWithOutbox(ctx, url, token, outboxPath)
+	statePath, err := resolveOptionalPrivatePath(settings.GetString("worker.state_db"), "worker state database")
 	if err != nil {
-		return fmt.Errorf("connect worker WebSocket: %w", err)
+		return err
 	}
-	defer client.Close()
-	_, err = tea.NewProgram(tui.New(client, tui.WithMirrorRoot(mirrorRoot))).Run()
+	worker, err := workerlib.Open(ctx, workerlib.Config{
+		GatewayURL: url, Token: token, MirrorRoot: mirrorRoot,
+		OutboxPath: outboxPath, StatePath: statePath, DisableState: statePath == "",
+		WorkspaceAutoSend: settings.GetBool("workspace.auto_send"),
+	})
+	if err != nil {
+		return err
+	}
+	defer worker.Close()
+	_, err = worker.Run(ctx)
 	return err
 }
 
 func resolveMirrorRoot(value string) (string, error) {
 	return resolvePrivatePath(value, "workspace mirror root")
+}
+
+func resolveOptionalPrivatePath(value, description string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", nil
+	}
+	return resolvePrivatePath(value, description)
 }
 
 func resolvePrivatePath(value, description string) (string, error) {

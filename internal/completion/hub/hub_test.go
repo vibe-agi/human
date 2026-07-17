@@ -130,6 +130,138 @@ func TestWorkerDisconnectKeepsAndRedeliversActiveSession(t *testing.T) {
 	}
 }
 
+func TestRegisterReplacesSameWorkerWithoutOldCloseUnregisteringReplacement(t *testing.T) {
+	t.Parallel()
+	workerHub := New(2)
+	oldWorker, err := workerHub.Register("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := workerHub.Reserve("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := reservation.Enqueue(completion.Assignment{
+		CallerID: "caller", TaskID: "task", IdempotencyKey: "request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assignment := <-oldWorker.Assignments; assignment.TaskID != "task" {
+		t.Fatalf("old assignment = %+v", assignment)
+	}
+
+	replacement, err := workerHub.Register("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(replacement.Close)
+	select {
+	case _, open := <-oldWorker.Assignments:
+		if open {
+			t.Fatal("superseded worker assignment channel remained open")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("superseded worker assignment channel did not close")
+	}
+	select {
+	case assignment := <-replacement.Assignments:
+		if assignment.TaskID != "task" || assignment.LeaseOwner != "worker" {
+			t.Fatalf("replacement assignment = %+v", assignment)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active assignment was not redelivered to replacement")
+	}
+
+	// This is the ordering used by the two HTTP handlers: Register replaces
+	// first, then the old handler's deferred Close runs.
+	oldWorker.Close()
+	probe, err := workerHub.Reserve("worker")
+	if err != nil {
+		t.Fatalf("old Close unregistered replacement: %v", err)
+	}
+	probe.Release()
+	publishAndReceive(t, workerHub, events, "caller", "request", completion.Event{
+		ID: "final", Type: completion.EventFinal, Text: "done",
+	})
+}
+
+func TestPublishFromEnforcesWorkerOwnershipAndOverridesAcceptedIdentity(t *testing.T) {
+	t.Parallel()
+	workerHub := New(2)
+	owner, err := workerHub.Register("owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(owner.Close)
+	intruder, err := workerHub.Register("intruder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(intruder.Close)
+	reservation, err := workerHub.Reserve("owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := reservation.Enqueue(completion.Assignment{
+		CallerID: "caller", TaskID: "task", IdempotencyKey: "request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-owner.Assignments
+
+	forged := completion.Event{
+		ID: "forged", Type: completion.EventAccepted, WorkerID: "owner",
+	}
+	if err := workerHub.PublishFrom(
+		context.Background(), "intruder", "caller", "request", forged,
+	); !errors.Is(err, ErrWorkerOwnership) {
+		t.Fatalf("intruder publish error = %v", err)
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("intruder event was delivered: %+v", event.Event)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- workerHub.PublishFrom(
+			context.Background(), "owner", "caller", "request",
+			completion.Event{ID: "accepted", Type: completion.EventAccepted, WorkerID: "intruder"},
+		)
+	}()
+	delivery := <-events
+	if delivery.WorkerID != "owner" {
+		t.Fatalf("accepted worker id = %q, want authenticated owner", delivery.WorkerID)
+	}
+	delivery.Commit(nil)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+
+	final := completion.Event{ID: "final", Type: completion.EventFinal, Text: "done"}
+	go func() {
+		result <- workerHub.PublishFrom(context.Background(), "owner", "caller", "request", final)
+	}()
+	delivery = <-events
+	delivery.Commit(nil)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if err := workerHub.PublishFrom(
+		context.Background(), "intruder", "caller", "request", final,
+	); !errors.Is(err, ErrWorkerOwnership) {
+		t.Fatalf("intruder terminal replay error = %v", err)
+	}
+	if err := workerHub.PublishFrom(
+		context.Background(), "owner", "caller", "request", final,
+	); err != nil {
+		t.Fatalf("owner terminal replay error = %v", err)
+	}
+}
+
 func TestWorkerEventIDIsIdempotent(t *testing.T) {
 	t.Parallel()
 	hub := New(1)
@@ -258,6 +390,346 @@ func TestAbortReleasesCapacity(t *testing.T) {
 	next.Release()
 }
 
+func TestAbortRetainsOwnerWithoutInventingLateEventReceipt(t *testing.T) {
+	t.Parallel()
+	workerHub := New(2)
+	owner, err := workerHub.Register("owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(owner.Close)
+	intruder, err := workerHub.Register("intruder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(intruder.Close)
+
+	reservation, err := workerHub.Reserve("owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reservation.Enqueue(completion.Assignment{
+		CallerID: "caller", TaskID: "expired", IdempotencyKey: "request",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-owner.Assignments
+	if err := workerHub.Abort("caller", "request"); err != nil {
+		t.Fatal(err)
+	}
+
+	late := completion.Event{ID: "late-final", Type: completion.EventFinal, Text: "too late"}
+	if err := workerHub.AuthorizePublisher("owner", "caller", "request"); err != nil {
+		t.Fatalf("retired owner authorization = %v", err)
+	}
+	if err := workerHub.PublishFrom(
+		context.Background(), "owner", "caller", "request", late,
+	); !errors.Is(err, ErrSessionMissing) {
+		t.Fatalf("late owner event = %v, want explicit rejection", err)
+	}
+	if err := workerHub.AuthorizePublisher("intruder", "caller", "request"); !errors.Is(err, ErrWorkerOwnership) {
+		t.Fatalf("retired intruder authorization = %v", err)
+	}
+	if err := workerHub.PublishFrom(
+		context.Background(), "intruder", "caller", "request", late,
+	); !errors.Is(err, ErrWorkerOwnership) {
+		t.Fatalf("retired intruder publish = %v", err)
+	}
+}
+
+func TestCapacityOneAbortDiscardsQueuedAssignment(t *testing.T) {
+	t.Parallel()
+	workerHub := New(1)
+	worker, err := workerHub.Register("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(worker.Close)
+
+	first, err := workerHub.Reserve("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Enqueue(completion.Assignment{
+		CallerID: "caller", TaskID: "stale", IdempotencyKey: "stale",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Do not receive the first assignment. This reproduces the capacity-one
+	// stale queue slot which used to make the next Enqueue block under Hub.mu.
+	if err := workerHub.Abort("caller", "stale"); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := workerHub.Reserve("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Enqueue(completion.Assignment{
+		CallerID: "caller", TaskID: "live", IdempotencyKey: "live",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case assignment := <-worker.Assignments:
+		if assignment.TaskID != "live" {
+			t.Fatalf("received stale assignment after abort: %+v", assignment)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live assignment was blocked behind retired session")
+	}
+	if err := workerHub.Abort("caller", "live"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCapacityOneRestoreDiscardsRetiredAssignment(t *testing.T) {
+	t.Parallel()
+	workerHub := New(1)
+	worker, err := workerHub.Register("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(worker.Close)
+
+	if _, err := workerHub.Restore(completion.Assignment{
+		CallerID: "caller", TaskID: "stale", IdempotencyKey: "stale",
+	}, RestoreOptions{WorkerID: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workerHub.Abort("caller", "stale"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workerHub.Restore(completion.Assignment{
+		CallerID: "caller", TaskID: "live", IdempotencyKey: "live",
+	}, RestoreOptions{WorkerID: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case assignment := <-worker.Assignments:
+		if assignment.TaskID != "live" {
+			t.Fatalf("received retired restored assignment: %+v", assignment)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live restored assignment was blocked")
+	}
+	if err := workerHub.Abort("caller", "live"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoveryMayExceedConfiguredCapacityAndDrainsBeforeNewAdmission(t *testing.T) {
+	t.Parallel()
+	workerHub := New(1)
+	for _, request := range []string{"first", "second"} {
+		if _, err := workerHub.Restore(completion.Assignment{
+			CallerID: "caller", TaskID: request, IdempotencyKey: request,
+		}, RestoreOptions{}); err != nil {
+			t.Fatalf("restore %s above configured capacity: %v", request, err)
+		}
+	}
+	if _, err := workerHub.Reserve(""); !errors.Is(err, ErrNoWorker) {
+		t.Fatalf("reserve before worker = %v", err)
+	}
+	worker, err := workerHub.Register("worker")
+	if err != nil {
+		t.Fatalf("register worker for over-capacity recovery: %v", err)
+	}
+	t.Cleanup(worker.Close)
+	drained := make(map[string]struct{})
+	for len(drained) < 2 {
+		select {
+		case assignment := <-worker.Assignments:
+			if assignment.IdempotencyKey != "first" && assignment.IdempotencyKey != "second" {
+				t.Fatalf("unexpected recovery assignment = %q", assignment.IdempotencyKey)
+			}
+			drained[assignment.IdempotencyKey] = struct{}{}
+		case <-time.After(time.Second):
+			t.Fatalf("recovery assignments did not drain: %v", drained)
+		}
+	}
+	if _, err := workerHub.Reserve("worker"); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("new admission while recovered backlog exceeds limit = %v", err)
+	}
+	if err := workerHub.Abort("caller", "first"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workerHub.Reserve("worker"); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("new admission at configured limit = %v", err)
+	}
+	if err := workerHub.Abort("caller", "second"); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := workerHub.Reserve("worker")
+	if err != nil {
+		t.Fatalf("admission did not recover after backlog drained: %v", err)
+	}
+	reservation.Release()
+}
+
+func TestWorkerPendingAssignmentsStayCapacityBoundedAcrossAbortChurn(t *testing.T) {
+	t.Parallel()
+	workerHub := New(1)
+	worker, err := workerHub.Register("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(worker.Close)
+
+	const attempts = 100
+	for index := range attempts {
+		requestID := fmt.Sprintf("request-%d", index)
+		reservation, err := workerHub.Reserve("worker")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reservation.Enqueue(completion.Assignment{
+			CallerID: "caller", TaskID: requestID, IdempotencyKey: requestID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if index != attempts-1 {
+			if err := workerHub.Abort("caller", requestID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	workerHub.mu.Lock()
+	state := workerHub.workers["worker"]
+	workerHub.mu.Unlock()
+	state.mu.Lock()
+	pending := len(state.pending)
+	state.mu.Unlock()
+	if pending > workerHub.capacity {
+		t.Fatalf("pending assignments = %d, capacity = %d", pending, workerHub.capacity)
+	}
+
+	select {
+	case assignment := <-worker.Assignments:
+		if assignment.TaskID != "request-99" {
+			t.Fatalf("received stale assignment after churn: %+v", assignment)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("last live assignment was not delivered")
+	}
+	if err := workerHub.Abort("caller", "request-99"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAbortUnblocksPublishersWaitingToSendOrCommit(t *testing.T) {
+	t.Parallel()
+	workerHub := New(1)
+	worker, err := workerHub.Register("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(worker.Close)
+	reservation, err := workerHub.Reserve("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := reservation.Enqueue(completion.Assignment{
+		CallerID: "caller", TaskID: "task", IdempotencyKey: "request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = events // Deliberately leave the 32-slot delivery channel undrained.
+
+	const publishers = 40
+	results := make(chan error, publishers)
+	for index := range publishers {
+		go func() {
+			results <- workerHub.Publish(context.Background(), "caller", "request", completion.Event{
+				ID: fmt.Sprintf("progress-%d", index), Type: completion.EventProgress, Text: "pending",
+			})
+		}()
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		workerHub.mu.Lock()
+		active := workerHub.sessions["caller\x00request"]
+		pending := 0
+		if active != nil {
+			pending = len(active.pending)
+		}
+		workerHub.mu.Unlock()
+		if pending == publishers {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("registered publishers = %d, want %d", pending, publishers)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := workerHub.Abort("caller", "request"); err != nil {
+		t.Fatal(err)
+	}
+	for range publishers {
+		select {
+		case err := <-results:
+			if !errors.Is(err, ErrSessionMissing) {
+				t.Fatalf("publisher retirement error = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("publisher remained blocked after abort")
+		}
+	}
+}
+
+func TestDurableTerminalRetiresOtherPendingPublishers(t *testing.T) {
+	t.Parallel()
+	workerHub := New(1)
+	worker, err := workerHub.Register("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(worker.Close)
+	reservation, err := workerHub.Reserve("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := reservation.Enqueue(completion.Assignment{
+		CallerID: "caller", TaskID: "task", IdempotencyKey: "request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	progressResult := make(chan error, 1)
+	go func() {
+		progressResult <- workerHub.Publish(context.Background(), "caller", "request", completion.Event{
+			ID: "progress", Type: completion.EventProgress, Text: "pending",
+		})
+	}()
+	progress := <-events
+
+	finalResult := make(chan error, 1)
+	go func() {
+		finalResult <- workerHub.Publish(context.Background(), "caller", "request", completion.Event{
+			ID: "final", Type: completion.EventFinal, Text: "done",
+		})
+	}()
+	final := <-events
+	final.Commit(nil)
+	if err := <-finalResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-progressResult; !errors.Is(err, ErrSessionMissing) {
+		t.Fatalf("pending progress retirement error = %v", err)
+	}
+	progress.Commit(nil) // A late consumer commit is harmless.
+
+	next, err := workerHub.Reserve("worker")
+	if err != nil {
+		t.Fatalf("terminal event did not release capacity: %v", err)
+	}
+	next.Release()
+}
+
 func TestTerminalAndAbortRetireLiveSessions(t *testing.T) {
 	t.Parallel()
 	hub := New(64)
@@ -350,7 +822,7 @@ func TestRetiredTerminalReceiptAcknowledgesOnlyExactReplay(t *testing.T) {
 	}
 }
 
-func TestAbortRacingDurableTerminalCommitKeepsCompactReceipt(t *testing.T) {
+func TestDurableTerminalCommitWinsLaterAbortAndKeepsCompactReceipt(t *testing.T) {
 	t.Parallel()
 	hub := New(1)
 	worker, err := hub.Register("worker")
@@ -375,10 +847,13 @@ func TestAbortRacingDurableTerminalCommitKeepsCompactReceipt(t *testing.T) {
 		result <- hub.Publish(context.Background(), "caller", "request", final)
 	}()
 	delivery := <-events
-	if err := hub.Abort("caller", "request"); err != nil {
+	delivery.Commit(nil)
+	// Once Commit(nil) wins Delivery.once, a concurrent abort may retire the
+	// live session but cannot turn a durably handled terminal event into a
+	// failure. Publish still installs the compact exact-replay receipt.
+	if err := hub.Abort("caller", "request"); err != nil && !errors.Is(err, ErrSessionMissing) {
 		t.Fatal(err)
 	}
-	delivery.Commit(nil)
 	if err := <-result; err != nil {
 		t.Fatal(err)
 	}

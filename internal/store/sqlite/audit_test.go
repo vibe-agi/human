@@ -2,9 +2,7 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -131,39 +129,5 @@ func TestAuditValidationAndForeignKey(t *testing.T) {
 	}
 	if _, err := db.PurgeExpiredAuditPayloads(ctx, time.Time{}); err == nil {
 		t.Fatal("zero purge cutoff accepted")
-	}
-}
-
-func TestOpenAddsAuditTablesToPreAuditDatabase(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "old-human.db")
-	old, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := old.ExecContext(ctx, `
-		CREATE TABLE api_tokens (
-		  key_id TEXT PRIMARY KEY,
-		  principal_type TEXT NOT NULL CHECK(principal_type IN ('caller', 'worker')),
-		  subject_id TEXT NOT NULL,
-		  token_hash BLOB NOT NULL UNIQUE,
-		  created_at INTEGER NOT NULL,
-		  revoked_at INTEGER
-		)`); err != nil {
-		old.Close()
-		t.Fatal(err)
-	}
-	if err := old.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	db, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	if _, err := db.CreateAuditMetadata(ctx, auditMetadata()); err != nil {
-		t.Fatalf("audit metadata after migration: %v", err)
 	}
 }

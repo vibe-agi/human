@@ -29,10 +29,10 @@ func newShimCommand(settings *viper.Viper) *cobra.Command {
 	}
 	flags := command.Flags()
 	flags.String("listen", "127.0.0.1:8181", "local shim listen address")
-	flags.String("upstream", "http://127.0.0.1:8080", "humand model API base URL")
-	flags.String("caller-token", "", "humand caller token")
+	flags.String("upstream", "http://127.0.0.1:8080", "gateway model API base URL")
+	flags.String("caller-token", "", "gateway caller token")
 	flags.String("tool-token", "", "local tool endpoint bearer token")
-	flags.String("caller-id", "", "stable caller id matching the humand caller principal; retained across token rotation")
+	flags.String("caller-id", "", "stable caller id matching the gateway caller principal; retained across token rotation")
 	flags.String("workspace", ".", "caller workspace root")
 	flags.String("workspace-key", "", "stable caller workspace key")
 	flags.String("task-id", "", "stable task id; reuse it with the same ledger across shim restarts")

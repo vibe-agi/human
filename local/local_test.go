@@ -1,0 +1,393 @@
+package local
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/vibe-agi/human/gateway"
+	"github.com/vibe-agi/human/worker"
+)
+
+func TestOpenConnectsWorkerServesCallerAndClosesIdempotently(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	privateRoot := filepath.Join(root, "private")
+	if err := os.Mkdir(privateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := Config{
+		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
+		Worker: worker.Config{
+			MirrorRoot: filepath.Join(root, "mirror"),
+			OutboxPath: filepath.Join(privateRoot, "outbox.db"),
+			StatePath:  filepath.Join(privateRoot, "state.db"),
+		},
+		ListenAddress: "127.0.0.1:0",
+		CallerSubject: "test-caller",
+		WorkerSubject: "test-worker",
+	}
+
+	instance, err := Open(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = instance.Close()
+		}
+	})
+	if instance.Worker() == nil || instance.Model() == nil || instance.Gateway() == nil {
+		t.Fatal("local instance did not expose all embedded components")
+	}
+	if instance.CallerToken() == "" {
+		t.Fatal("caller token is empty")
+	}
+	credentials := instance.Credentials()
+	if !credentials.NewlyIssued || credentials.CallerToken != instance.CallerToken() || credentials.WorkerToken == "" ||
+		credentials.CallerKeyID == "" || credentials.WorkerKeyID == "" {
+		t.Fatal("Open did not return a complete newly-issued credential pair")
+	}
+	if !strings.HasPrefix(instance.BaseURL(), "http://127.0.0.1:") {
+		t.Fatalf("base URL = %q, want an IPv4 loopback URL", instance.BaseURL())
+	}
+
+	modelsRequest, err := http.NewRequest(http.MethodGet, instance.BaseURL()+"/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modelsRequest.Header.Set("Authorization", "Bearer "+instance.CallerToken())
+	modelsResponse, err := http.DefaultClient.Do(modelsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modelsBody, readErr := io.ReadAll(modelsResponse.Body)
+	_ = modelsResponse.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if modelsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, body = %s", modelsResponse.StatusCode, modelsBody)
+	}
+
+	// A streamed request is admitted only after the gateway reserves a live
+	// worker. Reaching 200 therefore exercises the in-process worker WebSocket,
+	// not merely the public HTTP listener.
+	requestContext, cancelRequest := context.WithTimeout(context.Background(), 3*time.Second)
+	body := []byte(`{"model":"human-expert","stream":true,"messages":[{"role":"user","content":"ping"}]}`)
+	chatRequest, err := http.NewRequestWithContext(
+		requestContext, http.MethodPost, instance.BaseURL()+"/v1/chat/completions", bytes.NewReader(body),
+	)
+	if err != nil {
+		cancelRequest()
+		t.Fatal(err)
+	}
+	chatRequest.Header.Set("Authorization", "Bearer "+instance.CallerToken())
+	chatRequest.Header.Set("Content-Type", "application/json")
+	chatRequest.Header.Set("Idempotency-Key", "local-worker-connected")
+	chatResponse, err := http.DefaultClient.Do(chatRequest)
+	if err != nil {
+		cancelRequest()
+		t.Fatal(err)
+	}
+	if chatResponse.StatusCode != http.StatusOK {
+		failureBody, _ := io.ReadAll(chatResponse.Body)
+		_ = chatResponse.Body.Close()
+		cancelRequest()
+		t.Fatalf("chat status = %d, body = %s", chatResponse.StatusCode, failureBody)
+	}
+	_ = chatResponse.Body.Close()
+	cancelRequest()
+
+	if err := instance.Close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	closed = true
+	if err := instance.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	select {
+	case <-instance.serveDone:
+	default:
+		t.Fatal("HTTP serving goroutine is still running after Close")
+	}
+
+	client := http.Client{Timeout: time.Second}
+	if response, err := client.Get(instance.BaseURL() + "/v1/models"); err == nil {
+		_ = response.Body.Close()
+		t.Fatalf("HTTP listener still accepted requests after Close: %s", response.Status)
+	}
+
+	databaseBytes, err := os.ReadFile(config.Gateway.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(databaseBytes, []byte(instance.CallerToken())) {
+		t.Fatal("gateway database persisted the plaintext caller token")
+	}
+	if bytes.Contains(databaseBytes, []byte(credentials.WorkerToken)) {
+		t.Fatal("gateway database persisted the plaintext worker token")
+	}
+}
+
+func TestOpenReusesExistingCredentials(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	privateRoot := filepath.Join(root, "private")
+	if err := os.Mkdir(privateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := Config{
+		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
+		Worker: worker.Config{
+			MirrorRoot: filepath.Join(root, "mirror"),
+			OutboxPath: filepath.Join(privateRoot, "outbox.db"),
+			StatePath:  filepath.Join(privateRoot, "state.db"),
+		},
+		ListenAddress: "127.0.0.1:0",
+		CallerSubject: "stable-caller",
+		WorkerSubject: "stable-worker",
+	}
+	first, err := Open(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials := first.Credentials()
+	if !credentials.NewlyIssued {
+		t.Fatal("first Open did not mark issued credentials")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	config.ExistingCallerToken = credentials.CallerToken
+	config.ExistingWorkerToken = credentials.WorkerToken
+	config.ExistingCallerKeyID = credentials.CallerKeyID
+	config.ExistingWorkerKeyID = credentials.WorkerKeyID
+	second, err := Open(context.Background(), config)
+	if err != nil {
+		t.Fatalf("reuse credentials: %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if got := second.Credentials(); got.NewlyIssued || got.CallerToken != credentials.CallerToken || got.WorkerToken != credentials.WorkerToken ||
+		got.CallerKeyID != credentials.CallerKeyID || got.WorkerKeyID != credentials.WorkerKeyID {
+		t.Fatal("Open did not return the configured existing credential pair")
+	}
+
+	request, err := http.NewRequest(http.MethodGet, second.BaseURL()+"/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+credentials.CallerToken)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("reused caller token status = %s", response.Status)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	withoutKeyIDs := config
+	withoutKeyIDs.ExistingCallerKeyID = ""
+	withoutKeyIDs.ExistingWorkerKeyID = ""
+	third, err := Open(context.Background(), withoutKeyIDs)
+	if err != nil {
+		t.Fatalf("reuse credentials without persisted key IDs: %v", err)
+	}
+	if got := third.Credentials(); got.CallerKeyID != credentials.CallerKeyID || got.WorkerKeyID != credentials.WorkerKeyID {
+		_ = third.Close()
+		t.Fatalf("derived credential key IDs = %+v", got)
+	}
+	if err := third.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wrongCallerSubject := config
+	wrongCallerSubject.CallerSubject = "different-caller"
+	if opened, err := Open(context.Background(), wrongCallerSubject); err == nil {
+		_ = opened.Close()
+		t.Fatal("Open accepted a caller token bound to a different subject")
+	}
+
+	wrongWorkerSubject := config
+	wrongWorkerSubject.WorkerSubject = "different-worker"
+	if opened, err := Open(context.Background(), wrongWorkerSubject); err == nil {
+		_ = opened.Close()
+		t.Fatal("Open accepted a worker token bound to a different subject")
+	}
+
+	wrongCallerKey := config
+	wrongCallerKey.ExistingCallerKeyID = "key_unrelated"
+	if opened, err := Open(context.Background(), wrongCallerKey); err == nil {
+		_ = opened.Close()
+		t.Fatal("Open accepted a caller token with a different persisted key ID")
+	}
+
+	invalidCaller := config
+	invalidCaller.ExistingCallerToken = credentials.WorkerToken
+	if opened, err := Open(context.Background(), invalidCaller); err == nil {
+		_ = opened.Close()
+		t.Fatal("Open accepted a worker credential as the existing caller token")
+	}
+
+	invalidWorker := config
+	invalidWorker.ExistingWorkerToken = credentials.CallerToken
+	if opened, err := Open(context.Background(), invalidWorker); err == nil {
+		_ = opened.Close()
+		t.Fatal("Open accepted a caller credential as the existing worker token")
+	}
+}
+
+func TestOpenUsesCredentialProviderBeforeStartingWorker(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	privateRoot := filepath.Join(root, "private")
+	if err := os.Mkdir(privateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	providerCalled := false
+	config := Config{
+		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
+		Worker: worker.Config{
+			MirrorRoot: filepath.Join(root, "mirror"),
+			OutboxPath: filepath.Join(privateRoot, "outbox.db"),
+			StatePath:  filepath.Join(privateRoot, "state.db"),
+		},
+		ListenAddress: "127.0.0.1:0",
+		CallerSubject: "provided-caller",
+		WorkerSubject: "provided-worker",
+	}
+	config.CredentialProvider = func(ctx context.Context, server *gateway.Server) (Credentials, error) {
+		providerCalled = true
+		caller, err := server.Issue(ctx, gateway.PrincipalCaller, config.CallerSubject)
+		if err != nil {
+			return Credentials{}, err
+		}
+		workerToken, err := server.Issue(ctx, gateway.PrincipalWorker, config.WorkerSubject)
+		if err != nil {
+			return Credentials{}, err
+		}
+		return Credentials{
+			CallerToken: caller.Secret, WorkerToken: workerToken.Secret,
+			CallerKeyID: caller.KeyID, WorkerKeyID: workerToken.KeyID,
+		}, nil
+	}
+
+	instance, err := Open(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = instance.Close() })
+	if !providerCalled {
+		t.Fatal("credential provider was not called")
+	}
+	if got := instance.Credentials(); got.NewlyIssued || got.CallerToken == "" || got.WorkerToken == "" {
+		t.Fatalf("provided credentials = %+v", got)
+	}
+}
+
+func TestOpenRejectsCustomAuthenticatorAndNonLoopbackListener(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	base := Config{
+		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
+		Worker: worker.Config{
+			MirrorRoot:   filepath.Join(root, "mirror"),
+			OutboxPath:   filepath.Join(root, "outbox.db"),
+			DisableState: true,
+		},
+	}
+	customAuth := base
+	customAuth.Gateway.Authenticator = gateway.AuthenticatorFunc(func(*http.Request) (gateway.Principal, error) {
+		return gateway.Principal{}, gateway.ErrUnauthorized
+	})
+	if instance, err := Open(context.Background(), customAuth); err == nil {
+		_ = instance.Close()
+		t.Fatal("Open accepted a custom authenticator in auto-token mode")
+	}
+
+	partialCredentials := base
+	partialCredentials.ExistingCallerToken = "caller-only"
+	if instance, err := Open(context.Background(), partialCredentials); err == nil {
+		_ = instance.Close()
+		t.Fatal("Open accepted only one existing credential")
+	}
+
+	nonLoopback := base
+	nonLoopback.ListenAddress = "0.0.0.0:0"
+	if instance, err := Open(context.Background(), nonLoopback); err == nil {
+		_ = instance.Close()
+		t.Fatal("Open accepted a non-loopback listener")
+	}
+}
+
+func TestDefaultConfigUsesEmbeddableComponentDefaults(t *testing.T) {
+	t.Parallel()
+	config, err := DefaultConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ListenAddress != DefaultListenAddress {
+		t.Fatalf("listen address = %q", config.ListenAddress)
+	}
+	if config.Gateway.Authenticator != nil || config.Worker.Token != "" {
+		t.Fatal("default local config unexpectedly contains external auth or plaintext credentials")
+	}
+	for label, path := range map[string]string{
+		"mirror": config.Worker.MirrorRoot,
+		"outbox": config.Worker.OutboxPath,
+		"state":  config.Worker.StatePath,
+	} {
+		if !filepath.IsAbs(path) {
+			t.Fatalf("%s path = %q, want absolute", label, path)
+		}
+	}
+}
+
+func TestFailedOpenRollbackRevokesCallerIssuedBeforeWorker(t *testing.T) {
+	t.Parallel()
+	gatewayConfig := gateway.DefaultConfig()
+	gatewayConfig.DatabasePath = filepath.Join(t.TempDir(), "gateway.db")
+	gatewayServer, err := gateway.Open(context.Background(), gatewayConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = gatewayServer.Close() })
+	caller, err := gatewayServer.Issue(context.Background(), gateway.PrincipalCaller, "rollback-caller")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	partial := &Local{
+		gateway: gatewayServer,
+		credentials: Credentials{
+			CallerToken: caller.Secret,
+			CallerKeyID: caller.KeyID,
+		},
+		issuedDuringOpen: true,
+		shutdownTimeout:  time.Second,
+	}
+	if err := partial.revokeNewCredentials(); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer "+caller.Secret)
+	response := httptest.NewRecorder()
+	gatewayServer.ModelHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("partially issued caller status = %d, want 401 after rollback", response.Code)
+	}
+}

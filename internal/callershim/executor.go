@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -45,11 +46,33 @@ type ExecutorConfig struct {
 	DefaultTimeout time.Duration
 	MaxTimeout     time.Duration
 	MaxOutputBytes int
+	// MaxReadBytes bounds human_read_file before the result is committed to the
+	// immutable execution ledger. The default leaves room for JSON escaping and
+	// completion history inside the shared 8 MiB protocol budget.
+	MaxReadBytes int64
+	// MaxResultBytes bounds the final encoded ToolResponse for every tool before
+	// it becomes immutable in the ledger. This catches amplification such as a
+	// search returning many multi-megabyte lines or JSON escaping command output.
+	MaxResultBytes int
 }
 
 type Executor struct {
 	config ExecutorConfig
+
+	unsettledMu sync.Mutex
+	unsettled   map[ExecutionKey]unsettledExecution
 }
+
+// unsettledExecution is the narrow current-process recovery record for a tool
+// that has definitely finished running but whose completed or indeterminate
+// terminal could not be confirmed durable. It deliberately contains no input
+// capable of re-running the tool.
+type unsettledExecution struct {
+	requestDigest        string
+	indeterminatePayload []byte
+}
+
+const toolResultCommitTimeout = 10 * time.Second
 
 func NewExecutor(config ExecutorConfig) (*Executor, error) {
 	if config.Root == nil || config.Ledger == nil {
@@ -67,7 +90,16 @@ func NewExecutor(config ExecutorConfig) (*Executor, error) {
 	if config.MaxOutputBytes <= 0 {
 		config.MaxOutputBytes = 1 << 20
 	}
-	return &Executor{config: config}, nil
+	if config.MaxReadBytes <= 0 {
+		config.MaxReadBytes = 1 << 20
+	}
+	if config.MaxResultBytes <= 0 {
+		config.MaxResultBytes = 2 << 20
+	}
+	if config.MaxResultBytes < 256 {
+		return nil, errors.New("maximum encoded tool result must be at least 256 bytes")
+	}
+	return &Executor{config: config, unsettled: make(map[ExecutionKey]unsettledExecution)}, nil
 }
 
 func (executor *Executor) Execute(ctx context.Context, request ToolRequest) (ToolResponse, error) {
@@ -79,19 +111,18 @@ func (executor *Executor) Execute(ctx context.Context, request ToolRequest) (Too
 		return ToolResponse{}, err
 	}
 	key := ExecutionKey{CallerID: request.CallerID, TaskID: request.TaskID, ToolCallID: request.ToolCallID}
+	if response, handled, err := executor.retryUnsettledExecution(ctx, key, digest); handled {
+		return response, err
+	}
 	begin, err := executor.config.Ledger.Begin(ctx, key, digest)
 	if err != nil {
 		return ToolResponse{}, err
 	}
 	if begin.Replay {
-		if begin.Execution.Status != "completed" {
+		if begin.Execution.Status == "pending" {
 			return ToolResponse{}, ErrExecutionPending
 		}
-		var response ToolResponse
-		if err := json.Unmarshal(begin.Execution.Response, &response); err != nil {
-			return ToolResponse{}, fmt.Errorf("decode persisted tool response: %w", err)
-		}
-		return response, nil
+		return decodePersistedToolResponse(begin.Execution.Response)
 	}
 
 	response := executor.executeOnce(ctx, request.Name, canonicalInput)
@@ -99,8 +130,145 @@ func (executor *Executor) Execute(ctx context.Context, request ToolRequest) (Too
 	if err != nil {
 		return ToolResponse{}, fmt.Errorf("encode tool response: %w", err)
 	}
-	if _, err := executor.config.Ledger.Complete(ctx, key, encoded); err != nil {
-		return ToolResponse{}, fmt.Errorf("persist tool response: %w", err)
+	if len(encoded) > executor.config.MaxResultBytes {
+		guidance := "narrow the request and use a new tool_call_id"
+		if toolMayMutate(request.Name) {
+			guidance = "the tool may already have changed external state; reconcile that state before deciding whether to use a new tool_call_id"
+		}
+		response = ToolResponse{
+			Content: fmt.Sprintf(
+				"tool result encoded to %d bytes, exceeding the %d-byte durable result limit; %s",
+				len(encoded), executor.config.MaxResultBytes, guidance,
+			),
+			IsError: true, ErrorCode: "result_too_large",
+		}
+		encoded, err = json.Marshal(response)
+		if err != nil {
+			return ToolResponse{}, fmt.Errorf("encode bounded tool response: %w", err)
+		}
+	}
+	// The tool may already have changed the caller workspace by the time the
+	// HTTP peer disconnects. Do not let that request cancellation strand the
+	// at-most-once ledger row in pending forever: completion is a bounded,
+	// caller-independent durability obligation once execution has happened.
+	commitContext, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), toolResultCommitTimeout)
+	defer cancelCommit()
+	completed, err := executor.config.Ledger.Complete(commitContext, key, encoded)
+	if err != nil {
+		// Complete may fail after the tool has already changed the workspace. A
+		// durable indeterminate terminal is the only safe automatic resolution:
+		// it unblocks the caller without ever repeating the side effect.
+		indeterminate, encodeErr := json.Marshal(indeterminateToolResponse())
+		if encodeErr != nil {
+			return ToolResponse{}, errors.Join(
+				fmt.Errorf("persist tool response: %w", err),
+				fmt.Errorf("encode indeterminate execution response: %w", encodeErr),
+			)
+		}
+		unsettled := unsettledExecution{
+			requestDigest:        digest,
+			indeterminatePayload: bytes.Clone(indeterminate),
+		}
+		executor.rememberUnsettledExecution(key, unsettled)
+		resolved, resolveErr := executor.resolveUnsettledExecution(ctx, key, unsettled)
+		if resolveErr != nil {
+			return ToolResponse{}, errors.Join(
+				fmt.Errorf("persist tool response: %w", err),
+				resolveErr,
+			)
+		}
+		return resolved, nil
+	}
+	return decodePersistedToolResponse(completed.Response)
+}
+
+func (executor *Executor) rememberUnsettledExecution(
+	key ExecutionKey,
+	unsettled unsettledExecution,
+) {
+	executor.unsettledMu.Lock()
+	defer executor.unsettledMu.Unlock()
+	executor.unsettled[key] = unsettledExecution{
+		requestDigest:        unsettled.requestDigest,
+		indeterminatePayload: bytes.Clone(unsettled.indeterminatePayload),
+	}
+}
+
+// retryUnsettledExecution resolves only executions that this Executor knows
+// have already returned from executeOnce. A normal ledger "pending" row has no
+// such record and retains the existing ErrExecutionPending behavior.
+func (executor *Executor) retryUnsettledExecution(
+	ctx context.Context,
+	key ExecutionKey,
+	requestDigest string,
+) (ToolResponse, bool, error) {
+	executor.unsettledMu.Lock()
+	unsettled, ok := executor.unsettled[key]
+	executor.unsettledMu.Unlock()
+	if !ok {
+		return ToolResponse{}, false, nil
+	}
+	if unsettled.requestDigest != requestDigest {
+		return ToolResponse{}, true, ErrExecutionReplay
+	}
+	response, err := executor.resolveUnsettledExecution(ctx, key, unsettled)
+	return response, true, err
+}
+
+func (executor *Executor) resolveUnsettledExecution(
+	ctx context.Context,
+	key ExecutionKey,
+	unsettled unsettledExecution,
+) (ToolResponse, error) {
+	resolveContext, cancelResolve := context.WithTimeout(context.WithoutCancel(ctx), toolResultCommitTimeout)
+	defer cancelResolve()
+	resolved, err := executor.config.Ledger.MarkIndeterminate(
+		resolveContext, key, bytes.Clone(unsettled.indeterminatePayload),
+	)
+	if err != nil {
+		return ToolResponse{}, fmt.Errorf("persist indeterminate execution outcome: %w", err)
+	}
+	if resolved.Status != "completed" && resolved.Status != "indeterminate" {
+		return ToolResponse{}, fmt.Errorf(
+			"persist indeterminate execution outcome: ledger returned nonterminal status %q",
+			resolved.Status,
+		)
+	}
+
+	executor.unsettledMu.Lock()
+	current, stillUnsettled := executor.unsettled[key]
+	if stillUnsettled && current.requestDigest == unsettled.requestDigest &&
+		bytes.Equal(current.indeterminatePayload, unsettled.indeterminatePayload) {
+		delete(executor.unsettled, key)
+	}
+	executor.unsettledMu.Unlock()
+	response, decodeErr := decodePersistedToolResponse(resolved.Response)
+	if decodeErr != nil {
+		return ToolResponse{}, decodeErr
+	}
+	return response, nil
+}
+
+func toolMayMutate(name string) bool {
+	switch name {
+	case "human_write_file", "human_edit_file", "human_delete_file", "human_rename_file", "human_exec":
+		return true
+	default:
+		return false
+	}
+}
+
+func indeterminateToolResponse() ToolResponse {
+	return ToolResponse{
+		Content: "the previous execution may already have changed the workspace, but its result was not durably recorded; reconcile the workspace state, then retry with a new tool_call_id",
+		IsError: true, ErrorCode: "execution_outcome_indeterminate",
+	}
+}
+
+func decodePersistedToolResponse(encoded []byte) (ToolResponse, error) {
+	var response ToolResponse
+	if err := json.Unmarshal(encoded, &response); err != nil {
+		return ToolResponse{}, fmt.Errorf("decode persisted tool response: %w", err)
 	}
 	return response, nil
 }
@@ -149,7 +317,7 @@ func (executor *Executor) read(raw json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	content, fingerprint, err := executor.config.Root.ReadFile(path)
+	content, fingerprint, err := executor.config.Root.ReadFileLimited(path, executor.config.MaxReadBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -183,11 +351,15 @@ func (executor *Executor) search(raw json.RawMessage) (any, error) {
 			return nil, err
 		}
 	}
-	matches, err := executor.config.Root.Search(path, input.Query, input.MaxResults)
+	report, err := executor.config.Root.SearchDetailed(path, input.Query, input.MaxResults)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"matches": matches, "count": len(matches)}, nil
+	result := map[string]any{"matches": report.Matches, "count": len(report.Matches)}
+	if len(report.Skipped) > 0 {
+		result["skipped"] = report.Skipped
+	}
+	return result, nil
 }
 
 type writeInput struct {
@@ -335,6 +507,7 @@ func (executor *Executor) run(ctx context.Context, raw json.RawMessage) (any, er
 	} else {
 		command = exec.CommandContext(runContext, "/bin/sh", "-c", input.Command)
 	}
+	configureCommandCancellation(command)
 	command.Dir = cwd
 	command.Env = []string{"PATH=" + os.Getenv("PATH"), "LANG=C.UTF-8", "LC_ALL=C.UTF-8"}
 	stdout := &limitedBuffer{limit: executor.config.MaxOutputBytes}
@@ -492,6 +665,8 @@ func classifyError(err error) string {
 		return "edit_match_error"
 	case errors.Is(err, callerfs.ErrDestinationExists):
 		return "destination_exists"
+	case errors.Is(err, callerfs.ErrFileTooLarge):
+		return "result_too_large"
 	default:
 		return "tool_error"
 	}

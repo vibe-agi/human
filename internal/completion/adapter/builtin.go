@@ -6,13 +6,14 @@ const (
 )
 
 // NewDefaultRegistry returns the exact, versioned adapters shipped with the
-// daemon. Completion mode deliberately starts with the project-owned caller shim;
-// real harness adapters are added only after their golden fixtures are
-// captured and reviewed.
+// daemon. Real harness adapters are registered only after their tool contracts
+// have been captured and reviewed.
 func NewDefaultRegistry() *Registry {
 	registry := NewRegistry()
-	if err := registry.Register(HumanShimProfile()); err != nil {
-		panic(err)
+	for _, profile := range []Profile{HumanShimProfile(), OpenCode11718Profile()} {
+		if err := registry.Register(profile); err != nil {
+			panic(err)
+		}
 	}
 	return registry
 }
@@ -21,6 +22,8 @@ func HumanShimProfile() Profile {
 	return Profile{
 		HarnessID:      HumanShimID,
 		HarnessVersion: HumanShimVersion,
+		PathStyle:      PathWorkspaceVirtual,
+		ResultCodec:    ResultHumanShimV1,
 		Read: &Tool{Name: "human_read_file", Args: map[string]string{
 			"path": "path",
 		}},
@@ -28,7 +31,8 @@ func HumanShimProfile() Profile {
 			"query": "query", "path": "path",
 		}},
 		Write: &Tool{Name: "human_write_file", Args: map[string]string{
-			"path": "path", "content": "content", "expected_sha256": "expected_sha256",
+			"path": "path", "content": "content", "encoding": "encoding",
+			"expected_sha256": "expected_sha256",
 		}},
 		Edit: &EditTool{
 			Tool: Tool{Name: "human_edit_file", Args: map[string]string{

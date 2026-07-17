@@ -30,10 +30,13 @@ func (Codec) Dialect() canonical.Dialect {
 }
 
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Stream   bool          `json:"stream"`
-	Messages []chatMessage `json:"messages"`
-	Tools    []chatTool    `json:"tools"`
+	Model             string          `json:"model"`
+	Stream            bool            `json:"stream"`
+	Messages          []chatMessage   `json:"messages"`
+	Tools             []chatTool      `json:"tools"`
+	ToolChoice        json.RawMessage `json:"tool_choice"`
+	ResponseFormat    json.RawMessage `json:"response_format"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls"`
 }
 
 type chatMessage struct {
@@ -68,8 +71,14 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 	if err := json.Unmarshal(payload, &wire); err != nil {
 		return canonical.Request{}, fmt.Errorf("decode OpenAI chat request: %w", err)
 	}
-	if !wire.Stream {
-		return canonical.Request{}, dialect.ErrUnsupportedNonStreaming
+	if err := validateToolChoice(wire.ToolChoice); err != nil {
+		return canonical.Request{}, err
+	}
+	if err := validateResponseFormat(wire.ResponseFormat); err != nil {
+		return canonical.Request{}, err
+	}
+	if wire.ParallelToolCalls != nil && !*wire.ParallelToolCalls {
+		return canonical.Request{}, errors.New("parallel_tool_calls=false is not supported")
 	}
 	request := canonical.Request{
 		Dialect: canonical.DialectOpenAIChat,
@@ -101,8 +110,8 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 			if call.Type != "" && call.Type != "function" {
 				return canonical.Request{}, fmt.Errorf("message %d tool call %d: unsupported type %q", index, callIndex, call.Type)
 			}
-			var input map[string]any
-			if err := json.Unmarshal([]byte(call.Function.Arguments), &input); err != nil {
+			input, err := decodeToolArguments(call.Function.Arguments)
+			if err != nil {
 				return canonical.Request{}, fmt.Errorf("message %d tool call %d arguments: %w", index, callIndex, err)
 			}
 			blocks = append(blocks, canonical.Block{
@@ -122,6 +131,12 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 			}
 			continue
 		}
+		// Model APIs may include an explicit empty assistant turn (notably after
+		// an empty final). It carries no canonical information; dropping it keeps
+		// the next full-history request valid without weakening user validation.
+		if role == canonical.RoleAssistant && len(blocks) == 0 {
+			continue
+		}
 		request.Messages = append(request.Messages, canonical.Message{Role: role, Blocks: blocks})
 	}
 	for index, tool := range wire.Tools {
@@ -130,7 +145,7 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 		}
 		request.Tools = append(request.Tools, canonical.Tool{
 			Name: tool.Function.Name, Description: tool.Function.Description,
-			InputSchema: tool.Function.Parameters,
+			InputSchema: objectSchemaOrDefault(tool.Function.Parameters),
 		})
 	}
 	if err := request.Validate(); err != nil {
@@ -139,9 +154,64 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 	return request, nil
 }
 
+func validateToolChoice(raw json.RawMessage) error {
+	if isNullJSON(raw) {
+		return nil
+	}
+	var choice string
+	if err := json.Unmarshal(raw, &choice); err != nil || choice != "auto" {
+		return errors.New("tool_choice is unsupported; omit it or use \"auto\"")
+	}
+	return nil
+}
+
+func validateResponseFormat(raw json.RawMessage) error {
+	if isNullJSON(raw) {
+		return nil
+	}
+	var format struct {
+		Type string `json:"type"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&format); err != nil {
+		return fmt.Errorf("response_format: %w", err)
+	}
+	if format.Type != "text" {
+		return errors.New("structured response_format is not supported; omit it or use type \"text\"")
+	}
+	return nil
+}
+
+func decodeToolArguments(value string) (map[string]any, error) {
+	if strings.TrimSpace(value) == "" || strings.TrimSpace(value) == "null" {
+		return map[string]any{}, nil
+	}
+	var input map[string]any
+	if err := json.Unmarshal([]byte(value), &input); err != nil {
+		return nil, err
+	}
+	if input == nil {
+		input = map[string]any{}
+	}
+	return input, nil
+}
+
+func objectSchemaOrDefault(raw json.RawMessage) json.RawMessage {
+	if isNullJSON(raw) {
+		return json.RawMessage(`{"type":"object","properties":{}}`)
+	}
+	return raw
+}
+
+func isNullJSON(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
+}
+
 func parseRole(value string) (canonical.Role, error) {
 	switch value {
-	case "system":
+	case "system", "developer":
 		return canonical.RoleSystem, nil
 	case "user":
 		return canonical.RoleUser, nil
@@ -181,7 +251,9 @@ func parseContent(raw json.RawMessage) ([]canonical.Block, error) {
 	for _, part := range parts {
 		switch part.Type {
 		case "text":
-			blocks = append(blocks, canonical.Block{Type: canonical.BlockText, Text: part.Text})
+			if part.Text != "" {
+				blocks = append(blocks, canonical.Block{Type: canonical.BlockText, Text: part.Text})
+			}
 		case "image_url":
 			blocks = append(blocks, canonical.Block{Type: canonical.BlockImage, ImageURL: part.ImageURL.URL})
 		default:
@@ -223,6 +295,9 @@ func errorType(status int) string {
 	case http.StatusConflict:
 		return "idempotency_error"
 	default:
+		if status >= 500 {
+			return "server_error"
+		}
 		return "invalid_request_error"
 	}
 }
@@ -282,7 +357,7 @@ func (stream *stream) Encode(event completion.Event, _ ...dialect.EventSeed) ([]
 	case completion.EventToolCalls:
 		calls := make([]map[string]any, 0, len(event.ToolCalls))
 		for index, call := range event.ToolCalls {
-			arguments, err := json.Marshal(call.Input)
+			arguments, err := marshalToolArguments(call.Input)
 			if err != nil {
 				return nil, false, fmt.Errorf("marshal tool call %q arguments: %w", call.ID, err)
 			}
@@ -319,6 +394,13 @@ func (stream *stream) Encode(event completion.Event, _ ...dialect.EventSeed) ([]
 	default:
 		return nil, false, fmt.Errorf("unsupported completion event %q", event.Type)
 	}
+}
+
+func marshalToolArguments(input map[string]any) ([]byte, error) {
+	if input == nil {
+		input = map[string]any{}
+	}
+	return json.Marshal(input)
 }
 
 func (stream *stream) chunk(delta map[string]any, finishReason *string) ([]byte, error) {

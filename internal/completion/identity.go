@@ -29,8 +29,12 @@ type RoutingIdentity struct {
 	IdempotencyKey string
 	HarnessID      string
 	HarnessVersion string
-	Root           string
-	ExecAllowed    bool
+	// HarnessSessionID is a versioned adapter-provided conversation affinity.
+	// It is not a task ID: one harness session may contain many terminal Human
+	// tasks, while an awaiting-caller clarification reuses the one open task.
+	HarnessSessionID string
+	Root             string
+	ExecAllowed      bool
 }
 
 func ParseCapabilityTier(value string) (CapabilityTier, error) {
@@ -68,6 +72,9 @@ func (id RoutingIdentity) Validate(tier CapabilityTier) error {
 			return fmt.Errorf("%s is required and must be a stable key", field.name)
 		}
 	}
+	if id.HarnessSessionID != "" && !validStableKey(id.HarnessSessionID) {
+		return errors.New("harness_session_id must be a stable key when provided")
+	}
 	if strings.TrimSpace(id.Root) == "" {
 		return errors.New("workspace root is required")
 	}
@@ -80,4 +87,11 @@ func (id RoutingIdentity) Namespace() string {
 
 func validStableKey(value string) bool {
 	return stableKeyPattern.MatchString(value)
+}
+
+// IsStableKey reports whether value can safely participate in a durable
+// correctness namespace. Exact adapters use it for protocol-native affinity
+// values before they are allowed to influence routing or downgrade behavior.
+func IsStableKey(value string) bool {
+	return validStableKey(value)
 }

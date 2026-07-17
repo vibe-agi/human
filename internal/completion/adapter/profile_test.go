@@ -49,3 +49,25 @@ func TestProfileRejectsNoCapabilities(t *testing.T) {
 		t.Fatal("empty capability profile accepted")
 	}
 }
+
+func TestProfileRejectsInvalidOrConflictingNativeToolAuthorization(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		native map[string]ToolAuthorization
+	}{
+		{name: "invalid authorization", native: map[string]ToolAuthorization{"task": "maybe"}},
+		{name: "duplicates semantic mapping", native: map[string]ToolAuthorization{"read": ToolAuthorizationStandard}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			profile := Profile{
+				HarnessID: "h", HarnessVersion: "v", ErrorShape: "error",
+				Read: &Tool{Name: "read"}, NativeTools: test.native,
+			}
+			if err := profile.Validate(); err == nil {
+				t.Fatal("invalid native tool authorization accepted")
+			}
+		})
+	}
+}

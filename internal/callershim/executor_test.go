@@ -6,10 +6,53 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/vibe-agi/human/internal/callerfs"
 )
+
+type cancelAfterBeginLedger struct {
+	Ledger
+	cancel context.CancelFunc
+}
+
+type failCompleteLedger struct {
+	Ledger
+}
+
+func (ledger failCompleteLedger) Complete(context.Context, ExecutionKey, []byte) (Execution, error) {
+	return Execution{}, errors.New("injected completion failure")
+}
+
+type completeThenErrorLedger struct {
+	Ledger
+}
+
+func (ledger completeThenErrorLedger) Complete(
+	ctx context.Context,
+	key ExecutionKey,
+	response []byte,
+) (Execution, error) {
+	if _, err := ledger.Ledger.Complete(ctx, key, response); err != nil {
+		return Execution{}, err
+	}
+	return Execution{}, errors.New("injected ambiguous commit result")
+}
+
+func (ledger cancelAfterBeginLedger) Begin(
+	ctx context.Context,
+	key ExecutionKey,
+	digest string,
+) (BeginResult, error) {
+	result, err := ledger.Ledger.Begin(ctx, key, digest)
+	if err == nil {
+		ledger.cancel()
+	}
+	return result, err
+}
 
 type executorFixture struct {
 	executor  *Executor
@@ -163,6 +206,108 @@ func TestReadSearchAndExecDefaultClosed(t *testing.T) {
 	}
 }
 
+func TestOversizedReadBecomesSmallDurableToolError(t *testing.T) {
+	t.Parallel()
+	fixture := newExecutorFixture(t, false)
+	fixture.executor.config.MaxReadBytes = 8
+	path := filepath.Join(fixture.workspace, "large.txt")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := toolRequest("read-large", "human_read_file", map[string]any{"path": "large.txt"})
+	first, err := fixture.executor.Execute(context.Background(), request)
+	if err != nil || !first.IsError || first.ErrorCode != "result_too_large" {
+		t.Fatalf("oversized read = %+v, %v", first, err)
+	}
+	if text, ok := first.Content.(string); !ok || !strings.Contains(text, "limit 8") {
+		t.Fatalf("oversized read diagnostic = %#v", first.Content)
+	}
+	// The bounded error, not the oversized bytes, is the immutable result for
+	// this call id. A new call id can retry after the file changes.
+	if err := os.WriteFile(path, []byte("small"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := fixture.executor.Execute(context.Background(), request)
+	if err != nil || !replay.IsError || replay.ErrorCode != "result_too_large" {
+		t.Fatalf("oversized read replay = %+v, %v", replay, err)
+	}
+	retry, err := fixture.executor.Execute(context.Background(),
+		toolRequest("read-small", "human_read_file", map[string]any{"path": "large.txt"}))
+	if err != nil || retry.IsError {
+		t.Fatalf("new bounded read = %+v, %v", retry, err)
+	}
+}
+
+func TestOversizedSearchResultBecomesSmallDurableToolError(t *testing.T) {
+	t.Parallel()
+	fixture := newExecutorFixture(t, false)
+	fixture.executor.config.MaxResultBytes = 512
+	path := filepath.Join(fixture.workspace, "bundle.js")
+	if err := os.WriteFile(path, []byte("needle "+strings.Repeat("x", 2048)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := toolRequest("search-large", "human_search", map[string]any{
+		"path": ".", "query": "needle", "max_results": 100,
+	})
+	first, err := fixture.executor.Execute(context.Background(), request)
+	if err != nil || !first.IsError || first.ErrorCode != "result_too_large" {
+		t.Fatalf("oversized search = %+v, %v", first, err)
+	}
+	if err := os.WriteFile(path, []byte("needle small"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := fixture.executor.Execute(context.Background(), request)
+	if err != nil || !replay.IsError || replay.ErrorCode != "result_too_large" {
+		t.Fatalf("oversized search replay = %+v, %v", replay, err)
+	}
+	retry, err := fixture.executor.Execute(context.Background(),
+		toolRequest("search-small", "human_search", map[string]any{
+			"path": ".", "query": "needle", "max_results": 100,
+		}))
+	if err != nil || retry.IsError {
+		t.Fatalf("new bounded search = %+v, %v", retry, err)
+	}
+	encoded, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > fixture.executor.config.MaxResultBytes {
+		t.Fatalf("bounded search error encoded to %d bytes", len(encoded))
+	}
+}
+
+func TestOversizedMutatingResultRequiresReconciliationBeforeRetry(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture command uses POSIX shell syntax")
+	}
+	fixture := newExecutorFixture(t, true)
+	executor, err := NewExecutor(ExecutorConfig{
+		Root: fixture.executor.config.Root, Ledger: fixture.ledger, ExecEnabled: true,
+		MaxResultBytes: 512,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := executor.Execute(context.Background(), toolRequest(
+		"large-mutating-result", "human_exec", map[string]any{
+			"command": "printf applied > side-effect.txt; printf '%04096d' 0",
+			"cwd":     "/workspace",
+		},
+	))
+	if err != nil || !response.IsError || response.ErrorCode != "result_too_large" {
+		t.Fatalf("oversized mutating result = %+v, %v", response, err)
+	}
+	message, ok := response.Content.(string)
+	if !ok || !strings.Contains(message, "may already have changed external state") ||
+		!strings.Contains(message, "reconcile") {
+		t.Fatalf("oversized mutating guidance = %#v", response.Content)
+	}
+	content, err := os.ReadFile(filepath.Join(fixture.workspace, "side-effect.txt"))
+	if err != nil || string(content) != "applied" {
+		t.Fatalf("command side effect = %q, %v", content, err)
+	}
+}
+
 func TestPendingExecutionFailsClosed(t *testing.T) {
 	t.Parallel()
 	fixture := newExecutorFixture(t, false)
@@ -183,5 +328,157 @@ func TestPendingExecutionFailsClosed(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(fixture.workspace, "pending.txt")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("pending execution was rerun: %v", err)
+	}
+}
+
+func TestPendingExecutionBecomesReplayableIndeterminateAfterRestart(t *testing.T) {
+	t.Parallel()
+	fixture := newExecutorFixture(t, false)
+	request := toolRequest("pending-restart", "human_write_file", map[string]any{
+		"path": "pending-restart.txt", "content": "must-not-run", "expected_sha256": callerfs.AbsentFingerprint,
+	})
+	digest, _, err := requestDigest(request.Name, request.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := ExecutionKey{CallerID: request.CallerID, TaskID: request.TaskID, ToolCallID: request.ToolCallID}
+	if _, err := fixture.ledger.Begin(context.Background(), key, digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := OpenSQLiteLedger(context.Background(), fixture.ledgerDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.ledger = ledger
+	root, err := callerfs.OpenRoot(fixture.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewExecutor(ExecutorConfig{Root: root, Ledger: ledger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := executor.Execute(context.Background(), request)
+	if err != nil || !first.IsError || first.ErrorCode != "execution_outcome_indeterminate" {
+		t.Fatalf("recovered pending response = %+v, %v", first, err)
+	}
+	replay, err := executor.Execute(context.Background(), request)
+	if err != nil || replay != first {
+		t.Fatalf("indeterminate replay = %+v, %v; want %+v", replay, err, first)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.workspace, "pending-restart.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovered pending execution was rerun: %v", err)
+	}
+	newCall := request
+	newCall.ToolCallID = "pending-reconciled"
+	result, err := executor.Execute(context.Background(), newCall)
+	if err != nil || result.IsError {
+		t.Fatalf("explicit new call after reconciliation = %+v, %v", result, err)
+	}
+}
+
+func TestCompletionFailureBecomesDurableIndeterminateWithoutRerun(t *testing.T) {
+	t.Parallel()
+	fixture := newExecutorFixture(t, false)
+	executor, err := NewExecutor(ExecutorConfig{
+		Root: fixture.executor.config.Root, Ledger: failCompleteLedger{Ledger: fixture.ledger},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := toolRequest("ambiguous-write", "human_write_file", map[string]any{
+		"path": "ambiguous.txt", "content": "written-once", "expected_sha256": callerfs.AbsentFingerprint,
+	})
+	first, err := executor.Execute(context.Background(), request)
+	if err != nil || !first.IsError || first.ErrorCode != "execution_outcome_indeterminate" {
+		t.Fatalf("completion failure response = %+v, %v", first, err)
+	}
+	if content, err := os.ReadFile(filepath.Join(fixture.workspace, "ambiguous.txt")); err != nil || string(content) != "written-once" {
+		t.Fatalf("mutation result = %q, %v", content, err)
+	}
+	replay, err := fixture.executor.Execute(context.Background(), request)
+	if err != nil || replay != first {
+		t.Fatalf("indeterminate replay = %+v, %v; want %+v", replay, err, first)
+	}
+}
+
+func TestAmbiguousCommitReadsBackCompletedResult(t *testing.T) {
+	t.Parallel()
+	fixture := newExecutorFixture(t, false)
+	executor, err := NewExecutor(ExecutorConfig{
+		Root: fixture.executor.config.Root, Ledger: completeThenErrorLedger{Ledger: fixture.ledger},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := toolRequest("ambiguous-commit", "human_write_file", map[string]any{
+		"path": "committed-despite-error.txt", "content": "once", "expected_sha256": callerfs.AbsentFingerprint,
+	})
+	first, err := executor.Execute(context.Background(), request)
+	if err != nil || first.IsError {
+		t.Fatalf("ambiguous committed response = %+v, %v", first, err)
+	}
+	replay, err := fixture.executor.Execute(context.Background(), request)
+	if err != nil || replay.IsError {
+		t.Fatalf("completed replay = %+v, %v", replay, err)
+	}
+}
+
+func TestExecutedMutationCommitsLedgerAfterRequestCancellation(t *testing.T) {
+	t.Parallel()
+	fixture := newExecutorFixture(t, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	executor, err := NewExecutor(ExecutorConfig{
+		Root:   fixture.executor.config.Root,
+		Ledger: cancelAfterBeginLedger{Ledger: fixture.ledger, cancel: cancel},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := toolRequest("cancel-after-write", "human_write_file", map[string]any{
+		"path": "committed.txt", "content": "once", "expected_sha256": callerfs.AbsentFingerprint,
+	})
+	first, err := executor.Execute(ctx, request)
+	if err != nil || first.IsError {
+		t.Fatalf("canceled request result = %+v, %v", first, err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("test ledger did not cancel request context")
+	}
+	replay, err := fixture.executor.Execute(context.Background(), request)
+	if err != nil || replay.IsError {
+		t.Fatalf("durable replay after request cancellation = %+v, %v", replay, err)
+	}
+}
+
+func TestExecTimeoutKillsDescendantPipeHolders(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix process-group behavior")
+	}
+	fixture := newExecutorFixture(t, true)
+	executor, err := NewExecutor(ExecutorConfig{
+		Root: fixture.executor.config.Root, Ledger: fixture.ledger, ExecEnabled: true,
+		DefaultTimeout: 100 * time.Millisecond, MaxTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	response, err := executor.Execute(context.Background(), toolRequest(
+		"timeout-descendants", "human_exec", map[string]any{
+			"command": "sleep 30 & wait", "cwd": "/workspace", "timeout_ms": 100,
+		},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.IsError || response.ErrorCode != "command_failed" {
+		t.Fatalf("timeout response = %+v", response)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("command timeout retained a descendant pipe for %s", elapsed)
 	}
 }

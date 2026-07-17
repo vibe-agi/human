@@ -20,8 +20,10 @@ import (
 	"github.com/vibe-agi/human/internal/auth"
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/completion/adapter"
+	"github.com/vibe-agi/human/internal/completion/canonical"
 	"github.com/vibe-agi/human/internal/completion/dialect"
 	"github.com/vibe-agi/human/internal/completion/dialect/openai"
+	"github.com/vibe-agi/human/internal/completion/dialect/responses"
 	"github.com/vibe-agi/human/internal/completion/hub"
 	"github.com/vibe-agi/human/internal/ratelimit"
 	storeapi "github.com/vibe-agi/human/internal/store"
@@ -30,7 +32,11 @@ import (
 
 type fixedAuthenticator struct{}
 
-func (fixedAuthenticator) Authenticate(_ context.Context, secret string) (auth.Principal, error) {
+func (fixedAuthenticator) AuthenticateRequest(request *http.Request) (auth.Principal, error) {
+	secret := strings.TrimSpace(strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer "))
+	if secret == "" {
+		secret = strings.TrimSpace(request.Header.Get("X-Api-Key"))
+	}
 	if secret != "hae_test" {
 		return auth.Principal{}, auth.ErrUnauthorized
 	}
@@ -44,6 +50,7 @@ type gatewayFixture struct {
 	gateway  *Server
 	server   *httptest.Server
 	registry *adapter.Registry
+	cancel   context.CancelFunc
 }
 
 func newGatewayFixture(t *testing.T, withWorker bool) *gatewayFixture {
@@ -51,6 +58,15 @@ func newGatewayFixture(t *testing.T, withWorker bool) *gatewayFixture {
 }
 
 func newGatewayFixtureWithConfig(t *testing.T, withWorker bool, config Config) *gatewayFixture {
+	return newGatewayFixtureWithAuthenticator(t, withWorker, config, fixedAuthenticator{})
+}
+
+func newGatewayFixtureWithAuthenticator(
+	t *testing.T,
+	withWorker bool,
+	config Config,
+	authenticator auth.Authenticator,
+) *gatewayFixture {
 	t.Helper()
 	ctx := context.Background()
 	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "gateway.db"))
@@ -65,15 +81,21 @@ func newGatewayFixtureWithConfig(t *testing.T, withWorker bool, config Config) *
 	if config.MaxPending == 0 {
 		config.MaxPending = time.Second
 	}
-	server, err := NewServer(config, db, fixedAuthenticator{}, workerHub, registry, map[string]dialect.Codec{
+	server, err := NewServer(config, db, authenticator, workerHub, registry, map[string]dialect.Codec{
 		"/v1/chat/completions": openai.New(),
+		"/v1/responses":        responses.New(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	runContext, cancel := context.WithCancel(context.Background())
+	if err := server.Recover(runContext); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
 	fixture := &gatewayFixture{
 		db: db, hub: workerHub, registry: registry,
-		gateway: server, server: httptest.NewServer(server),
+		gateway: server, server: httptest.NewServer(server), cancel: cancel,
 	}
 	if withWorker {
 		fixture.worker, err = workerHub.Register("worker-1")
@@ -83,9 +105,11 @@ func newGatewayFixtureWithConfig(t *testing.T, withWorker bool, config Config) *
 	}
 	t.Cleanup(func() {
 		fixture.server.Close()
+		fixture.cancel()
 		if fixture.worker != nil {
 			fixture.worker.Close()
 		}
+		fixture.gateway.Wait()
 		_ = db.Close()
 	})
 	return fixture
@@ -147,11 +171,12 @@ func (store *cancelAfterResponseDecisionStore) BeginResponse(
 
 type transientResponseListStore struct {
 	storeapi.CompletionStore
-	mu       sync.Mutex
-	failed   bool
-	allow    <-chan struct{}
-	failure  chan struct{}
-	listCall int
+	mu           sync.Mutex
+	failed       bool
+	allow        <-chan struct{}
+	failure      chan struct{}
+	listCall     int
+	readSnapshot bool
 }
 
 func (store *transientResponseListStore) ListResponseEvents(
@@ -159,23 +184,46 @@ func (store *transientResponseListStore) ListResponseEvents(
 	key storeapi.RequestKey,
 	after int64,
 ) ([]storeapi.ResponseEvent, error) {
+	if store.readSnapshot {
+		return store.CompletionStore.ListResponseEvents(ctx, key, after)
+	}
+	if err := store.injectFailure(ctx); err != nil {
+		return nil, err
+	}
+	return store.CompletionStore.ListResponseEvents(ctx, key, after)
+}
+
+func (store *transientResponseListStore) ReadResponse(
+	ctx context.Context,
+	key storeapi.RequestKey,
+	after int64,
+) (storeapi.ResponseRead, error) {
+	if !store.readSnapshot {
+		return store.CompletionStore.ReadResponse(ctx, key, after)
+	}
+	if err := store.injectFailure(ctx); err != nil {
+		return storeapi.ResponseRead{}, err
+	}
+	return store.CompletionStore.ReadResponse(ctx, key, after)
+}
+
+func (store *transientResponseListStore) injectFailure(ctx context.Context) error {
 	if store.allow != nil {
 		select {
 		case <-store.allow:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
 	}
 	store.mu.Lock()
+	defer store.mu.Unlock()
 	store.listCall++
 	if !store.failed {
 		store.failed = true
 		close(store.failure)
-		store.mu.Unlock()
-		return nil, errors.New("injected transient response-list failure")
+		return errors.New("injected transient response-list failure")
 	}
-	store.mu.Unlock()
-	return store.CompletionStore.ListResponseEvents(ctx, key, after)
+	return nil
 }
 
 func (store *transientResponseListStore) listCalls() int {
@@ -236,6 +284,27 @@ func setHumanShimRemoteHeaders(request *http.Request, taskID, callerID string) {
 	}
 }
 
+func TestExplicitInvalidCapabilityTierFailsClosed(t *testing.T) {
+	t.Parallel()
+	fixture := newGatewayFixture(t, false)
+	request := newChatRequest(t, fixture, chatBody("invalid tier", false), "invalid-tier-request")
+	request.Header.Set(headerCapabilityTier, "workspace-admin")
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadRequest ||
+		!strings.Contains(string(body), `workspace-admin`) {
+		t.Fatalf("invalid tier response = %d, %s", response.StatusCode, body)
+	}
+}
+
 func TestChatCompletionPersistsBeforeDispatchAndReplays(t *testing.T) {
 	t.Parallel()
 	fixture := newGatewayFixture(t, true)
@@ -243,8 +312,8 @@ func TestChatCompletionPersistsBeforeDispatchAndReplays(t *testing.T) {
 	assignmentDone := make(chan error, 1)
 	go func() {
 		assignment := <-fixture.worker.Assignments
-		if len(assignment.Request.Tools) != 0 {
-			assignmentDone <- errors.New("Chat tier exposed tools")
+		if len(assignment.Request.Tools) != 1 || assignment.Request.Tools[0].Name != "read_file" {
+			assignmentDone <- errors.New("Chat tier lost caller-declared tools")
 			return
 		}
 		task, err := fixture.db.GetTask(context.Background(), storeapi.TaskKey{
@@ -254,8 +323,8 @@ func TestChatCompletionPersistsBeforeDispatchAndReplays(t *testing.T) {
 			assignmentDone <- err
 			return
 		}
-		if task.State != completion.StateAdmitted {
-			assignmentDone <- errors.New("task was dispatched before admitted was durable")
+		if task.State != completion.StateAdmitted || task.LeaseOwner != "worker-1" {
+			assignmentDone <- errors.New("task was dispatched before admitted owner was durable")
 			return
 		}
 		if err := fixture.hub.Publish(context.Background(), assignment.CallerID, assignment.IdempotencyKey, completion.Event{
@@ -463,7 +532,8 @@ func TestPreStreamFailurePersistsExactHTTPReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	if stored.Request.Response.StatusCode != http.StatusInternalServerError ||
-		!stored.Request.ResponseComplete || stored.Task.State != completion.StateFailed ||
+		!stored.Request.ResponseComplete || stored.Task.State != completion.StateAdmitted ||
+		stored.Task.RetryRequestDigest != digest ||
 		!bytes.Equal(stored.Request.Response.Body, firstBody) {
 		t.Fatalf("durable pre-stream response = %+v, task = %+v", stored.Request, stored.Task)
 	}
@@ -497,6 +567,98 @@ func TestPreStreamFailurePersistsExactHTTPReplay(t *testing.T) {
 	}
 	if conflict.StatusCode != http.StatusConflict || !bytes.Contains(conflictBody, []byte("idempotency_conflict")) {
 		t.Fatalf("failed-response conflict = %d, %q", conflict.StatusCode, conflictBody)
+	}
+}
+
+func TestPreStreamFailureRetriesExactRequestWithNewKeyOnSameTask(t *testing.T) {
+	fixture := newGatewayFixture(t, true)
+	if err := fixture.registry.Register(adapter.Profile{
+		HarnessID: "known", HarnessVersion: "1", Read: &adapter.Tool{Name: "read_file"}, ErrorShape: "is_error",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := chatBody("retry the same durable turn", false)
+	firstRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	firstRequest.Header.Set("Authorization", "Bearer hae_test")
+	firstRequest.Header.Set(headerIdempotencyKey, "pre-stream-original")
+	setRemoteHeaders(firstRequest, "task-pre-stream-retry")
+	first := &nonFlushingRecorder{}
+	fixture.gateway.ServeHTTP(first, firstRequest)
+	firstBody := bytes.Clone(first.body.Bytes())
+	if first.status != http.StatusInternalServerError {
+		t.Fatalf("first pre-stream response = %d, %q", first.status, firstBody)
+	}
+
+	different := newChatRequest(t, fixture, chatBody("changed retry", false), "pre-stream-different")
+	setRemoteHeaders(different, "task-pre-stream-retry")
+	differentResponse, err := http.DefaultClient.Do(different)
+	if err != nil {
+		t.Fatal(err)
+	}
+	differentBody, readErr := io.ReadAll(differentResponse.Body)
+	differentResponse.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if differentResponse.StatusCode != http.StatusConflict ||
+		!bytes.Contains(differentBody, []byte("task_reconciliation_conflict")) {
+		t.Fatalf("changed retry = %d, %q", differentResponse.StatusCode, differentBody)
+	}
+
+	workerDone := make(chan error, 1)
+	go func() {
+		assignment := <-fixture.worker.Assignments
+		if assignment.TaskID != "task-pre-stream-retry" || assignment.IdempotencyKey != "pre-stream-retry" {
+			workerDone <- fmt.Errorf("retry assignment = %+v", assignment)
+			return
+		}
+		if err := fixture.hub.Publish(context.Background(), assignment.CallerID, assignment.IdempotencyKey, completion.Event{
+			Type: completion.EventAccepted, WorkerID: fixture.worker.ID,
+		}); err != nil {
+			workerDone <- err
+			return
+		}
+		workerDone <- fixture.hub.Publish(context.Background(), assignment.CallerID, assignment.IdempotencyKey, completion.Event{
+			Type: completion.EventFinal, Text: "retry succeeded",
+		})
+	}()
+	retry := newChatRequest(t, fixture, body, "pre-stream-retry")
+	setRemoteHeaders(retry, "task-pre-stream-retry")
+	retryResponse, err := http.DefaultClient.Do(retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryBody, readErr := io.ReadAll(retryResponse.Body)
+	retryResponse.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if err := <-workerDone; err != nil {
+		t.Fatal(err)
+	}
+	if retryResponse.StatusCode != http.StatusOK || !bytes.Contains(retryBody, []byte("retry succeeded")) {
+		t.Fatalf("exact retry = %d, %q", retryResponse.StatusCode, retryBody)
+	}
+	task, err := fixture.db.GetTask(context.Background(), storeapi.TaskKey{
+		CallerID: "caller-1", TaskID: "task-pre-stream-retry",
+	})
+	if err != nil || task.State != completion.StateCompleted || task.RetryRequestDigest != "" {
+		t.Fatalf("task after successful retry = %+v, %v", task, err)
+	}
+
+	original := newChatRequest(t, fixture, body, "pre-stream-original")
+	setRemoteHeaders(original, "task-pre-stream-retry")
+	originalReplay, err := http.DefaultClient.Do(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalBody, readErr := io.ReadAll(originalReplay.Body)
+	originalReplay.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if originalReplay.StatusCode != first.status || !bytes.Equal(originalBody, firstBody) {
+		t.Fatalf("old key replay = %d, %q; want %d, %q", originalReplay.StatusCode, originalBody, first.status, firstBody)
 	}
 }
 
@@ -606,6 +768,7 @@ func TestTransientPostFlushListFailureDoesNotCancelDispatchAndOnlineReplayComple
 		CompletionStore: database,
 		allow:           allowResponseList,
 		failure:         make(chan struct{}),
+		readSnapshot:    true,
 	}
 	gateway, err := NewServer(Config{
 		HeartbeatInterval: time.Hour, MaxPending: time.Second,
@@ -755,6 +918,7 @@ func TestOnlineReplayRetriesTransientInitialListWithoutEmpty200(t *testing.T) {
 	transientStore := &transientResponseListStore{
 		CompletionStore: database,
 		failure:         make(chan struct{}),
+		readSnapshot:    true,
 	}
 	replayServer := newServer(transientStore)
 	retryRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
@@ -963,29 +1127,143 @@ func TestAdmissionRateLimitRunsAfterIdempotencyReplay(t *testing.T) {
 	}
 }
 
-func TestUnknownHarnessDowngradesToChat(t *testing.T) {
+func TestUnknownHarnessDowngradesToChatWithFreshTaskPerCompletion(t *testing.T) {
+	t.Parallel()
+	fixture := newGatewayFixture(t, true)
+	done := make(chan error, 1)
+	go func() {
+		seenTasks := make(map[string]struct{}, 2)
+		for index, wantRequest := range []string{"request-remote-1", "request-remote-2"} {
+			assignment := <-fixture.worker.Assignments
+			if assignment.CapabilityTier != completion.TierChat || assignment.WorkspaceKey != "" || assignment.Adapter != nil {
+				done <- errors.New("unknown harness retained adapter-gated capability")
+				return
+			}
+			if assignment.TaskID == "task" || assignment.IdempotencyKey != wantRequest {
+				done <- fmt.Errorf("downgraded assignment %d retained identity: %+v", index, assignment)
+				return
+			}
+			if _, duplicate := seenTasks[assignment.TaskID]; duplicate {
+				done <- fmt.Errorf("downgraded completions reused task %q", assignment.TaskID)
+				return
+			}
+			seenTasks[assignment.TaskID] = struct{}{}
+			if len(assignment.Request.Tools) != 1 || assignment.Request.Tools[0].Name != "read_file" {
+				done <- errors.New("Chat downgrade lost caller-declared tools")
+				return
+			}
+			if err := fixture.hub.Publish(context.Background(), assignment.CallerID, assignment.IdempotencyKey, completion.Event{
+				Type: completion.EventRejected, ErrorCode: "rejected", Error: "no",
+			}); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	var responseTaskIDs []string
+	for index, key := range []string{"request-remote-1", "request-remote-2"} {
+		request := newChatRequest(t, fixture, chatBody(fmt.Sprintf("hello-%d", index), true), key)
+		request.Header.Set(headerCapabilityTier, string(completion.TierRemoteTools))
+		request.Header.Set(headerWorkspaceKey, "workspace")
+		request.Header.Set(headerTaskID, "task")
+		request.Header.Set(headerHarnessID, "unknown")
+		request.Header.Set(headerHarnessVersion, "1")
+		request.Header.Set(headerWorkspaceRoot, "/repo")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK || response.Header.Get(headerIdempotencyKey) != key {
+			t.Fatalf("downgraded response %d = status %d, idempotency %q", index, response.StatusCode, response.Header.Get(headerIdempotencyKey))
+		}
+		responseTaskIDs = append(responseTaskIDs, response.Header.Get(headerTaskID))
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if responseTaskIDs[0] == "" || responseTaskIDs[0] == "task" || responseTaskIDs[0] == responseTaskIDs[1] {
+		t.Fatalf("downgraded response task ids = %q", responseTaskIDs)
+	}
+	if _, err := fixture.db.GetTask(context.Background(), storeapi.TaskKey{
+		CallerID: "caller-1", TaskID: "task",
+	}); !errors.Is(err, storeapi.ErrNotFound) {
+		t.Fatalf("untrusted enhanced task id crossed Basic admission: %v", err)
+	}
+}
+
+func TestChatClarificationCompletesIndependentTask(t *testing.T) {
 	t.Parallel()
 	fixture := newGatewayFixture(t, true)
 	done := make(chan error, 1)
 	go func() {
 		assignment := <-fixture.worker.Assignments
-		if len(assignment.Request.Tools) != 0 || assignment.WorkspaceKey != "" {
-			done <- errors.New("unknown harness retained tool capability")
-			return
-		}
-		if err := fixture.hub.Publish(context.Background(), assignment.CallerID, assignment.IdempotencyKey, completion.Event{Type: completion.EventRejected, ErrorCode: "rejected", Error: "no"}); err != nil {
+		if err := fixture.hub.Publish(context.Background(), assignment.CallerID, assignment.IdempotencyKey, completion.Event{
+			Type: completion.EventAccepted, WorkerID: "worker-1",
+		}); err != nil {
 			done <- err
 			return
 		}
-		done <- nil
+		done <- fixture.hub.Publish(context.Background(), assignment.CallerID, assignment.IdempotencyKey, completion.Event{
+			Type: completion.EventClarification, Text: "Which file should I inspect?",
+		})
 	}()
-	request := newChatRequest(t, fixture, chatBody("hello", true), "request-remote")
-	request.Header.Set(headerCapabilityTier, string(completion.TierRemoteTools))
-	request.Header.Set(headerWorkspaceKey, "workspace")
-	request.Header.Set(headerTaskID, "task")
-	request.Header.Set(headerHarnessID, "unknown")
-	request.Header.Set(headerHarnessVersion, "1")
-	request.Header.Set(headerWorkspaceRoot, "/repo")
+
+	response, err := http.DefaultClient.Do(newChatRequest(
+		t, fixture, chatBody("inspect it", false), "request-chat-clarification",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `"finish_reason":"stop"`) ||
+		!strings.Contains(string(body), "Which file should I inspect?") {
+		t.Fatalf("Chat clarification response = %d, %s", response.StatusCode, body)
+	}
+	task, err := fixture.db.GetTask(context.Background(), storeapi.TaskKey{
+		CallerID: "caller-1", TaskID: response.Header.Get(headerTaskID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != completion.StateCompleted {
+		t.Fatalf("Chat clarification task state = %q, want %q", task.State, completion.StateCompleted)
+	}
+}
+
+func TestRemoteToolsClarificationStillAwaitsCaller(t *testing.T) {
+	t.Parallel()
+	fixture := newGatewayFixture(t, true)
+	if err := fixture.registry.Register(adapter.Profile{
+		HarnessID: "known", HarnessVersion: "1", Read: &adapter.Tool{Name: "read_file"}, ErrorShape: "is_error",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		assignment := <-fixture.worker.Assignments
+		if err := fixture.hub.Publish(context.Background(), assignment.CallerID, assignment.IdempotencyKey, completion.Event{
+			Type: completion.EventAccepted, WorkerID: "worker-1",
+		}); err != nil {
+			done <- err
+			return
+		}
+		done <- fixture.hub.Publish(context.Background(), assignment.CallerID, assignment.IdempotencyKey, completion.Event{
+			Type: completion.EventClarification, Text: "Which file should I inspect?",
+		})
+	}()
+
+	request := newChatRequest(t, fixture, chatBody("inspect it", true), "request-remote-clarification")
+	setRemoteHeaders(request, "task-remote-clarification")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -994,6 +1272,343 @@ func TestUnknownHarnessDowngradesToChat(t *testing.T) {
 	response.Body.Close()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+	task, err := fixture.db.GetTask(context.Background(), storeapi.TaskKey{
+		CallerID: "caller-1", TaskID: "task-remote-clarification",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != completion.StateAwaitingCaller {
+		t.Fatalf("Remote-tools clarification task state = %q, want %q", task.State, completion.StateAwaitingCaller)
+	}
+}
+
+func TestChatTierDispatchesOnlyCallerDeclaredToolCalls(t *testing.T) {
+	t.Parallel()
+	fixture := newGatewayFixture(t, true)
+	done := make(chan error, 1)
+	go func() {
+		assignment := <-fixture.worker.Assignments
+		if assignment.CapabilityTier != completion.TierChat || assignment.Adapter != nil {
+			done <- errors.New("Chat task unexpectedly required an adapter")
+			return
+		}
+		if len(assignment.Request.Tools) != 1 || assignment.Request.Tools[0].Name != "read_file" {
+			done <- errors.New("Chat assignment lost caller-declared tool")
+			return
+		}
+		if err := fixture.hub.Publish(context.Background(), assignment.CallerID, assignment.IdempotencyKey, completion.Event{
+			Type: completion.EventAccepted, WorkerID: "worker-1",
+		}); err != nil {
+			done <- err
+			return
+		}
+		done <- fixture.hub.Publish(context.Background(), assignment.CallerID, assignment.IdempotencyKey, completion.Event{
+			Type: completion.EventToolCalls,
+			ToolCalls: []completion.ToolCall{{
+				ID: "read-1", Name: "read_file", Input: map[string]any{"path": "README.md"},
+			}},
+		})
+	}()
+
+	response, err := http.DefaultClient.Do(newChatRequest(t, fixture, chatBody("inspect", true), "request-chat-tool"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `"finish_reason":"tool_calls"`) ||
+		!strings.Contains(string(body), `"name":"read_file"`) {
+		t.Fatalf("Chat tool-call response = %d, %s", response.StatusCode, body)
+	}
+	taskID := response.Header.Get(headerTaskID)
+	task, err := fixture.db.GetTask(context.Background(), storeapi.TaskKey{CallerID: "caller-1", TaskID: taskID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != completion.StateCompleted {
+		t.Fatalf("Chat tool-call task state = %q, want %q", task.State, completion.StateCompleted)
+	}
+	call := completion.ToolCall{ID: "read-1", Name: "read_file", Input: map[string]any{"path": "README.md"}}
+	digest, err := toolCallDigest(call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := fixture.db.BeginToolExecution(context.Background(), storeapi.ToolExecutionKey{
+		CallerID: "caller-1", TaskID: taskID, ToolCallID: call.ID,
+	}, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.Replay {
+		t.Fatal("Chat tool-call response created a caller-shim execution ledger")
+	}
+}
+
+func TestChatTierToolCallValidation(t *testing.T) {
+	t.Parallel()
+	server := &Server{adapters: adapter.NewRegistry()}
+	task := storeapi.Task{CapabilityTier: completion.TierChat}
+	request := canonical.Request{Tools: []canonical.Tool{{Name: "read_file"}}}
+	tests := []struct {
+		name  string
+		calls []completion.ToolCall
+	}{
+		{name: "empty"},
+		{name: "missing id", calls: []completion.ToolCall{{Name: "read_file"}}},
+		{name: "missing name", calls: []completion.ToolCall{{ID: "read-1"}}},
+		{name: "duplicate id", calls: []completion.ToolCall{{ID: "read-1", Name: "read_file"}, {ID: "read-1", Name: "read_file"}}},
+		{name: "undeclared", calls: []completion.ToolCall{{ID: "write-1", Name: "write_file"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := server.validateToolCalls(task, request, test.calls); err == nil {
+				t.Fatal("invalid Chat tool calls were accepted")
+			}
+		})
+	}
+	if err := server.validateToolCalls(task, request, []completion.ToolCall{{ID: "read-1", Name: "read_file"}}); err != nil {
+		t.Fatalf("declared Chat tool call rejected: %v", err)
+	}
+}
+
+func TestToolCallValidationUsesNamespacePairAndSerialPolicy(t *testing.T) {
+	t.Parallel()
+	server := &Server{adapters: adapter.NewRegistry()}
+	task := storeapi.Task{CapabilityTier: completion.TierChat}
+	request := canonical.Request{
+		ToolCallPolicy: canonical.ToolCallsSerial,
+		Tools: []canonical.Tool{
+			{Name: "read"},
+			{Namespace: "workspace", Name: "read"},
+		},
+	}
+	if err := server.validateToolCalls(task, request, []completion.ToolCall{{
+		ID: "read-ns", Namespace: "workspace", Name: "read",
+	}}); err != nil {
+		t.Fatalf("declared namespace/name pair rejected: %v", err)
+	}
+	for _, call := range []completion.ToolCall{
+		{ID: "wrong-namespace", Namespace: "other", Name: "read"},
+		{ID: "wrong-name", Namespace: "workspace", Name: "write"},
+		{ID: "ambiguous", Namespace: "workspace::other", Name: "read"},
+		{ID: "whitespace", Namespace: "workspace", Name: " read"},
+	} {
+		if err := server.validateToolCalls(task, request, []completion.ToolCall{call}); err == nil {
+			t.Fatalf("invalid tool identity accepted: %+v", call)
+		}
+	}
+	if err := server.validateToolCalls(task, request, []completion.ToolCall{
+		{ID: "read-plain", Name: "read"},
+		{ID: "read-ns", Namespace: "workspace", Name: "read"},
+	}); err == nil || !strings.Contains(err.Error(), "serial") {
+		t.Fatalf("serial multi-call result = %v", err)
+	}
+}
+
+func TestInvalidWorkerEventIsRejectedWithoutPoisoningLiveSession(t *testing.T) {
+	t.Parallel()
+	fixture := newGatewayFixture(t, true)
+	workerDone := make(chan error, 1)
+	go func() {
+		assignment := <-fixture.worker.Assignments
+		if err := fixture.hub.Publish(
+			context.Background(), assignment.CallerID, assignment.IdempotencyKey,
+			completion.Event{ID: "accept-valid-after-bad", Type: completion.EventAccepted},
+		); err != nil {
+			workerDone <- err
+			return
+		}
+		badErr := fixture.hub.Publish(
+			context.Background(), assignment.CallerID, assignment.IdempotencyKey,
+			completion.Event{
+				ID: "undeclared-tool", Type: completion.EventToolCalls,
+				ToolCalls: []completion.ToolCall{{ID: "bad-call", Name: "not_declared"}},
+			},
+		)
+		if !errors.Is(badErr, hub.ErrEventRejected) {
+			workerDone <- fmt.Errorf("invalid event result = %v", badErr)
+			return
+		}
+		workerDone <- fixture.hub.Publish(
+			context.Background(), assignment.CallerID, assignment.IdempotencyKey,
+			completion.Event{ID: "final-after-bad", Type: completion.EventFinal, Text: "still healthy"},
+		)
+	}()
+
+	response, err := http.DefaultClient.Do(newChatRequest(
+		t, fixture, chatBody("reject one worker event", false), "request-reject-one-event",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-workerDone; err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "still healthy") {
+		t.Fatalf("response after rejected event = %d, %s", response.StatusCode, body)
+	}
+}
+
+func TestTaskWideToolCallIDReuseIsRejectedBeforeDurableStep(t *testing.T) {
+	tests := []struct {
+		name            string
+		input           map[string]any
+		wantErrorDetail string
+	}{
+		{
+			name:            "same input is a duplicate business call",
+			input:           map[string]any{"path": "README.md"},
+			wantErrorDetail: "already dispatched for this task",
+		},
+		{
+			name:            "different input conflicts with stable identity",
+			input:           map[string]any{"path": "go.mod"},
+			wantErrorDetail: "reused with different input",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGatewayFixture(t, true)
+			if err := fixture.registry.Register(adapter.Profile{
+				HarnessID: "known", HarnessVersion: "1",
+				Read: &adapter.Tool{Name: "read_file"}, ErrorShape: "is_error",
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			workerDone := make(chan error, 1)
+			go func() {
+				assignment := <-fixture.worker.Assignments
+				if err := fixture.hub.Publish(
+					context.Background(), assignment.CallerID, assignment.IdempotencyKey,
+					completion.Event{ID: "accept-before-reuse", Type: completion.EventAccepted},
+				); err != nil {
+					workerDone <- err
+					return
+				}
+
+				original := completion.ToolCall{
+					ID: "task-wide-call-id", Name: "read_file",
+					Input: map[string]any{"path": "README.md"},
+				}
+				digest, err := toolCallDigest(original)
+				if err != nil {
+					workerDone <- err
+					return
+				}
+				if _, err := fixture.db.BeginToolExecution(context.Background(), storeapi.ToolExecutionKey{
+					CallerID: assignment.CallerID, TaskID: assignment.TaskID, ToolCallID: original.ID,
+				}, digest); err != nil {
+					workerDone <- err
+					return
+				}
+
+				reuseErr := fixture.hub.Publish(
+					context.Background(), assignment.CallerID, assignment.IdempotencyKey,
+					completion.Event{
+						ID: "new-event-reusing-tool-id", Type: completion.EventToolCalls,
+						ToolCalls: []completion.ToolCall{{
+							ID: original.ID, Name: original.Name, Input: test.input,
+						}},
+					},
+				)
+				if !errors.Is(reuseErr, hub.ErrEventRejected) ||
+					!strings.Contains(reuseErr.Error(), test.wantErrorDetail) {
+					workerDone <- fmt.Errorf("reused tool-call event result = %v", reuseErr)
+					return
+				}
+				stages, err := fixture.db.ListWorkerEventStages(
+					context.Background(), storeapi.RequestKey{
+						CallerID: assignment.CallerID, IdempotencyKey: assignment.IdempotencyKey,
+					}, "new-event-reusing-tool-id",
+				)
+				if err != nil || len(stages) != 0 {
+					workerDone <- fmt.Errorf("rejected event durable stages = %+v, %v", stages, err)
+					return
+				}
+
+				workerDone <- fixture.hub.Publish(
+					context.Background(), assignment.CallerID, assignment.IdempotencyKey,
+					completion.Event{
+						ID: "final-after-tool-id-reuse", Type: completion.EventFinal,
+						Text: "worker connection remains healthy",
+					},
+				)
+			}()
+
+			request := newChatRequest(
+				t, fixture, chatBody("reject reused task tool id", true), "request-tool-id-reuse",
+			)
+			setRemoteHeaders(request, "task-tool-id-reuse")
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(response.Body)
+			response.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := <-workerDone; err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusOK ||
+				!bytes.Contains(body, []byte("worker connection remains healthy")) {
+				t.Fatalf("response after rejected tool id reuse = %d, %s", response.StatusCode, body)
+			}
+		})
+	}
+}
+
+func TestWorkspaceTierGatesPrivilegedAndUnclassifiedCallerTools(t *testing.T) {
+	t.Parallel()
+	registry := adapter.NewRegistry()
+	if err := registry.Register(adapter.OpenCode11718Profile()); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{adapters: registry}
+	task := storeapi.Task{
+		CapabilityTier: completion.TierWorkspace,
+		HarnessID:      adapter.OpenCodeID, HarnessVersion: adapter.OpenCodeVersion,
+	}
+	request := canonical.Request{Tools: []canonical.Tool{
+		{Name: "todowrite"}, {Name: "edit"}, {Name: "custom_mcp_tool"},
+		{Name: "task"}, {Name: "webfetch"}, {Name: "bash"},
+	}}
+	if err := server.validateToolCalls(task, request, []completion.ToolCall{
+		{ID: "tasks-1", Name: "todowrite"},
+		{ID: "edit-1", Name: "edit"},
+	}); err != nil {
+		t.Fatalf("classified standard Workspace tools rejected: %v", err)
+	}
+	for _, toolName := range []string{"bash", "task", "webfetch", "custom_mcp_tool"} {
+		err := server.validateToolCalls(task, request, []completion.ToolCall{{
+			ID: toolName + "-1", Name: toolName,
+		}})
+		if err == nil || !strings.Contains(err.Error(), "explicit authorization") {
+			t.Fatalf("%s without privileged-tool opt-in = %v", toolName, err)
+		}
+	}
+	task.ExecAllowed = true
+	for _, toolName := range []string{"bash", "task", "webfetch", "custom_mcp_tool"} {
+		if err := server.validateToolCalls(task, request, []completion.ToolCall{{
+			ID: toolName + "-1", Name: toolName,
+		}}); err != nil {
+			t.Fatalf("%s with privileged-tool opt-in rejected: %v", toolName, err)
+		}
 	}
 }
 
@@ -1141,7 +1756,24 @@ func TestKnownRemoteHarnessPreservesDeclaredTools(t *testing.T) {
 
 func TestRemoteToolResultReconcilesAndReturnsToStickyWorker(t *testing.T) {
 	t.Parallel()
-	fixture := newGatewayFixture(t, true)
+	var routeMu sync.Mutex
+	routeCalls := 0
+	fixture := newGatewayFixtureWithConfig(t, true, Config{
+		WorkerRouter: workerRouterFunc(func(context.Context, WorkerRouteRequest) (string, error) {
+			routeMu.Lock()
+			defer routeMu.Unlock()
+			routeCalls++
+			if routeCalls == 1 {
+				return "worker-1", nil
+			}
+			return "worker-2", nil
+		}),
+	})
+	otherWorker, err := fixture.hub.Register("worker-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherWorker.Close()
 	if err := fixture.registry.Register(adapter.Profile{
 		HarnessID: "known", HarnessVersion: "1", Read: &adapter.Tool{Name: "read_file"}, ErrorShape: "is_error",
 	}); err != nil {
@@ -1179,6 +1811,11 @@ func TestRemoteToolResultReconcilesAndReturnsToStickyWorker(t *testing.T) {
 	}
 	if err := <-firstDone; err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case leaked := <-otherWorker.Assignments:
+		t.Fatalf("initial task ignored routed owner: %+v", leaked)
+	case <-time.After(20 * time.Millisecond):
 	}
 	if firstResponse.StatusCode != http.StatusOK || !strings.Contains(string(firstBody), `"finish_reason":"tool_calls"`) {
 		t.Fatalf("first response = %d, %s", firstResponse.StatusCode, firstBody)
@@ -1234,12 +1871,22 @@ func TestRemoteToolResultReconcilesAndReturnsToStickyWorker(t *testing.T) {
 	if err := <-secondDone; err != nil {
 		t.Fatal(err)
 	}
+	select {
+	case leaked := <-otherWorker.Assignments:
+		t.Fatalf("continuation was rerouted instead of retaining task owner: %+v", leaked)
+	case <-time.After(20 * time.Millisecond):
+	}
 	if secondResponse.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), `"content":"README inspected"`) {
 		t.Fatalf("second response = %d, %s", secondResponse.StatusCode, responseBody)
 	}
 	task, err = fixture.db.GetTask(context.Background(), taskKey)
 	if err != nil || task.State != completion.StateCompleted || task.LeaseOwner != "worker-1" {
 		t.Fatalf("completed task = %+v, %v", task, err)
+	}
+	routeMu.Lock()
+	defer routeMu.Unlock()
+	if routeCalls != 1 {
+		t.Fatalf("worker router calls = %d, want only initial task", routeCalls)
 	}
 }
 
@@ -1279,15 +1926,33 @@ func TestAuditPayloadRequiresExplicitOptInAndHasTTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	responsePayload, err := fixture.db.GetAuditPayload(context.Background(), auditID, "response")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Worker ACK follows correctness persistence, while optional audit payload
+	// assembly finishes immediately afterward in the session consumer. Wait for
+	// that explicitly instead of racing test cleanup against the audit write.
+	responsePayload := waitForAuditPayload(t, fixture.db, auditID, "response")
 	if !bytes.Equal(requestPayload.Data, body) || !strings.Contains(string(responsePayload.Data), "audited response") {
 		t.Fatalf("request = %s, response = %s", requestPayload.Data, responsePayload.Data)
 	}
 	if ttl := requestPayload.ExpiresAt.Sub(requestPayload.CreatedAt); ttl < 59*time.Minute || ttl > 61*time.Minute {
 		t.Fatalf("request payload TTL = %s", ttl)
+	}
+}
+
+func waitForAuditPayload(t *testing.T, database storeapi.AuditStore, auditID, kind string) storeapi.AuditPayload {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		payload, err := database.GetAuditPayload(context.Background(), auditID, kind)
+		if err == nil {
+			return payload
+		}
+		if !errors.Is(err, storeapi.ErrNotFound) {
+			t.Fatalf("get %s audit payload: %v", kind, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s audit payload was not stored before deadline", kind)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

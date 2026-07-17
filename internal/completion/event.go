@@ -20,9 +20,14 @@ const (
 )
 
 type ToolCall struct {
-	ID    string         `json:"id"`
-	Name  string         `json:"name"`
-	Input map[string]any `json:"input"`
+	ID        string         `json:"id"`
+	Namespace string         `json:"namespace,omitempty"`
+	Name      string         `json:"name"`
+	Input     map[string]any `json:"input"`
+}
+
+func (call ToolCall) QualifiedName() string {
+	return canonical.QualifiedToolName(call.Namespace, call.Name)
 }
 
 type Event struct {
@@ -46,18 +51,19 @@ func (event Event) EndsResponse() bool {
 }
 
 type Assignment struct {
-	CallerID       string            `json:"caller_id"`
-	WorkspaceKey   string            `json:"workspace_key,omitempty"`
-	TaskID         string            `json:"task_id"`
-	IdempotencyKey string            `json:"idempotency_key"`
-	LeaseOwner     string            `json:"lease_owner"`
-	CapabilityTier CapabilityTier    `json:"capability_tier"`
-	HarnessID      string            `json:"harness_id,omitempty"`
-	HarnessVersion string            `json:"harness_version,omitempty"`
-	Root           string            `json:"root,omitempty"`
-	ExecAllowed    bool              `json:"exec_allowed,omitempty"`
-	Adapter        *adapter.Profile  `json:"adapter,omitempty"`
-	Request        canonical.Request `json:"request"`
+	CallerID         string            `json:"caller_id"`
+	WorkspaceKey     string            `json:"workspace_key,omitempty"`
+	TaskID           string            `json:"task_id"`
+	IdempotencyKey   string            `json:"idempotency_key"`
+	LeaseOwner       string            `json:"lease_owner"`
+	CapabilityTier   CapabilityTier    `json:"capability_tier"`
+	HarnessID        string            `json:"harness_id,omitempty"`
+	HarnessVersion   string            `json:"harness_version,omitempty"`
+	HarnessSessionID string            `json:"harness_session_id,omitempty"`
+	Root             string            `json:"root,omitempty"`
+	ExecAllowed      bool              `json:"exec_allowed,omitempty"`
+	Adapter          *adapter.Profile  `json:"adapter,omitempty"`
+	Request          canonical.Request `json:"request"`
 }
 
 func (assignment Assignment) SessionKey() string {

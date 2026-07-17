@@ -38,7 +38,7 @@ func TestGoldenResponsesToolsCanonicalAndStreamContract(t *testing.T) {
 
 	stream := codec.NewStream("responses_fixture_01", request.Model)
 	start, err := stream.Start()
-	if err != nil || len(start) != 1 {
+	if err != nil || len(start) != 2 {
 		t.Fatalf("start = %q, %v", start, err)
 	}
 	created := assertEvent(t, start[0], "response.created", 0)
@@ -46,6 +46,7 @@ func TestGoldenResponsesToolsCanonicalAndStreamContract(t *testing.T) {
 	if createdResponse["id"] != "responses_fixture_01" || createdResponse["model"] != request.Model {
 		t.Fatalf("created response identity = %#v", createdResponse)
 	}
+	assertEvent(t, start[1], "response.in_progress", 1)
 
 	frames, done, err := stream.Encode(completion.Event{
 		Type: completion.EventToolCalls,
@@ -53,10 +54,15 @@ func TestGoldenResponsesToolsCanonicalAndStreamContract(t *testing.T) {
 			ID: call.ToolCallID, Name: call.ToolName, Input: call.Input,
 		}},
 	})
-	if err != nil || !done || len(frames) != 2 {
+	if err != nil || !done || len(frames) != 5 {
 		t.Fatalf("tool stream = %q, %v, %v", frames, done, err)
 	}
-	encodedCall := assertEvent(t, frames[0], "response.function_call_arguments.done", 1)
+	added := assertEvent(t, frames[0], "response.output_item.added", 2)
+	if item := fixtureMap(t, added["item"]); item["status"] != "in_progress" || item["arguments"] != "" {
+		t.Fatalf("added tool = %#v", item)
+	}
+	delta := assertEvent(t, frames[1], "response.function_call_arguments.delta", 3)
+	encodedCall := assertEvent(t, frames[2], "response.function_call_arguments.done", 4)
 	if encodedCall["item_id"] != "fc_"+call.ToolCallID || encodedCall["name"] != call.ToolName {
 		t.Fatalf("encoded tool identity = %#v", encodedCall)
 	}
@@ -69,7 +75,14 @@ func TestGoldenResponsesToolsCanonicalAndStreamContract(t *testing.T) {
 		!reflect.DeepEqual(arguments, call.Input) {
 		t.Fatalf("encoded tool arguments = %#v, %v", arguments, err)
 	}
-	completed := assertEvent(t, frames[1], "response.completed", 2)
+	if delta["delta"] != encodedArguments {
+		t.Fatalf("tool argument delta = %#v, want %q", delta, encodedArguments)
+	}
+	doneItem := assertEvent(t, frames[3], "response.output_item.done", 5)
+	if item := fixtureMap(t, doneItem["item"]); item["status"] != "completed" || item["arguments"] != encodedArguments {
+		t.Fatalf("done tool = %#v", item)
+	}
+	completed := assertEvent(t, frames[4], "response.completed", 6)
 	response := fixtureMap(t, completed["response"])
 	output := fixtureSlice(t, response["output"])
 	function := fixtureMap(t, output[0])
