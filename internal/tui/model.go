@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -65,6 +66,8 @@ type Model struct {
 	continueContext     *completion.Assignment
 	parkedContinuations []continuationState
 	pending             pendingSend
+	pendingRecoveries   []pendingSend
+	recoveredSessions   map[string]struct{}
 	rejectedDrafts      map[string]rejectedDraftState
 	rejectedDraftOrder  []string
 	handledRejections   map[string]struct{}
@@ -82,6 +85,9 @@ type Model struct {
 	connectionTerminal  string
 	ui                  workspaceUI
 	stateStore          StateStore
+	stateBound          bool
+	stateLoaded         bool
+	stateIdentity       workerclient.Identity
 	stateDrafts         map[stateRecordKey]savedStateDraft
 	stateSynced         map[stateRecordKey]string
 	stateManaged        map[stateRecordKey]struct{}
@@ -91,6 +97,7 @@ type Model struct {
 	stateLoadWarning    string
 	stateWriteWarning   string
 	outboxWarning       string
+	deferredSend        deferredSendIntent
 }
 
 type connectionState int
@@ -182,18 +189,40 @@ const (
 )
 
 type pendingSend struct {
+	kind           pendingSendKind
+	eventID        string
+	assignment     completion.Assignment
+	context        *completion.Assignment
+	reply          string
+	command        string
+	tasks          []agentTask
+	toolInput      string
+	toolCallIDs    []string
+	toolCalls      []completion.ToolCall
+	remainingDraft persistedDraft
+	selected       int
+	automatic      bool
+	event          completion.Event
+	durable        bool
+	recovered      bool
+	retryAttempt   int
+}
+
+// deferredSendIntent is an in-memory user gesture waiting for the latest
+// editor snapshot to finish committing. The editor remains untouched and
+// frozen, so execution reads the exact draft that nextStateCommand just
+// synchronized. A snapshot is also pinned to the source scope solely for the
+// cancellation path: if the request dies meanwhile, its draft remains durable.
+// The eventual response intent still follows the normal pending-send -> local
+// outbox ordering.
+type deferredSendIntent struct {
 	kind        pendingSendKind
-	eventID     string
-	assignment  completion.Assignment
-	context     *completion.Assignment
-	reply       string
-	command     string
-	tasks       []agentTask
-	toolInput   string
-	toolCallIDs []string
-	toolCalls   []completion.ToolCall
-	selected    int
-	automatic   bool
+	sessionKey  string
+	replyType   completion.EventType
+	endResponse bool
+	allowEmpty  bool
+	draftKey    stateRecordKey
+	draft       persistedDraft
 }
 
 type continuationState struct {
@@ -235,8 +264,15 @@ type rejectedDraftState struct {
 type networkMessage workerclient.Message
 type networkClosed struct{}
 type eventSent struct {
+	eventID        string
+	intentKey      stateRecordKey
+	restorePayload json.RawMessage
+	intentErr      error
+	err            error
+}
+type pendingSendRetry struct {
 	eventID string
-	err     error
+	attempt int
 }
 type rejectedEventConfirmed struct {
 	eventID string
@@ -265,6 +301,7 @@ func New(client Client, options ...Option) Model {
 		mirrorGeneration:  make(map[string]uint64),
 		mirrorReviewing:   make(map[string]uint64),
 		continueIDs:       make(map[string]struct{}),
+		recoveredSessions: make(map[string]struct{}),
 		rejectedDrafts:    make(map[string]rejectedDraftState),
 		handledRejections: make(map[string]struct{}),
 		stateDrafts:       make(map[stateRecordKey]savedStateDraft),
@@ -276,12 +313,23 @@ func New(client Client, options ...Option) Model {
 	for _, option := range options {
 		option(&model)
 	}
-	model.loadWorkerState()
+	if provider, ok := client.(interface {
+		WorkerIdentity() (workerclient.Identity, bool)
+	}); ok {
+		if identity, ready := provider.WorkerIdentity(); ready {
+			if err := model.bindAndLoadWorkerState(identity); err != nil {
+				model.stateLoadWarning = "recovery state identity failed: " + err.Error()
+			}
+		}
+	}
 	return model
 }
 
 func (model Model) Init() tea.Cmd {
 	commands := []tea.Cmd{waitForNetwork(model.client), tea.RequestBackgroundColor}
+	if model.pending.kind != pendingNone && model.pending.durable && model.pending.event.ID != "" {
+		commands = append(commands, sendPersistedEvent(model.client, model.stateStore, model.pending))
+	}
 	if model.animationActive() {
 		commands = append(commands, model.ui.spinner.Tick)
 	}
@@ -297,9 +345,20 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 		}
 		next.syncUI()
 		next.resizeUI()
+		next.cancelDeferredSendIfInactive()
 		stateCommand := next.nextStateCommand()
 		if stateCommand != nil {
 			command = tea.Batch(command, stateCommand)
+		} else if next.deferredSend.kind != pendingNone && next.workerStateSynchronized() {
+			var deferred tea.Cmd
+			next, deferred = next.executeDeferredSend()
+			command = tea.Batch(command, deferred)
+			// Executing the gesture only stages the immutable response event in
+			// memory. Start its pending-intent transaction before the outbox is
+			// allowed to observe it.
+			if intent := next.nextStateCommand(); intent != nil {
+				command = tea.Batch(command, intent)
+			}
 		}
 		if !wasAnimating && next.animationActive() {
 			command = tea.Batch(command, next.ui.spinner.Tick)
@@ -327,6 +386,14 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 	case stateRetryReady:
 		model.stateRetryPending = false
 		return model, nil
+	case pendingSendRetry:
+		if model.pending.eventID != message.eventID || model.pending.kind == pendingNone ||
+			!model.pending.durable {
+			return model, nil
+		}
+		model.pending.retryAttempt = message.attempt
+		model.status = "retrying the durable local response intent…"
+		return model, sendPersistedEvent(model.client, model.stateStore, model.pending)
 	case networkClosed:
 		model.invalidateChat()
 		model.connection = connectionClosed
@@ -338,6 +405,20 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 		return model, nil
 	case networkMessage:
 		model.invalidateChat()
+		if message.IdentityReady != nil {
+			wasBound := model.stateBound
+			if err := model.bindAndLoadWorkerState(*message.IdentityReady); err != nil {
+				model.connection = connectionClosed
+				model.connectionTerminal = "worker recovery state identity failed: " + terminalSafe(err.Error())
+				model.status = model.connectionTerminal
+				return model, nil
+			}
+			commands := []tea.Cmd{waitForNetwork(model.client)}
+			if !wasBound && model.pending.kind != pendingNone && model.pending.durable && model.pending.event.ID != "" {
+				commands = append(commands, sendPersistedEvent(model.client, model.stateStore, model.pending))
+			}
+			return model, tea.Batch(commands...)
+		}
 		if message.OutboxQuarantine != nil {
 			quarantine := message.OutboxQuarantine
 			identifiers := make([]string, 0, len(quarantine.EventIDs))
@@ -529,6 +610,11 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 			if model.mirrorManager != nil && mirrorEnabled(incoming) {
 				commands = append(commands, prepareMirror(model.mirrorManager, incoming))
 			}
+			if _, recovered := model.recoveredSessions[incoming.SessionKey()]; recovered {
+				model.refreshRecoveredAssignment(incoming)
+				model.status = "replayed request is already covered by a recovered durable response event"
+				return model, tea.Batch(commands...)
+			}
 			if model.pending.kind == pendingAccept &&
 				model.pending.assignment.SessionKey() == incoming.SessionKey() {
 				model.pending.assignment = incoming
@@ -625,6 +711,10 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 		}
 		return model, nil
 	case tea.PasteMsg:
+		if model.deferredSend.kind != pendingNone {
+			model.status = "send is waiting for recovery state; input is locked · Esc cancels and keeps the draft"
+			return model, nil
+		}
 		// Paste transports commonly encode line endings as CRLF (and some
 		// terminals still send bare CR). Canonicalize those bytes before the
 		// terminal-display sanitizer: turning CR into the visible glyph ␍ would
@@ -900,6 +990,21 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 		return model, nil
 	case eventSent:
 		model.invalidateChat()
+		if message.intentKey.kind == workerStatePendingSendKind && len(message.restorePayload) > 0 {
+			model.stateManaged[message.intentKey] = struct{}{}
+			model.stateSynced[message.intentKey] = string(message.restorePayload)
+		}
+		if message.intentErr != nil && model.pending.eventID == message.eventID &&
+			model.pending.kind != pendingNone {
+			attempt := model.pending.retryAttempt + 1
+			model.pending.retryAttempt = attempt
+			model.status = "durable response intent retained; local handoff will retry: " +
+				terminalSafe(message.intentErr.Error())
+			delay := rejectionRetryDelay(attempt)
+			return model, tea.Tick(delay, func(time.Time) tea.Msg {
+				return pendingSendRetry{eventID: message.eventID, attempt: attempt}
+			})
+		}
 		if message.err != nil {
 			if errors.Is(message.err, workerclient.ErrEventRejectionPending) {
 				// The exact event is no longer sendable, but its body and rejection
@@ -933,6 +1038,7 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 			}
 		} else if model.pending.eventID != "" && model.pending.eventID == message.eventID {
 			pending := model.pending
+			model.retainPendingRemainder(pending)
 			model.pending = pendingSend{}
 			switch pending.kind {
 			case pendingAccept:
@@ -970,8 +1076,12 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 				}
 			}
 			followup := model.drainDirtyMirrorReview()
+			var recovered tea.Cmd
+			if pending.recovered {
+				recovered = model.resumePendingRecovery()
+			}
 			model.pruneMirrorCache()
-			return model, followup
+			return model, tea.Batch(followup, recovered)
 		}
 		followup := model.drainDirtyMirrorReview()
 		model.pruneMirrorCache()
@@ -980,6 +1090,32 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 		return model.updateKey(message)
 	default:
 		return model, nil
+	}
+}
+
+func (model *Model) resumePendingRecovery() tea.Cmd {
+	if model.pending.kind != pendingNone || len(model.pendingRecoveries) == 0 {
+		return nil
+	}
+	next := model.pendingRecoveries[0]
+	model.pendingRecoveries = append([]pendingSend(nil), model.pendingRecoveries[1:]...)
+	model.pending = next
+	model.activateRecoveredPending(next)
+	model.status = "resuming the next locally committed response event…"
+	return sendPersistedEvent(model.client, model.stateStore, next)
+}
+
+func (model *Model) refreshRecoveredAssignment(incoming completion.Assignment) {
+	if model.pending.recovered && model.pending.assignment.SessionKey() == incoming.SessionKey() {
+		model.pending.assignment = incoming
+		if model.pending.event.Type == completion.EventProgress {
+			model.active = &incoming
+		}
+	}
+	for index := range model.pendingRecoveries {
+		if model.pendingRecoveries[index].assignment.SessionKey() == incoming.SessionKey() {
+			model.pendingRecoveries[index].assignment = incoming
+		}
 	}
 }
 
@@ -1061,6 +1197,19 @@ func (model *Model) removeQueuedAssignment(sessionKey string, preferred int) {
 func (model Model) updateKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key.Keystroke() == "ctrl+c" {
 		return model, tea.Quit
+	}
+	if model.deferredSend.kind != pendingNone {
+		if key.Keystroke() == "esc" {
+			kind := model.deferredSend.kind
+			model.deferredSend = deferredSendIntent{}
+			if kind == pendingCommand {
+				model.commandConfirm = ""
+			}
+			model.status = "queued send canceled · draft retained"
+		} else {
+			model.status = "send is waiting for recovery state; input is locked · Esc cancels and keeps the draft"
+		}
+		return model, nil
 	}
 	if model.composing {
 		switch key.Keystroke() {
@@ -2930,6 +3079,9 @@ func (model Model) sendAgentTasks() (tea.Model, tea.Cmd) {
 		model.status = "Tasks sync disabled · accept a request first"
 		return model, nil
 	}
+	if model.blockSendWhileStateUnsettled("task edits", deferredSendIntent{kind: pendingTasks}) {
+		return model, nil
+	}
 	if model.responseInFlight() {
 		model.status = "another response event is still being committed; task edits retained"
 		return model, nil
@@ -2978,7 +3130,8 @@ func (model Model) sendAgentTasks() (tea.Model, tea.Cmd) {
 	model.expectContinuation(assignment, []completion.ToolCall{call})
 	model.pending = pendingSend{
 		kind: pendingTasks, eventID: eventID, assignment: assignment, tasks: append([]agentTask(nil), items...),
-		context: beforeContext,
+		context: beforeContext, selected: model.taskSelected,
+		remainingDraft: model.remainingDraftAfterSend(pendingTasks),
 	}
 	model.active = nil
 	model.focus = focusTasks
@@ -2986,7 +3139,7 @@ func (model Model) sendAgentTasks() (tea.Model, tea.Cmd) {
 	model.taskSyncWait = true
 	model.detailMode = false
 	model.status = "Tasks update queued for the client Agent · waiting for its next turn"
-	return model, sendEvent(model.client, assignment, event)
+	return model.commitPendingEvent(event)
 }
 
 func (model *Model) appendLocalText(assignment completion.Assignment, role canonical.Role, text string) {
@@ -3010,6 +3163,9 @@ func (model *Model) appendLocalToolCall(assignment completion.Assignment, call c
 }
 
 func (model Model) sendCommand() (tea.Model, tea.Cmd) {
+	if model.blockSendWhileStateUnsettled("command draft", deferredSendIntent{kind: pendingCommand}) {
+		return model, nil
+	}
 	if model.responseInFlight() {
 		model.status = "another response event is still being committed; command draft retained"
 		return model, nil
@@ -3058,7 +3214,7 @@ func (model Model) sendCommand() (tea.Model, tea.Cmd) {
 	model.expectContinuation(assignment, event.ToolCalls)
 	model.pending = pendingSend{
 		kind: pendingCommand, eventID: eventID, assignment: assignment, command: model.commandInput,
-		context: beforeContext,
+		context: beforeContext, remainingDraft: model.remainingDraftAfterSend(pendingCommand),
 	}
 	model.setCommandValue("")
 	model.commandConfirm = ""
@@ -3066,7 +3222,7 @@ func (model Model) sendCommand() (tea.Model, tea.Cmd) {
 	model.focus = focusTasks
 	model.detailMode = false
 	model.status = target.name + " tool call queued · waiting for the client Agent result"
-	return model, sendEvent(model.client, assignment, event)
+	return model.commitPendingEvent(event)
 }
 
 func workspacePullPath(command string) (string, bool) {
@@ -3137,6 +3293,7 @@ func (model Model) sendWorkspacePull(relativePath string, target commandTarget) 
 	model.pending = pendingSend{
 		kind: pendingCommand, eventID: eventID, assignment: assignment,
 		command: model.commandInput, context: beforeContext, toolCalls: []completion.ToolCall{call},
+		remainingDraft: model.remainingDraftAfterSend(pendingCommand),
 	}
 	model.setCommandValue("")
 	model.commandConfirm = ""
@@ -3144,11 +3301,14 @@ func (model Model) sendWorkspacePull(relativePath string, target commandTarget) 
 	model.focus = focusTasks
 	model.detailMode = false
 	model.status = "exact workspace pull queued · waiting for the client Agent result"
-	return model, sendEvent(model.client, assignment, event)
+	return model.commitPendingEvent(event)
 }
 
 func (model Model) sendDeclaredToolCalls() (tea.Model, tea.Cmd) {
 	if model.active == nil || !model.composing {
+		return model, nil
+	}
+	if model.blockSendWhileStateUnsettled("tool draft", deferredSendIntent{kind: pendingAdvancedTools}) {
 		return model, nil
 	}
 	if model.responseInFlight() {
@@ -3175,6 +3335,7 @@ func (model Model) sendDeclaredToolCalls() (tea.Model, tea.Cmd) {
 	model.pending = pendingSend{
 		kind: pendingAdvancedTools, eventID: eventID, assignment: assignment,
 		context: beforeContext, toolInput: model.input, toolCallIDs: append([]string(nil), model.toolCallIDs...),
+		remainingDraft: model.remainingDraftAfterSend(pendingAdvancedTools),
 	}
 	model.input = ""
 	model.toolCallIDs = nil
@@ -3183,7 +3344,7 @@ func (model Model) sendDeclaredToolCalls() (tea.Model, tea.Cmd) {
 	model.focus = focusTasks
 	model.detailMode = false
 	model.status = fmt.Sprintf("%d declared tool call(s) queued · waiting for client results", len(calls))
-	return model, sendEvent(model.client, assignment, event)
+	return model.commitPendingEvent(event)
 }
 
 func (model Model) appendComposeInput(value string) Model {
@@ -3289,6 +3450,11 @@ func (model Model) sendReplyWithOptions(eventType completion.EventType, endRespo
 	if model.active == nil {
 		return model, nil
 	}
+	if model.blockSendWhileStateUnsettled("reply draft", deferredSendIntent{
+		kind: pendingReply, replyType: eventType, endResponse: endResponse, allowEmpty: allowEmpty,
+	}) {
+		return model, nil
+	}
 	if model.responseInFlight() {
 		model.status = "previous response event is still being committed; draft retained"
 		return model, nil
@@ -3314,6 +3480,7 @@ func (model Model) sendReplyWithOptions(eventType completion.EventType, endRespo
 	model.pending = pendingSend{
 		kind: pendingReply, eventID: eventID, assignment: assignment,
 		context: cloneAssignment(model.lastContext), reply: text,
+		remainingDraft: model.remainingDraftAfterSend(pendingReply),
 	}
 	if text != "" {
 		model.appendLocalText(assignment, canonical.RoleAssistant, text)
@@ -3337,7 +3504,90 @@ func (model Model) sendReplyWithOptions(eventType completion.EventType, endRespo
 		model.focus = focusReply
 		model.status = "message queued locally · stream stays open"
 	}
-	return model, sendEvent(model.client, assignment, event)
+	return model.commitPendingEvent(event)
+}
+
+func (model *Model) blockSendWhileStateUnsettled(draft string, intent deferredSendIntent) bool {
+	if model.stateStore == nil {
+		return false
+	}
+	switch {
+	case !model.stateBound:
+		model.status = "recovery state is waiting for authenticated worker identity; " + draft +
+			" retained · sending remains disabled until the connection is ready"
+		return true
+	case model.stateWriting || model.stateRetryPending:
+		if model.active == nil {
+			model.status = "request is no longer active; " + draft + " retained"
+			return true
+		}
+		if model.deferredSend.kind == pendingNone {
+			intent.sessionKey = model.active.SessionKey()
+			intent.draftKey = stateRecordKey{scope: stateScope(*model.active), kind: workerStateDraftKind}
+			intent.draft, _ = model.currentPersistedDraft()
+			model.deferredSend = intent
+		}
+		model.status = "send queued behind recovery-state commit; " + draft +
+			" retained and input locked · Esc cancels"
+		return true
+	default:
+		return false
+	}
+}
+
+func (model Model) executeDeferredSend() (Model, tea.Cmd) {
+	intent := model.deferredSend
+	model.deferredSend = deferredSendIntent{}
+	if intent.kind == pendingNone {
+		return model, nil
+	}
+	if model.active == nil || model.active.SessionKey() != intent.sessionKey {
+		model.retainDeferredDraft(intent)
+		model.status = "queued send canceled because its request is no longer active · draft retained"
+		return model, nil
+	}
+
+	var updated tea.Model
+	var command tea.Cmd
+	switch intent.kind {
+	case pendingReply:
+		updated, command = model.sendReplyWithOptions(intent.replyType, intent.endResponse, intent.allowEmpty)
+	case pendingCommand:
+		updated, command = model.sendCommand()
+	case pendingTasks:
+		updated, command = model.sendAgentTasks()
+	case pendingAdvancedTools:
+		updated, command = model.sendDeclaredToolCalls()
+	default:
+		model.status = "queued send canceled because its action is invalid · draft retained"
+		return model, nil
+	}
+	return updated.(Model), command
+}
+
+// cancelDeferredSendIfInactive runs before nextStateCommand computes deletes.
+// A network lifecycle transition may have replaced the active editor while a
+// send gesture was waiting; pin the captured source draft to its original scope
+// so that canceling the gesture cannot turn a previously committed delete into
+// silent draft loss.
+func (model *Model) cancelDeferredSendIfInactive() {
+	if model.deferredSend.kind == pendingNone ||
+		(model.active != nil && model.active.SessionKey() == model.deferredSend.sessionKey) {
+		return
+	}
+	intent := model.deferredSend
+	model.deferredSend = deferredSendIntent{}
+	model.retainDeferredDraft(intent)
+	model.status = "queued send canceled because its request is no longer active · draft retained"
+}
+
+func (model *Model) retainDeferredDraft(intent deferredSendIntent) {
+	if intent.draftKey.kind != workerStateDraftKind || !persistedDraftHasContent(intent.draft) {
+		return
+	}
+	model.stateDrafts[intent.draftKey] = savedStateDraft{
+		draft: sanitizePersistedDraft(intent.draft), updatedAt: time.Now().UTC(),
+	}
 }
 
 func (model Model) View() tea.View {
@@ -3544,12 +3794,30 @@ func (model Model) contextSections(assignment completion.Assignment) []string {
 		primary.WriteString("\n\n")
 		primary.WriteString(review)
 	}
-	sections := make([]string, 0, 2)
+	sections := make([]string, 0, 3)
 	if reference.Len() > 0 {
 		sections = append(sections, reference.String())
 	}
 	sections = append(sections, primary.String())
+	if directory := model.mirrorDirectory(assignment); directory != "" {
+		sections = append(sections, "Human workspace (absolute path; edit this copy):\n"+directory)
+	}
 	return sections
+}
+
+func (model Model) mirrorDirectory(assignment completion.Assignment) string {
+	if !mirrorEnabled(assignment) {
+		return ""
+	}
+	workspace := model.mirrors[mirrorNamespace(assignment.CallerID, assignment.WorkspaceKey)]
+	if workspace == nil || workspace.Dir() == "" {
+		return ""
+	}
+	directory, err := filepath.Abs(workspace.Dir())
+	if err != nil {
+		return workspace.Dir()
+	}
+	return directory
 }
 
 func wrapDisplayLines(value string, width int) []string {
@@ -3832,6 +4100,54 @@ func sendEvent(client Client, assignment completion.Assignment, event completion
 	}
 }
 
+func (model Model) commitPendingEvent(event completion.Event) (tea.Model, tea.Cmd) {
+	model.pending.event = event
+	model.pending.eventID = event.ID
+	if model.stateStore == nil {
+		return model, sendEvent(model.client, model.pending.assignment, event)
+	}
+	// nextStateCommand serializes this intent through the worker-state store.
+	// applyStateWriteResult starts the outbox write only after that transaction
+	// commits, so clearing the editor can never outrun both durable copies.
+	return model, nil
+}
+
+func sendPersistedEvent(client Client, store StateStore, pending pendingSend) tea.Cmd {
+	return func() tea.Msg {
+		err := client.SendEvent(context.Background(), pending.assignment, pending.event)
+		message := eventSent{eventID: pending.event.ID, err: err}
+		if err == nil || errors.Is(err, workerclient.ErrEventRejectionPending) || store == nil {
+			return message
+		}
+		if errors.Is(err, workerclient.ErrWorkerIdentityUnavailable) {
+			message.intentErr = err
+			return message
+		}
+
+		// A deterministic validation failure or local outbox failure returns the
+		// draft to the operator. Publish that decision into the already-durable
+		// intent row before telling Bubble Tea to clear pending state; a crash at
+		// any earlier instruction therefore retries the exact intended event, while
+		// a crash after this commit restores the draft and never sends it silently.
+		key := pendingSendStateKey(pending)
+		persisted := persistedPendingFromSend(pending, pendingSendDispositionRestore)
+		payload, marshalErr := json.Marshal(persisted)
+		if marshalErr != nil {
+			message.intentErr = marshalErr
+			return message
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), workerStateWriteTimeout)
+		defer cancel()
+		if _, stateErr := store.Put(ctx, key.scope, key.kind, payload); stateErr != nil {
+			message.intentErr = stateErr
+			return message
+		}
+		message.intentKey = key
+		message.restorePayload = payload
+		return message
+	}
+}
+
 func confirmRejectedEvent(client Client, eventID string) tea.Cmd {
 	return confirmRejectedEventAttempt(client, eventID, 0)
 }
@@ -3990,6 +4306,7 @@ func escapeTranscriptBody(content string) string {
 	for index, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "CLIENT" || trimmed == "YOU" || trimmed == "TOOL" ||
+			trimmed == "LOCAL WORKSPACE" ||
 			strings.HasPrefix(trimmed, "SYSTEM") {
 			lines[index] = "│ " + line
 		}

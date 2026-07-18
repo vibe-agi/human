@@ -269,6 +269,28 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Ping proves that the gateway database can query its current schema now. It
+// is deliberately stronger than merely checking that sql.DB still owns a
+// driver handle (or evaluating SELECT 1 without touching the database file):
+// readiness must fail when SQLite becomes unavailable or damaged at runtime.
+func (s *Store) Ping(ctx context.Context) error {
+	var version int
+	var fingerprint string
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT version, fingerprint
+		FROM human_schema
+		WHERE component = 'gateway'`).Scan(&version, &fingerprint); err != nil {
+		return fmt.Errorf("query sqlite readiness probe: %w", err)
+	}
+	if version != schemaVersion || fingerprint != schemaFingerprint {
+		return fmt.Errorf(
+			"query sqlite readiness probe: schema version %d (%q), want %d (%q)",
+			version, fingerprint, schemaVersion, schemaFingerprint,
+		)
+	}
+	return nil
+}
+
 func (s *Store) LookupRequest(
 	ctx context.Context,
 	key storeapi.RequestKey,

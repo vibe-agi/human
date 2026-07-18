@@ -142,7 +142,7 @@ OpenCode 1.17.18 的真实 CLI gate 已从空 Human mirror 生成 `:pull native.
 
 1. caller 精确续传需要同一 key 与同一 canonical 摘要。默认显式提供；严格匹配的 Codex Responses turn 与 OpenCode 1.17.18 Workspace turn 可分别派生。OpenCode Basic/Chat 与其它未识别无 key 请求仍是新请求。Codex 0.144.4 黑盒只证明响应前 retry 身份；0.144.5 真实 gate 已证明 Responses Basic 的串行函数调用/result/final，两者都不能代替 partial SSE 恢复或 Codex Workspace profile。
 2. 恢复只对 `max_pending` 剩余窗口内的请求成立。超过后原请求已 `expired`；迟到 worker 事件可被持久拒绝并恢复为草稿，但不会使旧请求复活。
-3. worker outbox 保护已发送事件；默认 worker state DB 另持久化 Reply/Command/Tasks 草稿、rejected drafts 与最多 32 个 continuation。高级 JSON composer、mirror preview 等未列入 state DB 的瞬时 UI 状态仍不承诺恢复。
+3. worker outbox 保护已发送事件；默认 worker state DB 另持久化 Reply/Command/Tasks/Advanced tool-call 草稿、rejected drafts 与最多 32 个 continuation。mirror preview 等未列入 state DB 的瞬时 UI 状态仍不承诺恢复。
 
 **OpenCode 外部已验证**：1.17.18 + OpenAI-compatible Chat 完成 text SSE、同轮 `todowrite + write`、后续 `edit → bash → todowrite → final` 及成功/失败 read result 回流。exact Workspace 的 opt-in 真实 CLI gate 从空 Human mirror 发出精确 `:pull` bootstrap，真实 CLI 以 `--pure` 返回 base64 文件字节；随后修改 Human mirror、执行绝对路径原生 `edit`、回传 `Edit applied successfully.`、reconcile baseline，再在同一工具循环执行 `bash + todowrite` 并 final。第二条顶层 user 消息复用同一 OpenCode session，但因旧 task 已 terminal 而正确得到新的 Human task 和 request key。无工具标题/摘要请求会隔离 Chat；声明任意工具的请求不会仅因工具未被 adapter 映射而丢掉 Workspace 身份。
 

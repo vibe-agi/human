@@ -333,6 +333,10 @@ func (model *Model) prepareChatViewport(width, height int) {
 			content = strings.Join(model.contextSections(*assignment), "\n\n")
 		} else {
 			content = renderReadableChat(assignment.Request)
+			if directory := model.mirrorDirectory(*assignment); directory != "" {
+				content += "\n\nLOCAL WORKSPACE\n" + directory +
+					"\nEdit this copy; changes are reviewed and sent to the client Agent."
+			}
 			styleRoles = true
 		}
 	}
@@ -395,6 +399,8 @@ func (model Model) styleTranscript(content string) string {
 			lines[index] = human.Render("HUMAN")
 		case "TOOL":
 			lines[index] = tool.Render("TOOL")
+		case "LOCAL WORKSPACE":
+			lines[index] = muted.Render("LOCAL WORKSPACE")
 		default:
 			if strings.HasPrefix(strings.TrimSpace(line), "SYSTEM") {
 				lines[index] = muted.Render(line)

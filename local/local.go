@@ -9,16 +9,21 @@ package local
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/vibe-agi/human/gateway"
+	"github.com/vibe-agi/human/internal/sqlitefile"
 	"github.com/vibe-agi/human/internal/userdata"
 	"github.com/vibe-agi/human/worker"
 )
@@ -216,6 +221,9 @@ func Open(ctx context.Context, config Config) (*Local, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := rejectPendingOfflineRestore(config.Gateway.DatabasePath); err != nil {
+		return nil, err
+	}
 
 	listener, err := net.Listen("tcp", config.ListenAddress)
 	if err != nil {
@@ -324,6 +332,13 @@ func Open(ctx context.Context, config Config) (*Local, error) {
 
 	config.Worker.GatewayURL = "ws://" + listener.Addr().String() + gateway.WorkerPath
 	config.Worker.Token = instance.credentials.WorkerToken
+	if strings.TrimSpace(config.Worker.OutboxScope) == "" {
+		scope, resolveErr := localOutboxScope(config.Gateway.DatabasePath)
+		if resolveErr != nil {
+			return cleanupFailure(fmt.Errorf("resolve local gateway outbox identity: %w", resolveErr))
+		}
+		config.Worker.OutboxScope = scope
+	}
 	openedWorker, err := worker.Open(runContext, config.Worker)
 	if err != nil {
 		return cleanupFailure(fmt.Errorf("open local worker: %w", err))
@@ -344,6 +359,47 @@ func Open(ctx context.Context, config Config) (*Local, error) {
 		_ = instance.Close()
 	}()
 	return instance, nil
+}
+
+func rejectPendingOfflineRestore(databasePath string) error {
+	trimmed := strings.TrimSpace(databasePath)
+	if trimmed != ":memory:" && !strings.HasPrefix(strings.ToLower(trimmed), "file:") {
+		absolute, err := filepath.Abs(trimmed)
+		if err != nil {
+			return fmt.Errorf("inspect pending local restore: %w", err)
+		}
+		if _, err := os.Stat(filepath.Dir(absolute)); errors.Is(err, os.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("inspect pending local restore directory: %w", err)
+		}
+	}
+	location, err := sqlitefile.Resolve(databasePath)
+	if err != nil {
+		return fmt.Errorf("inspect pending local restore: %w", err)
+	}
+	if !location.FileBacked {
+		return nil
+	}
+	journalPath := location.Path + ".restore-journal.json"
+	if _, err := os.Lstat(journalPath); err == nil {
+		return fmt.Errorf("open local: an interrupted offline restore is pending at %s; resume it before starting Human local", journalPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect pending local restore journal: %w", err)
+	}
+	return nil
+}
+
+func localOutboxScope(databasePath string) (string, error) {
+	location, err := sqlitefile.Resolve(databasePath)
+	if err != nil {
+		return "", err
+	}
+	if !location.FileBacked {
+		return "", nil
+	}
+	sum := sha256.Sum256([]byte(location.Path))
+	return "human-local-gateway:" + hex.EncodeToString(sum[:]), nil
 }
 
 // BaseURL returns the loopback model API base URL using the kernel-selected

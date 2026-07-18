@@ -85,7 +85,7 @@ gateway 是协议与持久正确性的**逻辑组件**。`human local` 把 gatew
 
 ## OpenCode 本机演练
 
-已实测版本为 OpenCode `1.17.18`。先用 onboarding 命令核对本机环境并生成完整配置；`doctor` 中“尚未启动 gateway / 尚无首次凭据”只记 WARN，真正的权限、格式或版本错误才返回非零。`init` 默认只写 stdout，不会改客户仓库；只有显式给 `--output` 才原子写文件，已存在时还必须再给 `--force`：
+已实测版本为 OpenCode `1.17.18`。先用 onboarding 命令核对本机环境并生成完整配置；`doctor` 中“尚未启动 gateway / 尚无首次凭据 / gateway ready 但暂时没有在线 worker”只记 WARN，恢复未完成或 SQLite 不可查询等真正的 readiness 错误才返回非零。`init` 默认只写 stdout，不会改客户仓库；只有显式给 `--output` 才原子写文件，已存在时还必须再给 `--force`：
 
 ```sh
 human doctor --workspace . --require-opencode
@@ -128,9 +128,23 @@ human local \
 
 默认私有数据根为 macOS 的 `~/Library/Application Support/Human`、Linux 的 `${XDG_DATA_HOME:-~/.local/share}/human`、Windows 的 `%LOCALAPPDATA%\\Human`；也可用绝对路径 `HUMAN_DATA_HOME` 统一覆盖。local 的 gateway DB、credential journal、worker outbox/state 和 shim ledger 都在这个根下按真实 workspace 路径的 SHA-256 隔离，不会再把 `.human` 写进客户 Git workspace。显式 `--db`、`--credentials`、`--outbox`、`--state-db`、`--ledger` 仍完全覆盖自动路径；`--state-db=` 继续表示关闭 TUI 状态持久化。standalone `human gateway` 和 `human worker` 的私有库也使用同一用户数据根。
 
-需要轮换时使用 `--reset-credentials`。local 会先把 prepared pair 写入同一 mode-`0600` journal，再激活并切换 active，最后撤销旧 pair；进程在任一边界退出后，下次启动会继续未完成步骤，而不会先吊销唯一可用凭据。
+需要轮换时使用 `--reset-credentials`。local 会先把 prepared pair 写入同一 mode-`0600` journal，再激活并切换 active，最后撤销旧 pair；进程在任一边界退出后，下次启动会继续未完成步骤，而不会先吊销唯一可用凭据。worker outbox 不用 bearer token 作为持久身份，而是在认证成功后按规范化 gateway endpoint + 稳定 worker subject 选取命名空间：同一 subject 换新 token 后仍会补发旧 token 时已落盘但未 ACK 的事件，不同 gateway 或 subject 不能互相重放。
 
 当前 clean-break 发行的 gateway、worker outbox/state 与 caller ledger 只接受各自唯一的当前 schema，不包含迁移器。若从本轮之前的开发库启动，会明确返回 `unsupported ... schema; recreate database`；请连同相应的本地 credentials journal 一起重建，而不是尝试混用旧库。
+
+本机状态可以在 `human local` **完全停止后**做离线备份、校验和恢复；archive 含 gateway SQLite、credential rotation journal、worker outbox/state，以及该 local caller 的 mirror worktree 与 `.human-state` baseline：
+
+```sh
+human local --workspace . backup --output ~/Backups/human-local.tar.gz
+human local verify-backup --input ~/Backups/human-local.tar.gz
+human local --workspace . restore --input ~/Backups/human-local.tar.gz
+# 目标已有数据时，核对后才显式整套替换：
+human local --workspace . restore --input ~/Backups/human-local.tar.gz --force
+```
+
+backup/restore 会按 canonical path 排序并同时抢占 gateway、outbox 和启用时 state DB 的 owner lock；运行中的 local、独立 worker 或直接 token 管理不会与其并发写库。三个 SQLite 都在 source、snapshot/staging 和安装后执行 `PRAGMA quick_check`，并用 `VACUUM INTO` 生成自包含快照，所以已提交 WAL/rollback-sidecar 状态不会因只复制主文件而丢失。archive 还把 manifest 的 gateway identity、worker subject 与 outbox/state 中全部 correctness rows 交叉校验，混入另一 gateway/worker 的待发事件或 TUI 状态会 fail-closed。archive 固定为 mode `0600`，v1 manifest 对每个文件记录 path/type/mode/size/SHA-256，校验拒绝额外项、重复/可移植文件名碰撞、路径穿越、尾随 gzip 数据和超限解压。这里的 SHA/quick-check 只证明 archive 内部结构与内容自洽，不是数字签名或来源认证；archive 含明文 caller/worker token，必须始终以 `0600` 放在可信存储，攻击者能整体重写的 archive 不会因 `verify-backup` 变可信。mirror 中 symlink/特殊节点不会被跟随，而是逐路径列在 manifest 的 `skipped` 中；它们本来也不属于可交付 mirror 正确性树。
+
+restore 默认拒绝任一非空目标；`--force` 使用各目标同目录 staging、持久 restore journal 和 old/new rename，整套安装并重新 quick-check 前不会删除旧集。若 gateway DB 换了 canonical path，restore 会在私有 staging 中把 outbox/state 的 transport identity 一起事务重绑，pending/state 不会静默消失。若进程在 rename 边界退出，`human local` 会 fail-closed 拒绝混合状态，保持停止并运行 `human local --workspace . restore --resume`。移动 Git workspace 后恢复必须额外明确给出 `--accept-workspace-mismatch`，caller/worker subject 仍必须与 archive 一致；该开关只适合同一 workspace 搬迁或取证，不会改写旧 in-flight assignment 的 `workspace_key`/root，恢复后必须先审阅旧任务，不能假设旧 edit 已自动指向新路径。完整边界见 [08 部署与运维](docs/08-operations.md#本机离线备份与恢复)。
 
 在运行客户 Agent 的另一个终端读取 caller token（不会进入 argv），再启动 OpenCode：
 

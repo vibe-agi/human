@@ -173,17 +173,71 @@ func TestDoctorWarnsForOpenCodeMismatchUnlessRequired(t *testing.T) {
 func TestProbeHealthDistinguishesHealthyAndUnhealthyHTTP(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/healthy" {
-			_, _ = response.Write([]byte(`{"status":"ok"}`))
+			_, _ = response.Write([]byte(`{"status":"ok","database":{"status":"ok"},"recovery":{"complete":true},"workers":{"online":2,"has_online":true}}`))
 			return
 		}
 		response.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
-	if got := probeHealth(context.Background(), server.URL+"/healthy"); !got.Running || got.Err != nil {
+	if got := probeHealth(context.Background(), server.URL+"/healthy"); !got.Running || got.Err != nil ||
+		!got.Observed || got.DatabaseStatus != "ok" || !got.RecoveryComplete ||
+		got.OnlineWorkers != 2 || !got.HasOnlineWorker {
 		t.Fatalf("healthy probe = %+v", got)
 	}
 	if got := probeHealth(context.Background(), server.URL+"/unhealthy"); !got.Running || got.Err == nil {
 		t.Fatalf("unhealthy probe = %+v", got)
+	}
+}
+
+func TestProbeHealthAcceptsReadyGatewayWithoutWorker(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write([]byte(`{"status":"ok","database":{"status":"ok"},"recovery":{"complete":true},"workers":{"online":0,"has_online":false}}`))
+	}))
+	defer server.Close()
+	got := probeHealth(context.Background(), server.URL+"/readyz")
+	if !got.Running || got.Err != nil || !got.Observed || got.HasOnlineWorker || got.OnlineWorkers != 0 {
+		t.Fatalf("ready gateway without worker probe = %+v", got)
+	}
+}
+
+func TestDoctorWarnsButDoesNotFailWhenGatewayHasNoWorker(t *testing.T) {
+	dataRoot := t.TempDir()
+	if err := os.Chmod(dataRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HUMAN_DATA_HOME", dataRoot)
+	report := runDoctor(context.Background(), ".", defaultDoctorHealthURL, false, doctorDependencies{
+		openCode: func(context.Context) doctorOpenCodeResult {
+			return doctorOpenCodeResult{Found: true, Path: "/test/opencode", Version: adapter.OpenCodeVersion}
+		},
+		health: func(context.Context, string) doctorHealthResult {
+			return doctorHealthResult{
+				Running: true, Observed: true, DatabaseStatus: "ok", RecoveryComplete: true,
+			}
+		},
+	})
+	if !report.OK || report.Summary.Fail != 0 {
+		t.Fatalf("worker-offline readiness failed doctor: %+v", report)
+	}
+	for _, check := range report.Checks {
+		if check.ID == "gateway_health" {
+			if check.Status != doctorWarn || !strings.Contains(check.Message, "no Human worker is online") {
+				t.Fatalf("worker-offline gateway check = %+v", check)
+			}
+			return
+		}
+	}
+	t.Fatal("doctor omitted gateway_health check")
+}
+
+func TestProbeHealthRejectsLegacyFixedOKWithoutReadinessEvidence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+	got := probeHealth(context.Background(), server.URL+"/healthz")
+	if !got.Running || got.Err == nil {
+		t.Fatalf("legacy fixed-ok probe = %+v", got)
 	}
 }
 

@@ -14,7 +14,7 @@ import (
 func TestSendEventRejectsOversizeBeforeOutboxCommit(t *testing.T) {
 	ctx := context.Background()
 	outbox, err := openDurableOutbox(
-		ctx, filepath.Join(t.TempDir(), "outbox.db"), "wss://gateway.example/worker", "worker-token",
+		ctx, filepath.Join(t.TempDir(), "outbox.db"), "wss://gateway.example/worker", "worker-limit",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -22,7 +22,7 @@ func TestSendEventRejectsOversizeBeforeOutboxCommit(t *testing.T) {
 	t.Cleanup(func() { _ = outbox.Close() })
 	client := &Client{outbox: outbox, workerID: "worker-limit"}
 	assignment := completion.Assignment{
-		CallerID: "caller", TaskID: "task", IdempotencyKey: "request",
+		CallerID: "caller", TaskID: "task", IdempotencyKey: "request", LeaseOwner: "worker-limit",
 	}
 	event := completion.Event{
 		ID: "event-too-large", Type: completion.EventFinal,

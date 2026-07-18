@@ -33,7 +33,9 @@ HUMAN_EMBED_GATEWAY_DB=/absolute/private/path/gateway.db \
   go run ./examples/embed-gateway
 ```
 
-`gateway.Open` 自己不监听端口。`ModelHandler()` 处理 `/healthz`、`/v1/models`、`/v1/chat/completions`、`/v1/messages` 与 `/v1/responses`；如果挂到前缀下，宿主需要像示例一样在进入 handler 前移除前缀。`WorkerHandler()` 是独立 WebSocket handler，可挂到宿主选择的私有路径。若直接使用 `Server` 作为 `http.Handler`，内建路径是 `/internal/v1/worker/ws`。
+`gateway.Open` 自己不监听端口。`ModelHandler()` 处理 `/livez`、`/readyz`、兼容别名 `/healthz`、`/v1/models`、`/v1/chat/completions`、`/v1/messages` 与 `/v1/responses`；如果挂到前缀下，宿主需要像示例一样在进入 handler 前移除前缀。`WorkerHandler()` 是独立 WebSocket handler，可挂到宿主选择的私有路径。若直接使用 `Server` 作为 `http.Handler`，这些 model/health 路径同样可用，内建 worker 路径是 `/internal/v1/worker/ws`。
+
+三个健康端点无需 caller/worker 凭据，响应只披露依赖状态和在线 worker 数，不披露数据库路径、身份或错误正文。`/livez` 只证明进程 handler 可响应，固定把 database 标为 `unchecked`；`/readyz` 在启动恢复完成且 SQLite 可执行查询时返回 200，`/healthz` 与它语义相同。没有在线 worker 会体现在 `workers.online=0` 与 `has_online=false`，但不会令 gateway readiness 失败。
 
 ### 身份扩展点
 

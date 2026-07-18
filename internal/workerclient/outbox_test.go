@@ -14,14 +14,17 @@ import (
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/completion/adapter"
 	"github.com/vibe-agi/human/internal/completion/canonical"
+	"github.com/vibe-agi/human/internal/ownerlock"
 	"github.com/vibe-agi/human/internal/workerproto"
 )
 
-func TestDurableOutboxSurvivesReopenAndSeparatesCredentials(t *testing.T) {
+func TestDurableOutboxSurvivesCredentialRotationAndSeparatesIdentities(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "private", "worker-outbox.db")
 	ctx := context.Background()
-	outbox, err := openDurableOutbox(ctx, path, "wss://gateway.example/worker", "hae_secret_token")
+	outbox, err := openDurableOutbox(
+		ctx, path, "https://GATEWAY.example:443/worker?b=2&a=1", "worker-rotation",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,11 +57,15 @@ func TestDurableOutboxSurvivesReopenAndSeparatesCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "hae_secret_token") {
-		t.Fatal("outbox stored the bearer token")
+	if strings.Contains(string(raw), "worker-rotation") {
+		t.Fatal("outbox stored the authenticated worker subject instead of its namespace digest")
 	}
 
-	outbox, err = openDurableOutbox(ctx, path, "wss://gateway.example/worker", "hae_secret_token")
+	// A new credential for the same authenticated subject binds the same durable
+	// namespace. HTTP(S) aliases and query ordering must not fork the endpoint.
+	outbox, err = openDurableOutbox(
+		ctx, path, "wss://gateway.example/worker?a=1&b=2", "worker-rotation",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,18 +76,45 @@ func TestDurableOutboxSurvivesReopenAndSeparatesCredentials(t *testing.T) {
 	if len(records) != 1 || records[0].EventID != event.ID || records[0].Message.Event.Text != event.Text {
 		t.Fatalf("reopened outbox = %+v", records)
 	}
-	otherCredential, err := openDurableOutbox(ctx, path, "wss://gateway.example/worker", "hae_other_token")
+	if err := outbox.Close(); err != nil {
+		t.Fatal(err)
+	}
+	otherWorker, err := openDurableOutbox(
+		ctx, path, "wss://gateway.example/worker?a=1&b=2", "worker-other",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	records, err = otherCredential.List(ctx)
+	records, err = otherWorker.List(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(records) != 0 {
-		t.Fatalf("another credential could see pending events: %+v", records)
+		t.Fatalf("another worker could see pending events: %+v", records)
 	}
-	if err := otherCredential.Close(); err != nil {
+	if err := otherWorker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	otherGateway, err := openDurableOutbox(
+		ctx, path, "wss://other-gateway.example/worker?a=1&b=2", "worker-rotation",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err = otherGateway.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("another gateway could see pending events: %+v", records)
+	}
+	if err := otherGateway.Close(); err != nil {
+		t.Fatal(err)
+	}
+	outbox, err = openDurableOutbox(
+		ctx, path, "wss://gateway.example/worker?a=1&b=2", "worker-rotation",
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := outbox.Delete(ctx, event.ID); err != nil {
@@ -95,6 +129,127 @@ func TestDurableOutboxSurvivesReopenAndSeparatesCredentials(t *testing.T) {
 	}
 	if strings.Contains(string(raw), event.Text) {
 		t.Fatal("secure deletion left acknowledged response content in the outbox file")
+	}
+}
+
+func TestExplicitOutboxScopeSurvivesEphemeralEndpointChange(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	first, err := openDurableOutboxWithScope(
+		ctx, path, "ws://127.0.0.1:41001/internal/v1/worker/ws", "local-gateway-db-1", "worker-a",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment := completion.Assignment{
+		CallerID: "caller", TaskID: "task", IdempotencyKey: "request",
+	}
+	event := completion.Event{ID: "event-scope-restart", Type: completion.EventFinal, Text: "pending"}
+	if _, err := first.Put(ctx, assignment, event); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := openDurableOutboxWithScope(
+		ctx, path, "ws://127.0.0.1:51999/internal/v1/worker/ws", "local-gateway-db-1", "worker-a",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := restarted.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].EventID != event.ID {
+		t.Fatalf("records after endpoint change = %+v", records)
+	}
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	otherScope, err := openDurableOutboxWithScope(
+		ctx, path, "ws://127.0.0.1:51999/internal/v1/worker/ws", "other-gateway-db", "worker-a",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err = otherScope.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("different explicit gateway scope saw pending events: %+v", records)
+	}
+	if err := otherScope.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOutboxOwnerLockAndOfflineIdentityRebind(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "private", "outbox.db")
+	oldScope := "local-old"
+	newScope := "local-new"
+	workerID := "worker-rebind"
+	outbox, err := openDurableOutboxWithScope(
+		ctx, path, "ws://127.0.0.1:1/internal/v1/worker/ws", oldScope, workerID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openDurableOutboxWithScope(
+		ctx, path, "ws://127.0.0.1:1/internal/v1/worker/ws", oldScope, workerID,
+	); !errors.Is(err, ownerlock.ErrInUse) {
+		t.Fatalf("second live outbox owner error = %v", err)
+	}
+	assignment := completion.Assignment{CallerID: "caller", TaskID: "task", IdempotencyKey: "request"}
+	if _, err := outbox.Put(ctx, assignment, completion.Event{ID: "event-rebind", Type: completion.EventFinal}); err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.Close(); err != nil {
+		t.Fatal(err)
+	}
+	oldIdentity, err := GatewayIdentity("", oldScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newIdentity, err := GatewayIdentity("", newScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RebindOutboxIdentity(ctx, path, oldIdentity, newIdentity, workerID); err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := openDurableOutboxWithScope(
+		ctx, path, "ws://127.0.0.1:2/internal/v1/worker/ws", newScope, workerID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := rebound.List(ctx)
+	if err != nil || len(records) != 1 || records[0].EventID != "event-rebind" {
+		t.Fatalf("rebound outbox records = %+v err=%v", records, err)
+	}
+	if err := rebound.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	foreign, err := openDurableOutboxWithScope(
+		ctx, path, "ws://127.0.0.1:3/internal/v1/worker/ws", "foreign-scope", "worker-foreign",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreign.Put(ctx, assignment, completion.Event{ID: "event-foreign", Type: completion.EventFinal}); err != nil {
+		t.Fatal(err)
+	}
+	if err := foreign.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := RebindOutboxIdentity(ctx, path, newIdentity, oldIdentity, workerID); err == nil {
+		t.Fatal("mixed-identity outbox archive was partially rebound")
 	}
 }
 
@@ -140,7 +295,7 @@ func TestDurableOutboxQuarantinesOneCorruptRowWithoutBlockingHealthyEvents(t *te
 	if _, err := outbox.db.ExecContext(ctx, `
 		UPDATE worker_outbox
 		SET payload = x'7b'
-		WHERE namespace = ? AND event_id = 'event-corrupt'`, outbox.namespace); err != nil {
+		WHERE namespace = ? AND event_id = 'event-corrupt'`, outbox.namespaceValue()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -162,7 +317,7 @@ func TestDurableOutboxQuarantinesOneCorruptRowWithoutBlockingHealthyEvents(t *te
 	if err := outbox.db.QueryRowContext(ctx, `
 		SELECT payload
 		FROM worker_outbox_quarantine
-		WHERE namespace = ? AND event_id = 'event-corrupt'`, outbox.namespace).Scan(&rawPayload); err != nil {
+		WHERE namespace = ? AND event_id = 'event-corrupt'`, outbox.namespaceValue()).Scan(&rawPayload); err != nil {
 		t.Fatal(err)
 	}
 	if string(rawPayload) != "{" {
@@ -190,7 +345,7 @@ func TestClientFlushReportsPersistentOutboxQuarantineOnce(t *testing.T) {
 	}
 	if _, err := outbox.db.ExecContext(ctx, `
 		UPDATE worker_outbox SET assignment = x'7b'
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, event.ID); err != nil {
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), event.ID); err != nil {
 		t.Fatal(err)
 	}
 	client := &Client{outbox: outbox, messages: make(chan Message, 1)}
@@ -755,7 +910,7 @@ func TestRejectedConfirmationRollbackKeepsPayloadAndSuccessfulRetryErasesIt(t *t
 	var tombstones int
 	if err := outbox.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM worker_rejected_confirmed
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, event.ID).Scan(&tombstones); err != nil {
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), event.ID).Scan(&tombstones); err != nil {
 		t.Fatal(err)
 	}
 	if tombstones != 0 {
@@ -890,7 +1045,7 @@ func TestOldestRejectedDoesNotDecodeLaterCorruptBacklogRows(t *testing.T) {
 	}
 	if _, err := outbox.db.ExecContext(ctx, `
 		UPDATE worker_rejected_inbox SET assignment = X'00'
-		WHERE namespace = ? AND event_id = 'corrupt-tail'`, outbox.namespace); err != nil {
+		WHERE namespace = ? AND event_id = 'corrupt-tail'`, outbox.namespaceValue()); err != nil {
 		t.Fatal(err)
 	}
 	record, found, err := outbox.OldestRejected(ctx)

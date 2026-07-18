@@ -8,4 +8,10 @@
 
 # 本地环境
 .human/
+.codegraph/
 *.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.db.owner.lock
+*.db.restore-journal.json

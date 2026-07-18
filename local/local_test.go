@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +45,42 @@ func TestDefaultConfigScopesPrivateStoresOutsideWorkspace(t *testing.T) {
 		t.Fatalf("local private defaults = %q / %q / %q, want %q / %q / %q",
 			config.Gateway.DatabasePath, config.Worker.OutboxPath, config.Worker.StatePath,
 			wantGateway, wantOutbox, wantState)
+	}
+}
+
+func TestLocalOutboxScopeUsesCanonicalDurableGatewayIdentity(t *testing.T) {
+	realParent := filepath.Join(t.TempDir(), "real")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(realParent, aliasParent); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	realScope, err := localOutboxScope(filepath.Join(realParent, "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasScope, err := localOutboxScope(filepath.Join(aliasParent, "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realScope == "" || realScope != aliasScope {
+		t.Fatalf("canonical local scopes = %q and %q", realScope, aliasScope)
+	}
+	otherScope, err := localOutboxScope(filepath.Join(realParent, "other.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherScope == realScope {
+		t.Fatal("different gateway databases selected the same local outbox scope")
+	}
+	memoryScope, err := localOutboxScope(":memory:")
+	if err != nil || memoryScope != "" {
+		t.Fatalf("memory gateway scope = %q, %v", memoryScope, err)
 	}
 }
 
@@ -420,5 +457,17 @@ func TestFailedOpenRollbackRevokesCallerIssuedBeforeWorker(t *testing.T) {
 	gatewayServer.ModelHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("partially issued caller status = %d, want 401 after rollback", response.Code)
+	}
+}
+
+func TestOpenRejectsPendingOfflineRestoreJournal(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "gateway.db")
+	if err := os.WriteFile(databasePath+".restore-journal.json", []byte("pending"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := Config{}
+	config.Gateway.DatabasePath = databasePath
+	if _, err := Open(context.Background(), config); err == nil || !strings.Contains(err.Error(), "interrupted offline restore") {
+		t.Fatalf("pending restore open error = %v", err)
 	}
 }

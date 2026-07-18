@@ -21,7 +21,9 @@ import (
 	publicgateway "github.com/vibe-agi/human/gateway"
 	"github.com/vibe-agi/human/internal/auth"
 	"github.com/vibe-agi/human/internal/completion"
+	"github.com/vibe-agi/human/internal/ownerlock"
 	"github.com/vibe-agi/human/internal/ratelimit"
+	"github.com/vibe-agi/human/internal/sqlitefile"
 	"github.com/vibe-agi/human/internal/store/sqlite"
 	"github.com/vibe-agi/human/internal/userdata"
 )
@@ -196,12 +198,48 @@ func newTokenCommand(settings *viper.Viper) *cobra.Command {
 	return command
 }
 
-func openDatabase(ctx context.Context, path string) (*sqlite.Store, error) {
+type ownedDatabase struct {
+	*sqlite.Store
+	owner *ownerlock.Lock
+}
+
+func (database *ownedDatabase) Close() error {
+	if database == nil {
+		return nil
+	}
+	// Keep the process-level owner lock until every SQLite operation and handle
+	// has drained. Releasing it first would let another gateway/admin process
+	// start recovery against a database this handle is still closing.
+	storeErr := database.Store.Close()
+	var ownerErr error
+	if database.owner != nil {
+		ownerErr = database.owner.Close()
+	}
+	return errors.Join(storeErr, ownerErr)
+}
+
+func openDatabase(ctx context.Context, path string) (*ownedDatabase, error) {
 	path, err := resolveDatabasePath(path)
 	if err != nil {
 		return nil, err
 	}
-	return sqlite.Open(ctx, path)
+	location, err := sqlitefile.PreparePrivate(path, "gateway administration database")
+	if err != nil {
+		return nil, err
+	}
+	owner, err := ownerlock.Acquire(location, "gateway administration database")
+	if err != nil {
+		if errors.Is(err, ownerlock.ErrInUse) {
+			return nil, errors.New("gateway database is in use; stop the gateway or local runtime before token administration")
+		}
+		return nil, err
+	}
+	store, err := sqlite.Open(ctx, location.OpenDSN())
+	if err != nil {
+		_ = owner.Close()
+		return nil, err
+	}
+	return &ownedDatabase{Store: store, owner: owner}, nil
 }
 
 func resolveDatabasePath(path string) (string, error) {

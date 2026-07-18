@@ -29,7 +29,9 @@ import (
 	"github.com/vibe-agi/human/internal/completion/dialect/responses"
 	completiongateway "github.com/vibe-agi/human/internal/completion/gateway"
 	"github.com/vibe-agi/human/internal/completion/hub"
+	"github.com/vibe-agi/human/internal/ownerlock"
 	"github.com/vibe-agi/human/internal/ratelimit"
+	"github.com/vibe-agi/human/internal/sqlitefile"
 	"github.com/vibe-agi/human/internal/store/sqlite"
 	"github.com/vibe-agi/human/internal/workerproto"
 	"github.com/vibe-agi/human/internal/workerws"
@@ -54,6 +56,9 @@ var (
 	// finite 403 and is distinct from an offline selected worker or router
 	// infrastructure failure.
 	ErrWorkerRouteDenied = errors.New("worker route denied")
+	// ErrDatabaseInUse prevents two gateway runtimes from recovering and serving
+	// the same single-instance SQLite state through independent in-memory hubs.
+	ErrDatabaseInUse = errors.New("gateway database is already held by another running instance")
 )
 
 // PrincipalType identifies which side of the Human Agent protocol a
@@ -381,6 +386,7 @@ func (config Config) withDefaults() (Config, error) {
 // its HTTP server.
 type Server struct {
 	database   *sqlite.Store
+	ownerLock  *ownerlock.Lock
 	model      *completiongateway.Server
 	worker     *workerws.Server
 	handler    http.Handler
@@ -413,7 +419,24 @@ func Open(ctx context.Context, config Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	database, err := sqlite.Open(ctx, databasePath)
+	location, err := sqlitefile.PreparePrivate(databasePath, "gateway database")
+	if err != nil {
+		return nil, err
+	}
+	databaseOwner, err := ownerlock.Acquire(location, "gateway database")
+	if err != nil {
+		if errors.Is(err, ownerlock.ErrInUse) {
+			return nil, fmt.Errorf("%w: %v", ErrDatabaseInUse, err)
+		}
+		return nil, err
+	}
+	releaseOwner := true
+	defer func() {
+		if releaseOwner && databaseOwner != nil {
+			_ = databaseOwner.Close()
+		}
+	}()
+	database, err := sqlite.Open(ctx, location.OpenDSN())
 	if err != nil {
 		return nil, err
 	}
@@ -487,13 +510,15 @@ func Open(ctx context.Context, config Config) (*Server, error) {
 	mux.Handle(WorkerPath, workerServer)
 	mux.Handle("/", modelServer)
 	server := &Server{
-		database: database, model: modelServer, worker: workerServer, handler: mux,
+		database: database, ownerLock: databaseOwner,
+		model: modelServer, worker: workerServer, handler: mux,
 		tokens: tokens, logger: config.Logger, replayTTL: config.ReplayPayloadGrace,
 		sweepEvery: config.RetentionSweepInterval, cancel: cancel,
 	}
 	server.run.Add(1)
 	go server.purgeLoop(runContext)
 	cleanupDatabase = false
+	releaseOwner = false
 	return server, nil
 }
 
@@ -503,8 +528,8 @@ func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 }
 
 // ModelHandler returns the model API handler for mounting in an application
-// router. It serves /healthz, /v1/models, /v1/chat/completions, /v1/messages,
-// and /v1/responses.
+// router. It serves /livez, /readyz, the readiness-compatible /healthz alias,
+// /v1/models, /v1/chat/completions, /v1/messages, and /v1/responses.
 func (server *Server) ModelHandler() http.Handler { return server.model }
 
 // WorkerHandler returns the private worker WebSocket handler. Applications may
@@ -648,6 +673,9 @@ func (server *Server) Close() error {
 		server.model.Wait()
 		server.run.Wait()
 		server.err = server.database.Close()
+		if server.ownerLock != nil {
+			server.err = errors.Join(server.err, server.ownerLock.Close())
+		}
 	})
 	return server.err
 }

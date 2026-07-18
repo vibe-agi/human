@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vibe-agi/human/internal/auth"
@@ -119,8 +120,29 @@ type Server struct {
 	runMu            sync.RWMutex
 	runContext       context.Context
 	runWait          sync.WaitGroup
+	recovered        atomic.Bool
 	responses        responseNotifier
 	logger           *slog.Logger
+}
+
+type healthResponse struct {
+	Status   string         `json:"status"`
+	Database healthDatabase `json:"database"`
+	Recovery healthRecovery `json:"recovery"`
+	Workers  healthWorkers  `json:"workers"`
+}
+
+type healthDatabase struct {
+	Status string `json:"status"`
+}
+
+type healthRecovery struct {
+	Complete bool `json:"complete"`
+}
+
+type healthWorkers struct {
+	Online    int  `json:"online"`
+	HasOnline bool `json:"has_online"`
 }
 
 type auditRun struct {
@@ -164,7 +186,9 @@ func NewServer(
 	}
 	server.audit, _ = store.(storeapi.AuditStore)
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", server.health)
+	mux.HandleFunc("GET /livez", server.live)
+	mux.HandleFunc("GET /readyz", server.ready)
+	mux.HandleFunc("GET /healthz", server.ready)
 	mux.HandleFunc("GET /v1/models", server.models)
 	for route := range codecs {
 		mux.HandleFunc("POST "+route, server.completion(route))
@@ -265,9 +289,44 @@ func (server *Server) completeAudit(
 	}
 }
 
-func (*Server) health(response http.ResponseWriter, _ *http.Request) {
-	response.Header().Set("Content-Type", "application/json")
-	_, _ = response.Write([]byte(`{"status":"ok"}`))
+func (server *Server) live(response http.ResponseWriter, _ *http.Request) {
+	server.writeHealth(response, http.StatusOK, healthResponse{
+		Status:   "ok",
+		Database: healthDatabase{Status: "unchecked"},
+		Recovery: healthRecovery{Complete: server.recovered.Load()},
+		Workers:  server.healthWorkers(),
+	})
+}
+
+func (server *Server) ready(response http.ResponseWriter, request *http.Request) {
+	databaseStatus := "ok"
+	databaseReady := server.store.Ping(request.Context()) == nil
+	if !databaseReady {
+		databaseStatus = "error"
+	}
+	recoveryComplete := server.recovered.Load()
+	status := http.StatusOK
+	statusText := "ok"
+	if !databaseReady || !recoveryComplete {
+		status = http.StatusServiceUnavailable
+		statusText = "not_ready"
+	}
+	server.writeHealth(response, status, healthResponse{
+		Status:   statusText,
+		Database: healthDatabase{Status: databaseStatus},
+		Recovery: healthRecovery{Complete: recoveryComplete},
+		Workers:  server.healthWorkers(),
+	})
+}
+
+func (server *Server) healthWorkers() healthWorkers {
+	snapshot := server.hub.Snapshot()
+	return healthWorkers{Online: snapshot.OnlineWorkers, HasOnline: snapshot.HasWorker}
+}
+
+func (*Server) writeHealth(response http.ResponseWriter, status int, health healthResponse) {
+	response.Header().Set("Cache-Control", "no-store")
+	writeJSON(response, status, health)
 }
 
 func (server *Server) models(response http.ResponseWriter, request *http.Request) {
@@ -1521,6 +1580,7 @@ func (server *Server) Recover(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("recovery context is required")
 	}
+	server.recovered.Store(false)
 	server.runMu.Lock()
 	server.runContext = ctx
 	server.runMu.Unlock()
@@ -1564,6 +1624,7 @@ func (server *Server) Recover(ctx context.Context) error {
 			)
 		}
 	}
+	server.recovered.Store(true)
 	return nil
 }
 

@@ -12,13 +12,15 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Verify distribution terms
         run: test -s LICENSE
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
           cache: true
+      - name: Verify GitHub release tag semantics
+        run: make release-semantics-test
       - name: Verify source and race safety
         run: |
           make fmt-check tidy-check build vet
@@ -31,8 +33,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
           cache: true
@@ -41,16 +43,35 @@ jobs:
           go build ./...
           go test -count=1 -timeout=5m ./...
 
+  real-opencode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install checksum-pinned OpenCode 1.17.18
+        run: |
+          destination="$RUNNER_TEMP/opencode-1.17.18"
+          ./scripts/install-opencode-real-gate.sh "$destination"
+          echo "$destination" >> "$GITHUB_PATH"
+      - name: Verify real OpenCode product gates
+        run: |
+          test "$(opencode --version)" = "1.17.18"
+          make real-opencode-tui-test REAL_COUNT=3
+          make real-opencode-network-test REAL_COUNT=3
+
   release:
-    needs: [verify, portable]
+    needs: [verify, portable, real-opencode]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
           cache: true
@@ -72,7 +93,18 @@ jobs:
           jq -e --arg version "$expected" --arg commit "$COMMIT" \
             '.version == $version and .commit == $commit and .build_date != "unknown"' \
             /tmp/human-version.json
-      - name: Publish immutable tag release
+      # Asset/tag immutability is enforced by the repository's GitHub setting,
+      # not by `gh release create`; this job only verifies and publishes the tag.
+      - name: Publish verified tag release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+        run: |
+          if ! release_flags_output="$(./scripts/github-release-flags.sh "$GITHUB_REF_NAME")"; then
+            exit 1
+          fi
+          release_flags=()
+          while IFS= read -r flag; do
+            release_flags+=("$flag")
+          done <<< "$release_flags_output"
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag --generate-notes "${release_flags[@]}"

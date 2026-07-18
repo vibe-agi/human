@@ -32,13 +32,20 @@ type fakeClient struct {
 	sendErr          error
 	confirmationErr  error
 	confirmationErrs []error
+	identity         workerclient.Identity
 }
 
 func newFakeClient() *fakeClient {
-	return &fakeClient{messages: make(chan workerclient.Message, 4)}
+	return &fakeClient{
+		messages: make(chan workerclient.Message, 4),
+		identity: workerclient.Identity{GatewayID: "scope:test-gateway", WorkerID: "worker"},
+	}
 }
 
 func (client *fakeClient) Messages() <-chan workerclient.Message { return client.messages }
+func (client *fakeClient) WorkerIdentity() (workerclient.Identity, bool) {
+	return client.identity, client.identity.GatewayID != "" && client.identity.WorkerID != ""
+}
 func (client *fakeClient) SendEvent(_ context.Context, _ completion.Assignment, event completion.Event) error {
 	client.events = append(client.events, event)
 	return client.sendErr
@@ -1691,6 +1698,40 @@ func TestChatTierNeverOpensOrReviewsMirror(t *testing.T) {
 	if command != nil || manager.opens != 0 || len(client.events) != 0 ||
 		model.status != "Chat tier has no workspace mirror" {
 		t.Fatalf("Chat mirror state: %+v, opens=%d events=%+v", model, manager.opens, client.events)
+	}
+}
+
+func TestWorkspaceMirrorAbsolutePathIsVisibleInChatAndDetails(t *testing.T) {
+	t.Parallel()
+	manager := newFilesystemMirrorManager(filepath.Join(t.TempDir(), "human workspaces"))
+	assignment := workspaceAssignment(canonical.Request{Messages: []canonical.Message{{
+		Role: canonical.RoleUser, Blocks: []canonical.Block{{Type: canonical.BlockText, Text: "edit the project"}},
+	}}})
+	prepared := prepareMirror(manager, assignment)().(mirrorPrepared)
+	if prepared.err != nil {
+		t.Fatal(prepared.err)
+	}
+	directory := prepared.workspace.Dir()
+	if !filepath.IsAbs(directory) {
+		t.Fatalf("mirror path is not absolute: %q", directory)
+	}
+
+	model := New(newFakeClient(), WithMirrorManager(manager))
+	model.active = &assignment
+	model.mirrors[prepared.namespace] = prepared.workspace
+	model.width, model.height = 240, 30
+	model.prepareChatViewport(220, 18)
+	if view := model.ui.chat.View(); !strings.Contains(view, "LOCAL WORKSPACE") ||
+		!strings.Contains(view, directory) || !strings.Contains(view, "Edit this copy") {
+		t.Fatalf("normal chat does not expose the editable mirror path:\n%s", view)
+	}
+
+	model.detailMode = true
+	model.invalidateChat()
+	model.prepareChatViewport(220, 18)
+	if view := model.ui.chat.View(); !strings.Contains(view, "Human workspace (absolute path; edit this copy):") ||
+		!strings.Contains(view, directory) {
+		t.Fatalf("detail view does not retain the editable mirror path:\n%s", view)
 	}
 }
 

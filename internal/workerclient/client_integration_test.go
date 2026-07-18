@@ -27,6 +27,8 @@ type integrationAuthenticator struct{}
 
 type ownershipIntegrationAuthenticator struct{}
 
+type rotationIntegrationAuthenticator struct{}
+
 func (integrationAuthenticator) AuthenticateRequest(request *http.Request) (auth.Principal, error) {
 	token := strings.TrimSpace(strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer "))
 	if token != "hae_worker_integration" {
@@ -49,6 +51,26 @@ func (ownershipIntegrationAuthenticator) AuthenticateRequest(request *http.Reque
 	}, nil
 }
 
+func (rotationIntegrationAuthenticator) AuthenticateRequest(request *http.Request) (auth.Principal, error) {
+	token := strings.TrimSpace(strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer "))
+	workerID := "worker-rotation"
+	keyID := ""
+	switch token {
+	case "hae_worker_rotation_old":
+		keyID = "key-rotation-old"
+	case "hae_worker_rotation_new":
+		keyID = "key-rotation-new"
+	case "hae_worker_rotation_other":
+		workerID = "worker-other"
+		keyID = "key-rotation-other"
+	default:
+		return auth.Principal{}, auth.ErrUnauthorized
+	}
+	return auth.Principal{
+		Type: auth.PrincipalWorker, SubjectID: workerID, KeyID: keyID,
+	}, nil
+}
+
 func TestWorkerClientServerRoundTrip(t *testing.T) {
 	workerHub := hub.New(2)
 	server, err := workerws.New(workerws.Config{}, integrationAuthenticator{}, workerHub)
@@ -68,6 +90,15 @@ func TestWorkerClientServerRoundTrip(t *testing.T) {
 	waitFor(t, ctx, func() bool {
 		return client.WorkerID() == "worker-integration" && outgoingSequence(client) == 1
 	}, "worker hello and acknowledgement")
+	select {
+	case message := <-client.Messages():
+		if message.IdentityReady == nil || message.IdentityReady.WorkerID != "worker-integration" ||
+			message.IdentityReady.GatewayID == "" {
+			t.Fatalf("first post-Hello message = %+v, want authenticated identity", message)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for authenticated worker identity")
+	}
 
 	reservation, err := workerHub.Reserve("worker-integration")
 	if err != nil {
@@ -83,22 +114,7 @@ func TestWorkerClientServerRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var assignment completion.Assignment
-	select {
-	case message, open := <-client.Messages():
-		if !open {
-			t.Fatal("worker client closed before receiving assignment")
-		}
-		if message.Err != nil {
-			t.Fatalf("worker client error: %v", message.Err)
-		}
-		if message.Assignment == nil {
-			t.Fatal("worker client delivered an empty assignment")
-		}
-		assignment = *message.Assignment
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for assignment")
-	}
+	assignment := receiveClientAssignment(t, ctx, client.Messages())
 	if assignment.TaskID != "task-integration" || assignment.LeaseOwner != "worker-integration" {
 		t.Fatalf("assignment = %+v", assignment)
 	}
@@ -236,7 +252,7 @@ func TestSecondWorkerInstanceWaitsWithoutDisplacingThenRecovers(t *testing.T) {
 	}
 }
 
-func TestWorkerOwnershipViolationStopsReconnectWithoutAcknowledgingOutbox(t *testing.T) {
+func TestAssignmentWorkerMismatchNeverReachesOutboxOrConnection(t *testing.T) {
 	workerHub := hub.New(2)
 	assignment := completion.Assignment{
 		CallerID: "caller-owner", TaskID: "task-owner", IdempotencyKey: "request-owner",
@@ -269,36 +285,23 @@ func TestWorkerOwnershipViolationStopsReconnectWithoutAcknowledgingOutbox(t *tes
 	t.Cleanup(func() { _ = client.Close() })
 	waitFor(t, ctx, func() bool { return client.WorkerID() == "worker-intruder" }, "intruder hello")
 
-	if err := client.SendEvent(ctx, assignment, completion.Event{
+	err = client.SendEvent(ctx, assignment, completion.Event{
 		ID: "cross-worker-event", Type: completion.EventAccepted,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	var terminal error
-	for terminal == nil {
-		select {
-		case message, open := <-client.Messages():
-			if !open {
-				t.Fatal("ownership violation closed without an actionable error")
-			}
-			if errors.Is(message.Err, ErrWorkerOwnershipViolation) {
-				terminal = message.Err
-			}
-		case <-ctx.Done():
-			t.Fatal("ownership violation did not stop the client")
-		}
-	}
-	select {
-	case <-client.done:
-	case <-ctx.Done():
-		t.Fatal("ownership-violating client did not terminate")
+	})
+	if !errors.Is(err, ErrAssignmentWorkerMismatch) {
+		t.Fatalf("cross-worker SendEvent error = %v", err)
 	}
 	time.Sleep(80 * time.Millisecond)
 	if got := attempts.Load(); got != 1 {
-		t.Fatalf("ownership-violating client dial attempts = %d, want one terminal attempt", got)
+		t.Fatalf("local ownership rejection changed connection attempts = %d, want 1", got)
 	}
-	if got := pendingOutboxCount(client); got != 1 {
-		t.Fatalf("ownership violation acknowledged an unauthorized event: pending=%d, want 1", got)
+	if got := pendingOutboxCount(client); got != 0 {
+		t.Fatalf("ownership mismatch reached durable outbox: pending=%d", got)
+	}
+	select {
+	case <-client.done:
+		t.Fatal("local assignment mismatch terminated a healthy client")
+	default:
 	}
 }
 
@@ -1086,9 +1089,9 @@ func TestWorkerClientReplaysTerminalEventAfterACKLoss(t *testing.T) {
 	}
 }
 
-func TestWorkerClientOutboxSurvivesClientProcessReopen(t *testing.T) {
+func TestWorkerClientCredentialRotationReplaysPendingOutbox(t *testing.T) {
 	workerHub := hub.New(2)
-	server, err := workerws.New(workerws.Config{}, integrationAuthenticator{}, workerHub)
+	server, err := workerws.New(workerws.Config{}, rotationIntegrationAuthenticator{}, workerHub)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1097,12 +1100,12 @@ func TestWorkerClientOutboxSurvivesClientProcessReopen(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	outboxPath := filepath.Join(t.TempDir(), "worker-outbox.db")
-	client, err := DialWithOutbox(ctx, websocketURL(httpServer.URL), "hae_worker_integration", outboxPath)
+	client, err := DialWithOutbox(ctx, websocketURL(httpServer.URL), "hae_worker_rotation_old", outboxPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, ctx, func() bool { return client.WorkerID() == "worker-integration" }, "first worker hello")
-	reservation, err := workerHub.Reserve("worker-integration")
+	waitFor(t, ctx, func() bool { return client.WorkerID() == "worker-rotation" }, "old credential worker hello")
+	reservation, err := workerHub.Reserve("worker-rotation")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1135,14 +1138,31 @@ func TestWorkerClientOutboxSurvivesClientProcessReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, ctx, func() bool {
-		reservation, reserveErr := workerHub.Reserve("worker-integration")
+		reservation, reserveErr := workerHub.Reserve("worker-rotation")
 		if reserveErr == nil {
 			reservation.Release()
 		}
 		return errors.Is(reserveErr, hub.ErrNoWorker)
 	}, "first worker process unregister")
 
-	reopened, err := DialWithOutbox(ctx, websocketURL(httpServer.URL), "hae_worker_integration", outboxPath)
+	// The same SQLite file may be reused by an embedding host for several
+	// authenticated workers. A different subject must not see or transmit the
+	// pending event, even though its gateway endpoint is identical.
+	isolated, err := DialWithOutbox(
+		ctx, websocketURL(httpServer.URL), "hae_worker_rotation_other", outboxPath,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, ctx, func() bool { return isolated.WorkerID() == "worker-other" }, "other worker hello")
+	if count := pendingOutboxCount(isolated); count != 0 {
+		t.Fatalf("other authenticated worker pending outbox count = %d, want 0", count)
+	}
+	if err := isolated.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := DialWithOutbox(ctx, websocketURL(httpServer.URL), "hae_worker_rotation_new", outboxPath)
 	if err != nil {
 		t.Fatal(err)
 	}

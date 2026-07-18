@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/vibe-agi/human/internal/completion"
 )
@@ -241,15 +242,25 @@ type RestoreOptions struct {
 }
 
 type Hub struct {
-	mu         sync.Mutex
-	capacity   int
-	reserved   int
-	active     int
-	workers    map[string]*workerState
-	sessions   map[string]*session
-	retired    map[string]terminalReceipt
-	order      []string
-	maxRetired int
+	mu            sync.Mutex
+	capacity      int
+	reserved      int
+	active        int
+	workers       map[string]*workerState
+	onlineWorkers atomic.Int64
+	sessions      map[string]*session
+	retired       map[string]terminalReceipt
+	order         []string
+	maxRetired    int
+}
+
+// Snapshot is the dependency-free worker state exposed by gateway health
+// endpoints. Worker availability is intentionally observational: a gateway
+// with no connected worker remains ready to accept health and administrative
+// traffic even though model admission will report worker_unavailable.
+type Snapshot struct {
+	OnlineWorkers int
+	HasWorker     bool
 }
 
 func New(capacity int) *Hub {
@@ -267,6 +278,12 @@ func New(capacity int) *Hub {
 		retired:    make(map[string]terminalReceipt),
 		maxRetired: maxRetired,
 	}
+}
+
+// Snapshot returns a point-in-time count of authenticated live workers.
+func (hub *Hub) Snapshot() Snapshot {
+	online := int(hub.onlineWorkers.Load())
+	return Snapshot{OnlineWorkers: online, HasWorker: online > 0}
 }
 
 func (hub *Hub) Register(workerID string) (*Worker, error) {
@@ -321,6 +338,8 @@ func (hub *Hub) RegisterInstance(workerID, instanceID string) (*Worker, error) {
 	// this replacement when its deferred cleanup runs.
 	if previous != nil {
 		previous.close()
+	} else {
+		hub.onlineWorkers.Add(1)
 	}
 	return &Worker{ID: workerID, Assignments: state.assignments, hub: hub, state: state}, nil
 }
@@ -712,6 +731,7 @@ func (hub *Hub) unregister(workerID string, registered *workerState) {
 		return
 	}
 	delete(hub.workers, workerID)
+	hub.onlineWorkers.Add(-1)
 	state.close()
 	hub.mu.Unlock()
 }

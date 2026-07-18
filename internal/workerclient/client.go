@@ -42,6 +42,10 @@ var (
 	// retrying the same durable outbox head cannot change that authorization
 	// decision and would only flap the connection.
 	ErrWorkerOwnershipViolation = errors.New("worker event targets another worker's completion")
+	// ErrAssignmentWorkerMismatch means an assignment is leased to a different
+	// authenticated worker subject. Reject it before touching the durable outbox:
+	// assignment JSON is not an authority source and must never cross subjects.
+	ErrAssignmentWorkerMismatch = errors.New("assignment lease owner does not match authenticated worker")
 )
 
 const (
@@ -105,6 +109,7 @@ func (runtime clientRuntimeConfig) withDefaults() clientRuntimeConfig {
 }
 
 type Message struct {
+	IdentityReady      *Identity
 	Assignment         *completion.Assignment
 	EventRejected      *workerproto.EventRejected
 	RejectedEvent      *completion.Event
@@ -115,12 +120,26 @@ type Message struct {
 	Err                error
 }
 
+// Identity is established only by the gateway's authenticated Hello. GatewayID
+// is the canonical endpoint (or the caller-supplied logical gateway scope), and
+// WorkerID is the authenticated principal subject. Neither contains a token.
+type Identity struct {
+	GatewayID string
+	WorkerID  string
+}
+
+// ErrWorkerIdentityUnavailable means the client has not completed a worker
+// hello yet. A durable local intent must wait and retry instead of being
+// converted back into an unsent draft merely because startup began offline.
+var ErrWorkerIdentityUnavailable = errors.New("worker identity is not established")
+
 type Client struct {
 	connection          *websocket.Conn
 	cancel              context.CancelFunc
 	messages            chan Message
 	writeMu             sync.Mutex
 	clientSeq           uint64
+	helloConfirmed      bool
 	serverSeq           atomic.Uint64
 	inflight            map[string]uint64
 	workerMu            sync.RWMutex
@@ -155,11 +174,22 @@ func Dial(ctx context.Context, url, token string) (*Client, error) {
 // connection lifecycle. A transient initial failure (including connection
 // refused, timeout, 429, or 5xx) returns a live Client which reconnects in the
 // background; a malformed endpoint or conclusive handshake/authentication
-// rejection returns an error immediately. The bearer token is never stored;
-// only a SHA-256 namespace derived from the endpoint and token is written so
-// another credential cannot replay events.
+// rejection returns an error immediately. The bearer token is never stored or
+// used as durable identity. After the authenticated gateway hello, pending
+// events are selected by canonical endpoint plus stable worker subject, so a
+// credential rotation for that subject continues the same outbox while another
+// subject cannot replay it.
 func DialWithOutbox(ctx context.Context, url, token, outboxPath string) (*Client, error) {
 	return dialWithOutbox(ctx, url, token, outboxPath, defaultClientRuntimeConfig())
+}
+
+// DialWithOutboxScope is DialWithOutbox with an explicit stable logical
+// gateway identity. It is intended for embedded gateways whose loopback port
+// may change across restarts while the durable gateway database remains the
+// same. The scope is hashed into the outbox namespace and must never be reused
+// for a different gateway correctness domain.
+func DialWithOutboxScope(ctx context.Context, url, token, outboxPath, scope string) (*Client, error) {
+	return dialWithOutboxScope(ctx, url, token, outboxPath, scope, defaultClientRuntimeConfig())
 }
 
 func dialWithOutbox(
@@ -167,6 +197,17 @@ func dialWithOutbox(
 	url string,
 	token string,
 	outboxPath string,
+	runtime clientRuntimeConfig,
+) (*Client, error) {
+	return dialWithOutboxScope(ctx, url, token, outboxPath, "", runtime)
+}
+
+func dialWithOutboxScope(
+	ctx context.Context,
+	url string,
+	token string,
+	outboxPath string,
+	outboxScope string,
 	runtime clientRuntimeConfig,
 ) (*Client, error) {
 	if err := validateWorkerEndpoint(url); err != nil {
@@ -177,7 +218,7 @@ func dialWithOutbox(
 	if err != nil {
 		return nil, fmt.Errorf("create worker instance identity: %w", err)
 	}
-	outbox, err := openDurableOutbox(ctx, outboxPath, url, token)
+	outbox, err := openDurableOutboxWithScope(ctx, outboxPath, url, outboxScope, "")
 	if err != nil {
 		return nil, err
 	}
@@ -258,6 +299,45 @@ func validateWorkerEndpoint(value string) error {
 	return nil
 }
 
+func canonicalWorkerEndpoint(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	parsed, err := neturl.Parse(value)
+	if err != nil {
+		return "", fmt.Errorf("parse worker gateway URL: %w", err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	switch scheme {
+	case "http":
+		scheme = "ws"
+	case "https":
+		scheme = "wss"
+	case "ws", "wss":
+	default:
+		return "", fmt.Errorf("worker gateway URL uses unsupported scheme %q", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return "", errors.New("worker gateway URL requires a host")
+	}
+	if parsed.User != nil || parsed.Fragment != "" {
+		return "", errors.New("worker gateway URL must not contain credentials or a fragment")
+	}
+	hostname := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	port := parsed.Port()
+	if (scheme == "ws" && port == "80") || (scheme == "wss" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		parsed.Host = net.JoinHostPort(hostname, port)
+	} else if strings.Contains(hostname, ":") {
+		parsed.Host = "[" + hostname + "]"
+	} else {
+		parsed.Host = hostname
+	}
+	parsed.Scheme = scheme
+	parsed.RawQuery = parsed.Query().Encode()
+	return parsed.String(), nil
+}
+
 func workerEndpointLoopback(host string) bool {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 	if host == "localhost" {
@@ -275,6 +355,18 @@ func (client *Client) WorkerID() string {
 	client.workerMu.RLock()
 	defer client.workerMu.RUnlock()
 	return client.workerID
+}
+
+// WorkerIdentity reports the authenticated identity only after Hello has bound
+// the durable outbox. It is useful to embedders which construct a TUI after an
+// unusually fast handshake; ordinary startup also receives IdentityReady.
+func (client *Client) WorkerIdentity() (Identity, bool) {
+	client.workerMu.RLock()
+	defer client.workerMu.RUnlock()
+	if client.workerID == "" {
+		return Identity{}, false
+	}
+	return Identity{GatewayID: client.outbox.endpointIdentity, WorkerID: client.workerID}, true
 }
 
 // ConfirmRejectedEvent atomically replaces one durable inbox record with a
@@ -303,7 +395,10 @@ func (client *Client) SendEvent(ctx context.Context, assignment completion.Assig
 	}
 	workerID := client.WorkerID()
 	if workerID == "" {
-		return errors.New("worker identity is not established")
+		return ErrWorkerIdentityUnavailable
+	}
+	if strings.TrimSpace(assignment.LeaseOwner) == "" || assignment.LeaseOwner != workerID {
+		return ErrAssignmentWorkerMismatch
 	}
 	// Keep the durable outbox payload bound to the server-issued identity for
 	// every event type. gateway still overwrites this field from authentication;
@@ -362,6 +457,11 @@ func (client *Client) run(ctx context.Context, connection *websocket.Conn) {
 				return
 			}
 			instanceConflict := isWorkerInstanceConflict(err)
+			if errors.Is(err, errOutboxIdentityConflict) {
+				client.deliver(ctx, Message{Err: fmt.Errorf("worker identity changed for the durable outbox: %w", err)})
+				client.cancel()
+				return
+			}
 			if isWorkerOwnershipViolation(err) {
 				client.deliver(ctx, Message{Err: fmt.Errorf("%w: %v", ErrWorkerOwnershipViolation, err)})
 				client.cancel()
@@ -373,6 +473,7 @@ func (client *Client) run(ctx context.Context, connection *websocket.Conn) {
 			client.writeMu.Lock()
 			if client.connection == connection {
 				client.connection = nil
+				client.helloConfirmed = false
 				client.inflight = make(map[string]uint64)
 			}
 			client.writeMu.Unlock()
@@ -421,6 +522,7 @@ func (client *Client) run(ctx context.Context, connection *websocket.Conn) {
 			}
 			client.connection = candidate
 			client.clientSeq = 0
+			client.helloConfirmed = false
 			client.serverSeq.Store(0)
 			client.inflight = make(map[string]uint64)
 			client.writeMu.Unlock()
@@ -583,14 +685,31 @@ func (client *Client) readConnection(ctx context.Context, connection *websocket.
 			if err := json.Unmarshal(envelope.Payload, &hello); err != nil {
 				return err
 			}
+			if err := client.outbox.bindWorker(hello.WorkerID); err != nil {
+				return err
+			}
 			client.workerMu.Lock()
 			client.workerID = hello.WorkerID
 			client.workerMu.Unlock()
+			client.writeMu.Lock()
+			if client.connection != connection {
+				client.writeMu.Unlock()
+				return errors.New("worker hello arrived on a stale connection")
+			}
+			client.helloConfirmed = true
+			client.writeMu.Unlock()
+			// This correctness-bearing notification is delivered synchronously
+			// before reading any later Assignment frame. The TUI can therefore bind
+			// and load worker state without ever exposing another subject's drafts.
+			client.deliver(ctx, Message{IdentityReady: &Identity{
+				GatewayID: client.outbox.endpointIdentity,
+				WorkerID:  hello.WorkerID,
+			}})
+			client.signalRejectedReplay(true)
+			client.signalFlush()
 			if restoredPending {
 				restoredPending = false
 				client.deliver(ctx, Message{ConnectionRestored: true})
-				client.signalRejectedReplay(true)
-				client.signalFlush()
 			}
 		case workerproto.MessageAssignment:
 			var assignment completion.Assignment
@@ -708,6 +827,9 @@ func (client *Client) flushLoop(ctx context.Context) {
 }
 
 func (client *Client) flush(ctx context.Context) error {
+	if !client.outbox.isBound() {
+		return errWorkerConnectionUnavailable
+	}
 	records, err := client.outbox.List(ctx)
 	if err != nil {
 		return err
@@ -750,6 +872,9 @@ func (client *Client) rejectedLoop(ctx context.Context) {
 		if currentGeneration != generation {
 			generation = currentGeneration
 			offeredEventID = ""
+		}
+		if !client.outbox.isBound() {
+			continue
 		}
 		record, found, err := client.outbox.OldestRejected(ctx)
 		if err != nil {
@@ -794,7 +919,7 @@ func (client *Client) sendOutboxRecord(ctx context.Context, record outboxRecord)
 	if _, sent := client.inflight[record.EventID]; sent {
 		return nil
 	}
-	if client.connection == nil {
+	if client.connection == nil || !client.helloConfirmed {
 		return errWorkerConnectionUnavailable
 	}
 	connection := client.connection
@@ -832,7 +957,7 @@ func (client *Client) signalRejectedReplay(replayAll bool) {
 }
 
 func (client *Client) deliver(ctx context.Context, message Message) {
-	if message.Assignment != nil || message.EventRejected != nil || message.OutboxQuarantine != nil {
+	if message.IdentityReady != nil || message.Assignment != nil || message.EventRejected != nil || message.OutboxQuarantine != nil {
 		// Assignments and per-event rejections are correctness-bearing: losing
 		// either leaves work leased to this worker or leaves the UI operating on
 		// a session the gateway has already closed. Apply backpressure instead of

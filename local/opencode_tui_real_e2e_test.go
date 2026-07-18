@@ -166,12 +166,14 @@ func TestRealOpenCodeTUIWorkspaceLoop(t *testing.T) {
 	probe.waitContains(t, runContext, "first streamed Human reply")
 	_, beforeFirstReply := probe.snapshot()
 	writeTUIInput(t, inputWriter, "\r")
-	probe.waitAfterContains(t, runContext, beforeFirstReply, "stream open")
+	probe.waitAfterAll(t, runContext, beforeFirstReply,
+		"Message the client Agent", "stream open · continue replying")
 	writeTUIInput(t, inputWriter, "second streamed Human reply")
 	probe.waitContains(t, runContext, "second streamed Human reply")
 	_, beforeSecondReply := probe.snapshot()
 	writeTUIInput(t, inputWriter, "\r")
-	probe.waitAfterContains(t, runContext, beforeSecondReply, "stream open")
+	probe.waitAfterAll(t, runContext, beforeSecondReply,
+		"Message the client Agent", "stream open · continue replying")
 
 	// Reply -> Command, then hydrate the caller file through OpenCode's real read
 	// tool. This closes one model response and auto-accepts its continuation.
@@ -387,6 +389,23 @@ func (probe *tuiViewProbe) waitAfterAny(
 		}
 		return false
 	}, strings.Join(values, " or "))
+}
+
+func (probe *tuiViewProbe) waitAfterAll(
+	t *testing.T,
+	ctx context.Context,
+	revision uint64,
+	values ...string,
+) {
+	t.Helper()
+	probe.waitAfter(t, ctx, revision, func(content string) bool {
+		for _, value := range values {
+			if !strings.Contains(content, value) {
+				return false
+			}
+		}
+		return true
+	}, strings.Join(values, " and "))
 }
 
 func (probe *tuiViewProbe) wait(t *testing.T, ctx context.Context, ready func(string) bool, want string) {

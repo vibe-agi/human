@@ -31,6 +31,34 @@ func TestPublicGatewayRequiresExplicitDatabaseIdentity(t *testing.T) {
 	}
 }
 
+func TestPublicGatewayRejectsSecondRuntimeForSameDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	config := DefaultConfig()
+	config.DatabasePath = path
+	first, err := Open(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := Open(context.Background(), config)
+	if second != nil {
+		_ = second.Close()
+		t.Fatal("second gateway runtime opened the same database")
+	}
+	if !errors.Is(err, ErrDatabaseInUse) || !strings.Contains(err.Error(), ".owner.lock") {
+		t.Fatalf("second gateway error = %v, want explicit database ownership conflict", err)
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), config)
+	if err != nil {
+		t.Fatalf("reopen after owner Close: %v", err)
+	}
+	defer reopened.Close()
+}
+
 func TestCustomCookieAuthenticationAndPrincipalBoundaries(t *testing.T) {
 	t.Parallel()
 	config := DefaultConfig()

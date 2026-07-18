@@ -59,34 +59,38 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 	}
 	flags := command.Flags()
 	flags.String("listen", "127.0.0.1:19080", "loopback model API listen address")
-	flags.String("db", automaticPrivatePath, "embedded SQLite database; auto uses OS user data isolated by workspace")
-	flags.String("mirror-root", "~/mirror", "worker-local workspace mirror root")
 	flags.Bool("workspace-auto-send", false, "send clean mirror changes after live detection and fresh review")
-	flags.String("outbox", automaticPrivatePath, "private SQLite outbox; auto uses OS user data isolated by workspace")
-	flags.String("state-db", automaticPrivatePath, "private SQLite TUI recovery state; auto uses OS user data, empty disables persistence")
-	flags.String("caller-subject", "local-caller", "stable local caller identity")
-	flags.String("worker-subject", "local-worker", "stable local worker identity")
 	flags.Int("queue-capacity", 32, "maximum admitted and active requests")
 	flags.Duration("stream-write-timeout", 10*time.Second, "maximum time for one SSE write and flush")
 	flags.Duration("max-pending", 10*time.Minute, "maximum time waiting for a Human response")
 	flags.Duration("shutdown-timeout", 10*time.Second, "graceful local shutdown timeout")
 	flags.Bool("reset-credentials", false, "rotate the persisted local caller and worker credentials")
-	command.PersistentFlags().String("workspace", ".", "workspace used to isolate local private state; nearest Git root is selected")
-	command.PersistentFlags().String("credentials", automaticPrivatePath, "mode-0600 credential file; auto uses OS user data isolated by workspace")
+	persistent := command.PersistentFlags()
+	persistent.String("workspace", ".", "workspace used to isolate local private state; nearest Git root is selected")
+	persistent.String("db", automaticPrivatePath, "embedded SQLite database; auto uses OS user data isolated by workspace")
+	persistent.String("credentials", automaticPrivatePath, "mode-0600 credential file; auto uses OS user data isolated by workspace")
+	persistent.String("mirror-root", "~/mirror", "worker-local workspace mirror root")
+	persistent.String("outbox", automaticPrivatePath, "private SQLite outbox; auto uses OS user data isolated by workspace")
+	persistent.String("state-db", automaticPrivatePath, "private SQLite TUI recovery state; auto uses OS user data, empty disables persistence")
+	persistent.String("caller-subject", "local-caller", "stable local caller identity")
+	persistent.String("worker-subject", "local-worker", "stable local worker identity")
 
 	for key, name := range map[string]string{
-		"local.listen": "listen", "local.db": "db", "local.mirror_root": "mirror-root",
-		"local.workspace_auto_send": "workspace-auto-send", "local.outbox": "outbox",
-		"local.state_db": "state-db", "local.caller_subject": "caller-subject",
-		"local.worker_subject": "worker-subject", "local.queue_capacity": "queue-capacity",
+		"local.listen": "listen", "local.workspace_auto_send": "workspace-auto-send",
+		"local.queue_capacity":       "queue-capacity",
 		"local.stream_write_timeout": "stream-write-timeout",
 		"local.max_pending":          "max-pending", "local.shutdown_timeout": "shutdown-timeout",
 		"local.reset_credentials": "reset-credentials",
 	} {
 		mustBind(settings, key, flags.Lookup(name))
 	}
-	mustBind(settings, "local.credentials", command.PersistentFlags().Lookup("credentials"))
-	mustBind(settings, "local.workspace", command.PersistentFlags().Lookup("workspace"))
+	for key, name := range map[string]string{
+		"local.workspace": "workspace", "local.db": "db", "local.credentials": "credentials",
+		"local.mirror_root": "mirror-root", "local.outbox": "outbox", "local.state_db": "state-db",
+		"local.caller_subject": "caller-subject", "local.worker_subject": "worker-subject",
+	} {
+		mustBind(settings, key, persistent.Lookup(name))
+	}
 	credentialsCommand := &cobra.Command{
 		Use: "credentials", Short: "print the local caller credential as JSON",
 		RunE: func(command *cobra.Command, _ []string) error {
@@ -121,6 +125,9 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 	}
 	credentialsCommand.Flags().Bool("token-only", false, "print only the caller token for shell command substitution")
 	command.AddCommand(credentialsCommand)
+	command.AddCommand(newLocalBackupCommand(settings))
+	command.AddCommand(newLocalVerifyBackupCommand())
+	command.AddCommand(newLocalRestoreCommand(settings))
 	return command
 }
 
@@ -133,6 +140,9 @@ func runLocal(ctx context.Context, output io.Writer, settings *viper.Viper) erro
 		settings.GetString("local.db"), "local database", "local", workspaceRoot, "gateway.db",
 	)
 	if err != nil {
+		return err
+	}
+	if err := rejectPendingLocalRestore(databasePath); err != nil {
 		return err
 	}
 	credentialPath, err := resolveWorkspaceDataPath(

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	publicgateway "github.com/vibe-agi/human/gateway"
 	"github.com/vibe-agi/human/internal/auth"
 	"github.com/vibe-agi/human/internal/store/sqlite"
 	"github.com/vibe-agi/human/internal/userdata"
@@ -63,6 +64,20 @@ func TestTokenIssueAndRevoke(t *testing.T) {
 	defer database.Close()
 	if _, err := auth.NewService(database).Authenticate(context.Background(), issued["token"]); !errors.Is(err, auth.ErrUnauthorized) {
 		t.Fatalf("revoked token error = %v", err)
+	}
+}
+
+func TestTokenAdministrationRefusesLiveGatewayOwner(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "human.db")
+	config := publicgateway.DefaultConfig()
+	config.DatabasePath = databasePath
+	server, err := publicgateway.Open(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	if _, err := execute(t, "--db", databasePath, "token", "issue", "--type", "caller", "--subject", "owner-test"); err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Fatalf("token administration while gateway is live = %v", err)
 	}
 }
 

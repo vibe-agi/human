@@ -13,9 +13,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vibe-agi/human/internal/completion"
+	"github.com/vibe-agi/human/internal/ownerlock"
 	"github.com/vibe-agi/human/internal/sqlitefile"
 	"github.com/vibe-agi/human/internal/workerproto"
 	_ "modernc.org/sqlite"
@@ -24,6 +27,7 @@ import (
 var (
 	errUnsupportedOutboxSchema = errors.New("unsupported worker outbox schema; recreate outbox database")
 	errOutboxConflict          = errors.New("worker outbox event id conflicts with a different payload")
+	errOutboxIdentityConflict  = errors.New("worker outbox is bound to a different authenticated worker identity")
 	errRejectedConflict        = errors.New("worker rejected event id conflicts with different durable content")
 	errRejectedUnknown         = errors.New("worker rejected event is not durable locally")
 	errRejectedNotSent         = errors.New("worker rejected event was not sent on this connection")
@@ -41,8 +45,8 @@ var (
 )
 
 const (
-	outboxSchemaVersion     = 2
-	outboxSchemaFingerprint = "human-worker-outbox-v2-20260717"
+	outboxSchemaVersion     = 3
+	outboxSchemaFingerprint = "human-worker-outbox-v3-20260718"
 )
 
 type outboxRecord struct {
@@ -82,17 +86,32 @@ type rawOutboxRecord struct {
 }
 
 type durableOutbox struct {
-	db        *sql.DB
-	namespace string
-	path      string
+	db               *sql.DB
+	endpointIdentity string
+	bindMu           sync.Mutex
+	workerID         string
+	namespace        atomic.Pointer[string]
+	path             string
+	owner            *ownerlock.Lock
 }
 
-func openDurableOutbox(ctx context.Context, path, endpoint, token string) (*durableOutbox, error) {
+// openDurableOutbox opens the shared worker database. workerID may be empty
+// until the gateway's authenticated hello arrives. A non-empty value is used
+// by focused store tests and is bound through the same validation path.
+func openDurableOutbox(ctx context.Context, path, endpoint, workerID string) (*durableOutbox, error) {
+	return openDurableOutboxWithScope(ctx, path, endpoint, "", workerID)
+}
+
+func openDurableOutboxWithScope(
+	ctx context.Context,
+	path, endpoint, scope, workerID string,
+) (*durableOutbox, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("worker outbox path is required")
 	}
-	if strings.TrimSpace(endpoint) == "" || strings.TrimSpace(token) == "" {
-		return nil, errors.New("worker outbox endpoint and token are required")
+	endpointIdentity, err := GatewayIdentity(endpoint, scope)
+	if err != nil {
+		return nil, err
 	}
 	if path != ":memory:" {
 		absolute, err := filepath.Abs(path)
@@ -122,6 +141,16 @@ func openDurableOutbox(ctx context.Context, path, endpoint, token string) (*dura
 	if err != nil {
 		return nil, err
 	}
+	owner, err := ownerlock.Acquire(location, "worker outbox database")
+	if err != nil {
+		return nil, err
+	}
+	releaseOwner := true
+	defer func() {
+		if releaseOwner && owner != nil {
+			_ = owner.Close()
+		}
+	}()
 
 	database, err := sql.Open("sqlite", location.OpenDSN())
 	if err != nil {
@@ -151,7 +180,7 @@ func openDurableOutbox(ctx context.Context, path, endpoint, token string) (*dura
 		  fingerprint TEXT NOT NULL
 		);
 		INSERT INTO worker_outbox_schema (component, version, fingerprint)
-		VALUES ('outbox', 2, 'human-worker-outbox-v2-20260717')
+			VALUES ('outbox', 3, 'human-worker-outbox-v3-20260718')
 		ON CONFLICT(component) DO NOTHING;
 		CREATE TABLE IF NOT EXISTS worker_outbox (
 		  namespace TEXT NOT NULL,
@@ -203,8 +232,80 @@ func openDurableOutbox(ctx context.Context, path, endpoint, token string) (*dura
 		database.Close()
 		return nil, fmt.Errorf("initialize worker outbox: %w", err)
 	}
-	sum := sha256.Sum256([]byte(endpoint + "\x00" + token))
-	return &durableOutbox{db: database, namespace: hex.EncodeToString(sum[:]), path: path}, nil
+	outbox := &durableOutbox{db: database, endpointIdentity: endpointIdentity, path: path, owner: owner}
+	if strings.TrimSpace(workerID) != "" {
+		if err := outbox.bindWorker(workerID); err != nil {
+			_ = database.Close()
+			return nil, err
+		}
+	}
+	releaseOwner = false
+	return outbox, nil
+}
+
+// GatewayIdentity returns the token-free correctness identity shared by the
+// worker outbox and TUI state. A logical scope is appropriate for an embedded
+// gateway whose listener changes; otherwise the canonical worker endpoint is
+// used. Callers must never reuse a logical scope for another gateway database.
+func GatewayIdentity(endpoint, logicalScope string) (string, error) {
+	if logicalScope = strings.TrimSpace(logicalScope); logicalScope != "" {
+		if len(logicalScope) > 1024 {
+			return "", errors.New("worker gateway scope exceeds 1024 bytes")
+		}
+		sum := sha256.Sum256([]byte(logicalScope))
+		return "scope:" + hex.EncodeToString(sum[:]), nil
+	}
+	return canonicalWorkerEndpoint(endpoint)
+}
+
+func outboxNamespaceForIdentity(gatewayID, workerID string) (string, error) {
+	gatewayID = strings.TrimSpace(gatewayID)
+	workerID = strings.TrimSpace(workerID)
+	if gatewayID == "" || !completion.IsStableKey(workerID) {
+		return "", errors.New("outbox identity requires gateway identity and stable worker subject")
+	}
+	sum := sha256.Sum256([]byte(gatewayID + "\x00" + workerID))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// bindWorker selects the only namespace this process may access. The worker
+// identity comes from the gateway's authenticated hello, never from the token
+// text or caller configuration. Consequently credential rotation preserves
+// pending events for the same worker, while another gateway endpoint or worker
+// subject receives a disjoint namespace in the same SQLite file.
+func (outbox *durableOutbox) bindWorker(workerID string) error {
+	workerID = strings.TrimSpace(workerID)
+	if !completion.IsStableKey(workerID) {
+		return errors.New("authenticated worker identity must be a stable key")
+	}
+	namespace, err := outboxNamespaceForIdentity(outbox.endpointIdentity, workerID)
+	if err != nil {
+		return err
+	}
+	outbox.bindMu.Lock()
+	defer outbox.bindMu.Unlock()
+	boundNamespace := outbox.namespace.Load()
+	if boundNamespace != nil && (*boundNamespace != namespace || outbox.workerID != workerID) {
+		return errOutboxIdentityConflict
+	}
+	outbox.workerID = workerID
+	outbox.namespace.Store(&namespace)
+	return nil
+}
+
+func (outbox *durableOutbox) isBound() bool {
+	return outbox != nil && outbox.namespace.Load() != nil
+}
+
+func (outbox *durableOutbox) namespaceValue() string {
+	if outbox == nil {
+		return ""
+	}
+	namespace := outbox.namespace.Load()
+	if namespace == nil {
+		return ""
+	}
+	return *namespace
 }
 
 func requireCurrentOrEmptyOutboxSchema(ctx context.Context, database *sql.DB) error {
@@ -275,7 +376,7 @@ func (outbox *durableOutbox) Put(
 	err = tx.QueryRowContext(ctx, `
 		SELECT task_id, assignment, payload
 		FROM worker_outbox
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, event.ID).
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), event.ID).
 		Scan(&storedTask, &storedAssignment, &storedPayload)
 	switch {
 	case err == nil:
@@ -294,7 +395,7 @@ func (outbox *durableOutbox) Put(
 	err = tx.QueryRowContext(ctx, `
 		SELECT 1
 		FROM worker_outbox_quarantine
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, event.ID).Scan(&quarantined)
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), event.ID).Scan(&quarantined)
 	switch {
 	case err == nil:
 		return outboxRecord{}, ErrEventQuarantined
@@ -304,7 +405,7 @@ func (outbox *durableOutbox) Put(
 	err = tx.QueryRowContext(ctx, `
 			SELECT task_id, assignment, payload
 		FROM worker_rejected_inbox
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, event.ID).
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), event.ID).
 		Scan(&storedTask, &storedAssignment, &storedPayload)
 	switch {
 	case err == nil:
@@ -327,7 +428,7 @@ func (outbox *durableOutbox) Put(
 	err = tx.QueryRowContext(ctx, `
 		SELECT event_digest, assignment_digest
 		FROM worker_rejected_confirmed
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, event.ID).
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), event.ID).
 		Scan(&confirmedEventDigest, &confirmedAssignmentDigest)
 	switch {
 	case err == nil:
@@ -344,7 +445,7 @@ func (outbox *durableOutbox) Put(
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO worker_outbox (namespace, event_id, task_id, assignment, payload, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)`, outbox.namespace, event.ID, assignment.TaskID,
+		VALUES (?, ?, ?, ?, ?, ?)`, outbox.namespaceValue(), event.ID, assignment.TaskID,
 		assignmentPayload, payload, record.CreatedAt.UnixNano()); err != nil {
 		return outboxRecord{}, fmt.Errorf("persist worker outbox event: %w", err)
 	}
@@ -371,7 +472,7 @@ func (outbox *durableOutbox) List(ctx context.Context) ([]outboxRecord, error) {
 			SELECT event_id, task_id, assignment, payload, created_at
 		FROM worker_outbox
 		WHERE namespace = ?
-		ORDER BY created_at, event_id`, outbox.namespace)
+		ORDER BY created_at, event_id`, outbox.namespaceValue())
 	if err != nil {
 		return nil, fmt.Errorf("list worker outbox events: %w", err)
 	}
@@ -429,14 +530,14 @@ func (outbox *durableOutbox) quarantine(
 		  namespace, event_id, task_id, assignment, payload,
 		  created_at, quarantined_at, reason
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		outbox.namespace, record.eventID, record.taskID, record.assignment, record.payload,
+		outbox.namespaceValue(), record.eventID, record.taskID, record.assignment, record.payload,
 		record.createdAt, time.Now().UTC().UnixNano(), decodeErr.Error(),
 	); err != nil {
 		return fmt.Errorf("preserve corrupt worker outbox event %q: %w", record.eventID, err)
 	}
 	result, err := tx.ExecContext(ctx, `
 		DELETE FROM worker_outbox
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, record.eventID)
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), record.eventID)
 	if err != nil {
 		return fmt.Errorf("isolate corrupt worker outbox event %q: %w", record.eventID, err)
 	}
@@ -459,7 +560,7 @@ func (outbox *durableOutbox) QuarantineSummary(ctx context.Context) (OutboxQuara
 	if err := outbox.db.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM worker_outbox_quarantine
-		WHERE namespace = ?`, outbox.namespace).Scan(&summary.Count); err != nil {
+		WHERE namespace = ?`, outbox.namespaceValue()).Scan(&summary.Count); err != nil {
 		return OutboxQuarantine{}, fmt.Errorf("count quarantined worker outbox events: %w", err)
 	}
 	if summary.Count == 0 {
@@ -470,7 +571,7 @@ func (outbox *durableOutbox) QuarantineSummary(ctx context.Context) (OutboxQuara
 		FROM worker_outbox_quarantine
 		WHERE namespace = ?
 		ORDER BY quarantined_at, event_id
-		LIMIT 8`, outbox.namespace)
+		LIMIT 8`, outbox.namespaceValue())
 	if err != nil {
 		return OutboxQuarantine{}, fmt.Errorf("list quarantined worker outbox events: %w", err)
 	}
@@ -500,7 +601,7 @@ func (outbox *durableOutbox) Lookup(ctx context.Context, eventID string) (outbox
 	err := outbox.db.QueryRowContext(ctx, `
 		SELECT event_id, task_id, assignment, payload, created_at
 		FROM worker_outbox
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, eventID).
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), eventID).
 		Scan(&record.EventID, &record.TaskID, &assignment, &payload, &createdAt)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -603,7 +704,7 @@ func (outbox *durableOutbox) RejectAndAcknowledge(
 	err = tx.QueryRowContext(ctx, `
 		SELECT event_digest, assignment_digest, rejection_digest
 		FROM worker_rejected_confirmed
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, rejection.EventID).
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), rejection.EventID).
 		Scan(&confirmedEventDigest, &confirmedAssignmentDigest, &confirmedRejectionDigest)
 	switch {
 	case err == nil:
@@ -692,7 +793,7 @@ func (outbox *durableOutbox) RejectAndAcknowledge(
 			INSERT INTO worker_rejected_inbox (
 			  namespace, event_id, task_id, assignment, payload, rejection, created_at, rejected_at
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		outbox.namespace, original.EventID, original.TaskID, assignmentPayload, payload, rejectionPayload,
+		outbox.namespaceValue(), original.EventID, original.TaskID, assignmentPayload, payload, rejectionPayload,
 		original.CreatedAt.UnixNano(), rejectedAt.UnixNano(),
 	)
 	if err != nil {
@@ -725,7 +826,7 @@ func (outbox *durableOutbox) ListRejected(ctx context.Context) ([]rejectedRecord
 		SELECT inbox_seq, event_id, task_id, assignment, payload, rejection, created_at, rejected_at
 		FROM worker_rejected_inbox
 		WHERE namespace = ?
-		ORDER BY inbox_seq`, outbox.namespace)
+		ORDER BY inbox_seq`, outbox.namespaceValue())
 	if err != nil {
 		return nil, fmt.Errorf("list rejected worker events: %w", err)
 	}
@@ -756,7 +857,7 @@ func (outbox *durableOutbox) OldestRejected(
 		FROM worker_rejected_inbox
 		WHERE namespace = ?
 		ORDER BY inbox_seq
-		LIMIT 1`, outbox.namespace)
+		LIMIT 1`, outbox.namespaceValue())
 	record, err := scanRejectedRecord(row)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -805,7 +906,7 @@ func (outbox *durableOutbox) DeleteRejected(ctx context.Context, eventID string)
 	if _, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO worker_rejected_confirmed (
 		  namespace, event_id, event_digest, assignment_digest, rejection_digest, confirmed_at
-		) VALUES (?, ?, ?, ?, ?, ?)`, outbox.namespace, eventID, eventDigest,
+		) VALUES (?, ?, ?, ?, ?, ?)`, outbox.namespaceValue(), eventID, eventDigest,
 		assignmentDigest, rejectionDigest, time.Now().UTC().UnixNano()); err != nil {
 		return fmt.Errorf("persist confirmed worker rejection tombstone: %w", err)
 	}
@@ -815,7 +916,7 @@ func (outbox *durableOutbox) DeleteRejected(ctx context.Context, eventID string)
 	if err := tx.QueryRowContext(ctx, `
 		SELECT event_digest, assignment_digest, rejection_digest
 		FROM worker_rejected_confirmed
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, eventID).
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), eventID).
 		Scan(&storedEventDigest, &storedAssignmentDigest, &storedRejectionDigest); err != nil {
 		return fmt.Errorf("verify confirmed worker rejection tombstone: %w", err)
 	}
@@ -825,7 +926,7 @@ func (outbox *durableOutbox) DeleteRejected(ctx context.Context, eventID string)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM worker_rejected_inbox
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, eventID); err != nil {
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), eventID); err != nil {
 		return fmt.Errorf("delete confirmed worker rejection: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -846,7 +947,7 @@ func (outbox *durableOutbox) lookupOutboxTx(
 	err := tx.QueryRowContext(ctx, `
 		SELECT event_id, task_id, assignment, payload, created_at
 		FROM worker_outbox
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, eventID).
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), eventID).
 		Scan(&record.EventID, &record.TaskID, &assignment, &payload, &createdAt)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -868,7 +969,7 @@ func (outbox *durableOutbox) lookupRejectedTx(
 	row := tx.QueryRowContext(ctx, `
 		SELECT inbox_seq, event_id, task_id, assignment, payload, rejection, created_at, rejected_at
 		FROM worker_rejected_inbox
-		WHERE namespace = ? AND event_id = ?`, outbox.namespace, eventID)
+		WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), eventID)
 	record, err := scanRejectedRecord(row)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -949,13 +1050,91 @@ func (outbox *durableOutbox) deleteOutboxRows(ctx context.Context, tx *sql.Tx, e
 	for _, eventID := range eventIDs {
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM worker_outbox
-			WHERE namespace = ? AND event_id = ?`, outbox.namespace, eventID); err != nil {
+			WHERE namespace = ? AND event_id = ?`, outbox.namespaceValue(), eventID); err != nil {
 			return fmt.Errorf("delete acknowledged worker outbox event: %w", err)
 		}
 	}
 	return nil
 }
 
+// RebindOutboxIdentity validates and rewrites one offline outbox restored into
+// a different logical gateway location. It acquires the normal owner lock and
+// rejects mixed-identity archives; callers should invoke it on staging files
+// before atomically replacing live data.
+func RebindOutboxIdentity(ctx context.Context, path, oldGatewayID, newGatewayID, workerID string) error {
+	if ctx == nil {
+		return errors.New("rebind worker outbox: context is required")
+	}
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("inspect worker outbox for identity rebind: %w", err)
+	}
+	oldNamespace, err := outboxNamespaceForIdentity(oldGatewayID, workerID)
+	if err != nil {
+		return fmt.Errorf("validate old worker outbox identity: %w", err)
+	}
+	newNamespace, err := outboxNamespaceForIdentity(newGatewayID, workerID)
+	if err != nil {
+		return fmt.Errorf("validate new worker outbox identity: %w", err)
+	}
+	outbox, err := openDurableOutboxWithScope(
+		ctx, path, "ws://127.0.0.1/internal/v1/worker/ws", "offline-outbox-identity-inspection", "",
+	)
+	if err != nil {
+		return err
+	}
+	defer outbox.Close()
+	tx, err := outbox.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin worker outbox identity rebind: %w", err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
+		SELECT namespace FROM worker_outbox
+		UNION SELECT namespace FROM worker_outbox_quarantine
+		UNION SELECT namespace FROM worker_rejected_inbox
+		UNION SELECT namespace FROM worker_rejected_confirmed`)
+	if err != nil {
+		return fmt.Errorf("inspect worker outbox identities: %w", err)
+	}
+	for rows.Next() {
+		var namespace string
+		if err := rows.Scan(&namespace); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan worker outbox identity: %w", err)
+		}
+		if namespace != oldNamespace {
+			_ = rows.Close()
+			return errors.New("worker outbox contains correctness rows for another gateway or worker identity")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate worker outbox identities: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close worker outbox identity rows: %w", err)
+	}
+	if oldNamespace != newNamespace {
+		for _, table := range []string{
+			"worker_outbox", "worker_outbox_quarantine", "worker_rejected_inbox", "worker_rejected_confirmed",
+		} {
+			if _, err := tx.ExecContext(ctx,
+				"UPDATE "+table+" SET namespace = ? WHERE namespace = ?",
+				newNamespace, oldNamespace,
+			); err != nil {
+				return fmt.Errorf("rebind %s identity: %w", table, err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit worker outbox identity rebind: %w", err)
+	}
+	return nil
+}
+
 func (outbox *durableOutbox) Close() error {
-	return outbox.db.Close()
+	if outbox == nil {
+		return nil
+	}
+	return errors.Join(outbox.db.Close(), outbox.owner.Close())
 }

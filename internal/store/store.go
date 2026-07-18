@@ -281,6 +281,7 @@ type TokenStore interface {
 // CompletionStore is the durable correctness boundary for completion mode.
 type CompletionStore interface {
 	WorkerEventReceiptStore
+	Ping(context.Context) error
 	LookupRequest(context.Context, RequestKey, string) (BeginRequestResult, error)
 	BeginRequest(context.Context, BeginRequestInput) (BeginRequestResult, error)
 	BeginResponse(context.Context, RequestKey) (Request, error)

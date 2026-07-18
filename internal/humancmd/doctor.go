@@ -21,7 +21,7 @@ import (
 	"github.com/vibe-agi/human/internal/userdata"
 )
 
-const defaultDoctorHealthURL = "http://127.0.0.1:19080/healthz"
+const defaultDoctorHealthURL = "http://127.0.0.1:19080/readyz"
 
 type doctorStatus string
 
@@ -61,8 +61,13 @@ type doctorOpenCodeResult struct {
 }
 
 type doctorHealthResult struct {
-	Running bool
-	Err     error
+	Running          bool
+	Observed         bool
+	DatabaseStatus   string
+	RecoveryComplete bool
+	OnlineWorkers    int
+	HasOnlineWorker  bool
+	Err              error
 }
 
 type boundedDoctorOutput struct {
@@ -133,7 +138,7 @@ func newDoctorCommandWithDependencies(dependencies doctorDependencies) *cobra.Co
 		},
 	}
 	command.Flags().StringVar(&workspace, "workspace", ".", "workspace to diagnose; the nearest Git root is selected")
-	command.Flags().StringVar(&healthURL, "health-url", defaultDoctorHealthURL, "Human gateway health endpoint")
+	command.Flags().StringVar(&healthURL, "health-url", defaultDoctorHealthURL, "Human gateway readiness endpoint")
 	command.Flags().BoolVar(&requireOpenCode, "require-opencode", false, "fail unless the exact supported OpenCode Workspace adapter is installed")
 	command.Flags().BoolVar(&outputJSON, "json", false, "print stable machine-readable JSON")
 	return command
@@ -230,8 +235,15 @@ func runDoctor(ctx context.Context, workspaceValue, healthURL string, requireOpe
 			add("gateway_health", doctorWarn, message)
 		case result.Err != nil:
 			add("gateway_health", doctorFail, result.Err.Error())
+		case result.Observed && !result.HasOnlineWorker:
+			add("gateway_health", doctorWarn, "Human gateway is ready (SQLite ok; recovery complete), but no Human worker is online")
+		case result.Observed:
+			add("gateway_health", doctorPass, fmt.Sprintf(
+				"Human gateway is ready (SQLite ok; recovery complete); %d Human worker(s) online",
+				result.OnlineWorkers,
+			))
 		default:
-			add("gateway_health", doctorPass, "Human gateway health endpoint returned status ok")
+			add("gateway_health", doctorPass, "Human gateway readiness endpoint returned status ok")
 		}
 	}
 
@@ -339,7 +351,17 @@ func probeHealth(ctx context.Context, healthURL string) doctorHealthResult {
 		return doctorHealthResult{Running: true, Err: fmt.Errorf("gateway health returned HTTP %d", response.StatusCode)}
 	}
 	var payload struct {
-		Status string `json:"status"`
+		Status   string `json:"status"`
+		Database struct {
+			Status string `json:"status"`
+		} `json:"database"`
+		Recovery struct {
+			Complete *bool `json:"complete"`
+		} `json:"recovery"`
+		Workers struct {
+			Online    *int  `json:"online"`
+			HasOnline *bool `json:"has_online"`
+		} `json:"workers"`
 	}
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 4<<10))
 	if err := decoder.Decode(&payload); err != nil {
@@ -348,7 +370,24 @@ func probeHealth(ctx context.Context, healthURL string) doctorHealthResult {
 	if payload.Status != "ok" {
 		return doctorHealthResult{Running: true, Err: fmt.Errorf("gateway health status is %q, want ok", payload.Status)}
 	}
-	return doctorHealthResult{Running: true}
+	if payload.Database.Status != "ok" {
+		return doctorHealthResult{Running: true, Err: fmt.Errorf("gateway database status is %q, want ok", payload.Database.Status)}
+	}
+	if payload.Recovery.Complete == nil || !*payload.Recovery.Complete {
+		return doctorHealthResult{Running: true, Err: errors.New("gateway recovery is not complete")}
+	}
+	if payload.Workers.Online == nil || *payload.Workers.Online < 0 || payload.Workers.HasOnline == nil {
+		return doctorHealthResult{Running: true, Err: errors.New("gateway readiness response has invalid worker status")}
+	}
+	hasOnline := *payload.Workers.Online > 0
+	if *payload.Workers.HasOnline != hasOnline {
+		return doctorHealthResult{Running: true, Err: errors.New("gateway readiness response has inconsistent worker status")}
+	}
+	return doctorHealthResult{
+		Running: true, Observed: true, DatabaseStatus: payload.Database.Status,
+		RecoveryComplete: true, OnlineWorkers: *payload.Workers.Online,
+		HasOnlineWorker: hasOnline,
+	}
 }
 
 func writeDoctorHuman(writer io.Writer, report doctorReport) error {

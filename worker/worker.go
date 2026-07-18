@@ -24,10 +24,15 @@ const DefaultWorkerEndpoint = "ws://127.0.0.1:8080/internal/v1/worker/ws"
 // Config describes one worker process. Paths are deliberately explicit in the
 // library API: unlike the CLI, Open does not expand shell syntax such as ~.
 type Config struct {
-	GatewayURL        string
-	Token             string
-	MirrorRoot        string
-	OutboxPath        string
+	GatewayURL string
+	Token      string
+	MirrorRoot string
+	OutboxPath string
+	// OutboxScope is an optional stable logical gateway identity. Leave it empty
+	// for normal remote deployments, where the canonical GatewayURL is stable.
+	// Embedded gateways with an ephemeral listener may bind it to their durable
+	// database identity so pending events survive a port change.
+	OutboxScope       string
 	StatePath         string
 	DisableState      bool
 	WorkspaceAutoSend bool
@@ -110,7 +115,14 @@ func Open(ctx context.Context, config Config) (*Worker, error) {
 			return nil, fmt.Errorf("open worker state: %w", err)
 		}
 	}
-	client, err := workerclient.DialWithOutbox(ctx, config.GatewayURL, config.Token, config.OutboxPath)
+	var client *workerclient.Client
+	if strings.TrimSpace(config.OutboxScope) == "" {
+		client, err = workerclient.DialWithOutbox(ctx, config.GatewayURL, config.Token, config.OutboxPath)
+	} else {
+		client, err = workerclient.DialWithOutboxScope(
+			ctx, config.GatewayURL, config.Token, config.OutboxPath, config.OutboxScope,
+		)
+	}
 	if err != nil {
 		if stateStore != nil {
 			_ = stateStore.Close()
