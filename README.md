@@ -8,6 +8,8 @@
 
 当前 Go 实现已有三种方言的流式与聚合 codec、持久任务循环、worker WebSocket、caller shim、Live Workspace 与聊天式 TUI 闭环，并配有仓库内测试和脱敏 golden fixtures。TUI 基于官方 [Bubble Tea v2](https://github.com/charmbracelet/bubbletea)（`charm.land/bubbletea/v2`），并使用 [Bubbles](https://github.com/charmbracelet/bubbles)（`charm.land/bubbles/v2`）与 [Lip Gloss](https://github.com/charmbracelet/lipgloss)（`charm.land/lipgloss/v2`）组织输入、滚动和自适应布局。**OpenCode 1.17.18 + OpenAI-compatible Chat** 已在隔离 Git 工作区真实跑通文本 SSE、同一响应内的多 tool call、`write → edit → bash → todowrite → final` 多轮闭环；精确的 `opencode@1.17.18` Workspace profile 还以真实 CLI 进程跑通 `空 Human mirror → :pull 精确字节 → mirror edit → 原生 edit/result 对账 → bash + todowrite → final → 同一 OpenCode session 在 terminal 后的下一 user turn 新建 Human task`。10 分钟和 2 小时持续流只保留为历史证据，不再作为门禁。可靠性证据分两层：仓库内故障注入覆盖 caller/worker/gateway/SQLite 重启、三方重叠离线、outbox 重放和 Workspace save-ahead；真实 OpenCode 网络门则在 response headers 前、完整 stream-start 后、Human progress 后三个并行场景中，各连续强制断线 5 次，并在第 6 次以相同 body、`X-Session-Id` 与 Human idempotency key 恢复，单轮三个场景约 70 秒。后者证明真实 CLI 的传输重试，不等于真实多进程按不同顺序恢复已经通过。
 
+协议演进已经在 TLA+ 中明确拆成两个 surface：当前 completion 产品是实时增量的 **HumanLLM**；独立持久 Task/Context 与最终 Submission/Artifact 的 **HumanAgent** 是下一实现面，不等同于 TUI 里的 Tasks 工具列表，也不会复用 completion response 充当任务生命周期。两者只共享 runtime、worker transport/outbox、authority-qualified 身份和 workspace CAS。有限状态模型、故障/恢复矩阵、38 个必须失败的 mutant 与 Go refinement obligations 见 [09 TLA+ 模型与实现约束](docs/09-formal-model.md)；模型存在不代表 HumanAgent 的 Go 实现已经交付。
+
 当前 RC 的可交付目标是 **OpenCode 1.17.18 单机 `human local` 路径**。Codex、Claude、其它 OpenCode 版本、远程多 worker/多租户都是后续扩展证据；它们不阻塞这个明确范围，也不能借已有 codec 或 Basic gate 宣称兼容。
 
 **Codex CLI 0.144.4 的重试策略已做真实黑盒捕获**：服务端返 500，或读完 POST 后直接断 TCP，CLI 都显示 `Reconnecting 1/5…5/5`，两组捕获端各收到 30 个 POST。它不发 `Idempotency-Key`，但 `User-Agent: codex_exec/<version>` 与 `X-Codex-Turn-Metadata` 里的用户 turn UUID 在 retry 与同 turn 工具循环内稳定。gateway 因此仅为严格识别的 **Basic/Chat + Responses + Codex turn** 派生请求幂等 key；显式 key 始终优先，该适配不授予 Remote tools/Workspace 能力，可用 `human gateway --disable-codex-auto-idempotency` 立即关闭。仓库内测试证明 5 次断流第 6 次恢复，以及 30 个并发 + 1 个顺序重放仍只有 1 个 task/assignment 且 wire 逐字节相同。这只证明当前 Codex profile 的重试身份与 gateway 去重，不等于完整 Codex gateway/tool 兼容。
@@ -80,6 +82,7 @@ gateway 是协议与持久正确性的**逻辑组件**。`human local` 把 gatew
 | [06 产品 TODO](docs/06-product-todos.md) | 已完成、本轮待验收与后续真实 harness 工作，不把本机适配当外部兼容 |
 | [07 Go 库嵌入](docs/07-embedding.md) | `local` / `gateway` / `worker` 公共边界、自有身份与路由、生命周期和 SQLite 单实例限制 |
 | [08 部署与运维](docs/08-operations.md) | 远程 TLS/WSS 接入、token 生命周期、真实故障门、本机升级/回滚及拆分部署灾备边界 |
+| [09 TLA+ 模型与实现约束](docs/09-formal-model.md) | HumanLLM/HumanAgent 双 surface、共享 runtime/workspace、故障与活性假设、模型到 Go 的 refinement obligations |
 
 ## 安装
 

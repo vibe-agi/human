@@ -1,4 +1,4 @@
-.PHONY: all build test fault-test real-opencode-tui-test real-opencode-network-test release-build release-semantics-test release-build-contract-test fmt fmt-check tidy-check vet check
+.PHONY: all build test fault-test formal-check real-opencode-tui-test real-opencode-network-test release-build release-semantics-test release-build-contract-test fmt fmt-check tidy-check vet check
 
 GO_FILES := $(shell git ls-files --cached --others --exclude-standard -- '*.go')
 FAULT_COUNT ?= 1
@@ -16,6 +16,9 @@ test:
 fault-test:
 	go test -race -count=$(FAULT_COUNT) -timeout=5m ./internal/completion/gateway -run '^(TestCallerFiveTCPDisconnectsThenExactIdempotentRecovery|TestCodexResponsesFiveUnkeyedDisconnectsRecoverOneDerivedRequest|TestTransientHeartbeatFailureDoesNotAbandonLiveSession|TestContinueStreamingResponseStopsOnWriteOrFlushFailure|TestBeginStreamingReplayReturnsStartedCursorOnWriteFailure)$$'
 	go test -race -count=$(FAULT_COUNT) -timeout=5m ./internal/workerclient -run '^(TestWorkerClientInitialTransientFailuresRecoverAfterFiveAttempts|TestWorkerClientInitialConnectionRefusedRetriesUntilGatewayStarts|TestWorkerClientReconnectsAndReceivesActiveAssignmentAgain|TestWorkerClientFiveFlapsPreserveAssignmentOutboxAndACKs|TestWorkerClientKeepaliveRecoversFromPeerThatStopsReading|TestWorkerClientReplaysTerminalEventAfterACKLoss|TestWorkerClientCredentialRotationReplaysPendingOutbox|TestExpiredSessionRejectsLateOutboxEventAndContinuesWithLiveWork|TestGatewayRestartWithLiveWorkerRecoversPartialCallerAndOfflineOutbox|TestThreePartyOutageRecoversExactlyOnce|TestWorkspaceToolLoopSurvivesThreePartyOutage)$$'
+
+formal-check:
+	./formal/run-checks.sh
 
 real-opencode-tui-test:
 	HUMAN_REAL_OPENCODE_TUI_E2E=1 go test -count=$(REAL_COUNT) -timeout=2m ./local -run '^TestRealOpenCodeTUIWorkspaceLoop$$' -v

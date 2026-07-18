@@ -15,3 +15,7 @@
 *.db-wal
 *.db.owner.lock
 *.db.restore-journal.json
+
+# Locally installed formal-method tooling
+/formal/tla2tools.jar
+/formal/states/
