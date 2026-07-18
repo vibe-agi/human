@@ -43,7 +43,7 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 	if err := validateRevision("expected base revision", command.ExpectedBaseRevision); err != nil {
 		return FreezeArtifactResult{}, err
 	}
-	if err := agent.validateArtifactPayload(command.Payload); err != nil {
+	if err := validateArtifactPayloadShape(command.Payload); err != nil {
 		return FreezeArtifactResult{}, err
 	}
 	digest, err := commandDigest("freeze_artifact", command)
@@ -79,6 +79,11 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 			return FreezeArtifactResult{}, fmt.Errorf("%w: frozen command result does not match Artifact", ErrCorruptStore)
 		}
 		return cloneFreezeResult(replay), nil
+	}
+	if int64(len(command.Payload.Data)) > agent.maxArtifactBytes {
+		return FreezeArtifactResult{}, fmt.Errorf(
+			"%w: Artifact payload must be 1..%d bytes", ErrInvalidArgument, agent.maxArtifactBytes,
+		)
 	}
 
 	current, err := loadTask(ctx, tx, command.Task)
@@ -544,7 +549,7 @@ func recordJSONCommand(
 	return nil
 }
 
-func (agent *Agent) validateArtifactPayload(payload workspace.Payload) error {
+func validateArtifactPayloadShape(payload workspace.Payload) error {
 	if payload.MediaType == "" || payload.MediaType != strings.TrimSpace(payload.MediaType) ||
 		len(payload.MediaType) > 128 || !utf8.ValidString(payload.MediaType) ||
 		strings.ContainsAny(payload.MediaType, "\r\n\x00") {
@@ -553,8 +558,8 @@ func (agent *Agent) validateArtifactPayload(payload workspace.Payload) error {
 	if _, _, err := mime.ParseMediaType(payload.MediaType); err != nil {
 		return fmt.Errorf("%w: Artifact media type is invalid: %v", ErrInvalidArgument, err)
 	}
-	if len(payload.Data) == 0 || int64(len(payload.Data)) > agent.maxArtifactBytes {
-		return fmt.Errorf("%w: Artifact payload must be 1..%d bytes", ErrInvalidArgument, agent.maxArtifactBytes)
+	if len(payload.Data) == 0 || int64(len(payload.Data)) > absoluteArtifactMax {
+		return fmt.Errorf("%w: Artifact payload must be 1..%d bytes", ErrInvalidArgument, absoluteArtifactMax)
 	}
 	return nil
 }

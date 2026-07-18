@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
@@ -174,6 +175,49 @@ func TestArtifactFreezePublishReceiptAndRecovery(t *testing.T) {
 	recoveredReceipt, err := reopened.GetApplyReceipt(ctx, frozen.Artifact.Ref)
 	if err != nil || !reflect.DeepEqual(recoveredReceipt, receipt) {
 		t.Fatalf("recovered receipt = %#v, %v", recoveredReceipt, err)
+	}
+}
+
+func TestFreezeReplayIgnoresLoweredAdmissionLimit(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "agent.db")
+	config := DefaultConfig()
+	config.DatabasePath = path
+	config.MaxArtifactBytes = 2
+	service, err := Open(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextRef, taskRef := refs("tenant-a", "limit-context", "limit-workspace", "limit-task")
+	working := createWorkingTask(t, service, contextRef, taskRef, "limit")
+	command := freezeCommand("limit", working, "limit-base", []byte("{}"))
+	frozen, err := service.FreezeArtifact(ctx, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	config.MaxArtifactBytes = 1
+	reopened, err := Open(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	replayed, err := reopened.FreezeArtifact(ctx, command)
+	if err != nil {
+		t.Fatalf("exact replay after lowered admission limit: %v", err)
+	}
+	if !reflect.DeepEqual(replayed, frozen) {
+		t.Fatalf("freeze replay changed after lowered limit:\n got %#v\nwant %#v", replayed, frozen)
+	}
+	newContext, newTask := refs("tenant-a", "limit-context-2", "limit-workspace-2", "limit-task-2")
+	newWorking := createWorkingTask(t, reopened, newContext, newTask, "limit-new")
+	if _, err := reopened.FreezeArtifact(ctx, freezeCommand(
+		"limit-new", newWorking, "limit-base-2", []byte("{}"),
+	)); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("new Artifact bypassed lowered admission limit: %v", err)
 	}
 }
 
