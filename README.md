@@ -1,14 +1,14 @@
 # Human Agent
 
-> 让客户侧真实 Agent 像调用 LLM 一样调用人类专家。
+> 让人直接成为 Agent 可调用、可恢复、可交付 Workspace 结果的协作者。
 
-**技术形态固定：人占据 LLM / 模型协议的位置；业务边界不在这里设限。** 客户侧的真实 Agent / harness 继续负责上下文编排、权限与工具循环；Human Agent 兼容 **Anthropic Messages、OpenAI Chat Completions 与 OpenAI Responses**，把模型请求交给人，再把人的判断按请求模式以 SSE 或一次性 JSON 返回。只要客户 Agent 能用其原生工具表达，编码、排障、评审、运维或其它任务都可以走同一协议闭环。
+Human 不按编码、排障、评审、运维等业务场景设限，而是提供两种技术形态。**HumanLLM 是人占据 LLM / 模型协议的位置**：兼容 **Anthropic Messages、OpenAI Chat Completions 与 OpenAI Responses**，让客户侧真实 Agent / harness 继续负责上下文、权限和工具循环。**HumanAgent 是 durable Task/Message/Submission/Artifact**：适合可暂停、多轮询问和最终打包交付。两者共享内容与 Workspace 语义，但不是同一个公开状态机。
 
 **Live Workspace 是核心能力，不是后续附加项。** 人在自己的镜像目录保存文件后，`fsnotify` 会触发一次新的完整 review；默认仍需 preview/confirm，开启 `--workspace-auto-send` 后，change-level 无安全警告、无冲突的改动会自动进入同一交付路径。Human 只生成客户 Agent CLI 已声明的原生 `edit/write` tool call；命令与计划分别走 `bash` 和 Tasks 工具；执行结果由客户 Agent 在下一次 completion 回流，TUI 再续接同一任务。客户工作树始终是唯一真相，Human 侧不直接挂载或执行客户机器。
 
 当前 Go 实现已有三种方言的流式与聚合 codec、持久任务循环、worker WebSocket、caller shim、Live Workspace 与聊天式 TUI 闭环，并配有仓库内测试和脱敏 golden fixtures。TUI 基于官方 [Bubble Tea v2](https://github.com/charmbracelet/bubbletea)（`charm.land/bubbletea/v2`），并使用 [Bubbles](https://github.com/charmbracelet/bubbles)（`charm.land/bubbles/v2`）与 [Lip Gloss](https://github.com/charmbracelet/lipgloss)（`charm.land/lipgloss/v2`）组织输入、滚动和自适应布局。**OpenCode 1.17.18 + OpenAI-compatible Chat** 已在隔离 Git 工作区真实跑通文本 SSE、同一响应内的多 tool call、`write → edit → bash → todowrite → final` 多轮闭环；精确的 `opencode@1.17.18` Workspace profile 还以真实 CLI 进程跑通 `空 Human mirror → :pull 精确字节 → mirror edit → 原生 edit/result 对账 → bash + todowrite → final → 同一 OpenCode session 在 terminal 后的下一 user turn 新建 Human task`。10 分钟和 2 小时持续流只保留为历史证据，不再作为门禁。可靠性证据分两层：仓库内故障注入覆盖 caller/worker/gateway/SQLite 重启、三方重叠离线、outbox 重放和 Workspace save-ahead；真实 OpenCode 网络门则在 response headers 前、完整 stream-start 后、Human progress 后三个并行场景中，各连续强制断线 5 次，并在第 6 次以相同 body、`X-Session-Id` 与 Human idempotency key 恢复，单轮三个场景约 70 秒。后者证明真实 CLI 的传输重试，不等于真实多进程按不同顺序恢复已经通过。
 
-协议演进已经在 TLA+ 中明确拆成两个 surface：当前 completion 产品是实时增量的 **HumanLLM**；独立持久 Task/Context 与最终 Submission/Artifact 的 **HumanAgent** 是下一实现面，不等同于 TUI 里的 Tasks 工具列表，也不会复用 completion response 充当任务生命周期。两者只共享 runtime、worker transport/outbox、authority-qualified 身份和 workspace CAS。有限状态模型、故障/恢复矩阵、38 个必须失败的 mutant 与 Go refinement obligations 见 [09 TLA+ 模型与实现约束](docs/09-formal-model.md)；模型存在不代表 HumanAgent 的 Go 实现已经交付。
+协议演进已经在 TLA+ 中明确拆成两个 surface：completion 产品是实时增量的 **HumanLLM**；独立持久 Task/Context 与最终 Submission/Artifact 的 **HumanAgent** 已落第一份 Go 领域实现，不等同于 TUI 里的 Tasks 工具列表，也不会复用 completion response 充当任务生命周期。根包现在提供 `human.NewLLM()` / `human.NewAgent()`；后者已经覆盖多轮消息、终态、Artifact 原子发布，以及受信 caller receipt 驱动的 Workspace confirmed-head CAS，但还没有 A2A/worker transport、commit-time lease/fence grant 或 caller 侧 bundle apply journal，不能宣称真实文件已应用或完整 HumanAgent 网络产品已交付。有限状态模型、故障/恢复矩阵、38 个必须失败的 mutant 与 Go refinement obligations 见 [09 TLA+ 模型与实现约束](docs/09-formal-model.md)。
 
 当前 RC 的可交付目标是 **OpenCode 1.17.18 单机 `human local` 路径**。Codex、Claude、其它 OpenCode 版本、远程多 worker/多租户都是后续扩展证据；它们不阻塞这个明确范围，也不能借已有 codec 或 Basic gate 宣称兼容。
 
@@ -43,15 +43,15 @@ flowchart LR
     G <-->|"WebSocket"| T
 ```
 
-## 为什么选择“人当模型”
+## 为什么 HumanLLM 选择“人当模型”
 
-客户侧已经有一个真实 Agent。它原生拥有文件读写、命令执行、权限确认、取消重试与界面流式能力；Human Agent 只替换它调用的模型，不再并行维护另一套任务委托、代码传输和执行系统。
+客户侧已经有一个真实 Agent。它原生拥有文件读写、命令执行、权限确认、取消重试与界面流式能力；HumanLLM 只替换它调用的模型，不再并行维护另一套任务委托、代码传输和执行系统。HumanAgent 是另一条明确的 task surface，不受这条取舍约束。
 
 因此文件改动和命令始终由客户侧 Agent 在真实现场执行。Basic 把 completion 独立处理；exact Workspace 用 harness 原生 session 把 Live mirror、工具结果与多个 completion 续起来；只有需要持久执行 ledger、强 CAS 与 realpath/symlink 围栏时才叠加 Remote tools/shim。shim 的 `.git` 禁写不是只看输入字符串：解析内部符号链接后还会对真实相对路径再检查，`alias -> .git` 无法借 write/edit/delete/rename 写入 hooks 或其它仓库元数据。
 
 ## 运行形态与代码边界
 
-gateway 是协议与持久正确性的**逻辑组件**。`human local` 把 gateway、SQLite 与 TUI 放进同一进程；远程、团队或多个专家部署才拆成 `human gateway` 与 `human worker`。当前 clean-break 产品只保留这套进程模型，不维护第二套 daemon 命令或裸 worker 入口。
+gateway 是 HumanLLM 协议与持久正确性的**逻辑组件**。`human local` 把 gateway、SQLite 与 TUI 放进同一进程；远程、团队或多个专家部署才拆成 `human gateway` 与 `human worker`。HumanAgent 当前只提供可嵌入 Go 领域，不发布尚未完成 grant/transport 的第二套 daemon 命令。
 
 | 组件 | 职责 |
 |---|---|
@@ -60,13 +60,13 @@ gateway 是协议与持久正确性的**逻辑组件**。`human local` 把 gatew
 | `human worker` | 只连接远程 gateway 的专家 TUI；官方客户端自动处理重连、outbox 与 worker instance identity |
 | `human shim` | 可选的需求方执行边界，提供稳定身份、强 CAS、路径围栏与持久执行 ledger |
 
-核心领域仍位于 `internal/completion/`，对外可复用入口位于 `gateway`、`worker` 和 `local` 三个公共 Go package；CLI 只负责配置、listener 与进程信号。
+HumanLLM 核心领域位于 `internal/completion/`，HumanAgent 独立领域位于公共 `agent` 包；根 `human` 包提供两个命名 facade，`workspace` 提供为两面统一写链准备的 opaque workspace 值类型（当前先由 HumanAgent 直接使用，HumanLLM 尚未接入同一全局 revision chain）。`gateway`、`worker`、`local` 继续承载 HumanLLM 的可组合装配；CLI 只负责配置、listener 与进程信号。
 
 ### Go 库嵌入
 
 `gateway.Open` 不占用 TCP 端口，返回 `http.Handler`，也可分别取 `ModelHandler()` 与 `WorkerHandler()` 挂到现有 router。宿主可用完整 HTTP request 实现 Cookie、JWT、mTLS 或上游注入身份；`WorkerRouter` 再用已认证 caller、model、capability tier、workspace/task/harness 身份把**新任务**绑定到准确的 worker subject。该 owner 在准入时持久化，后续 continuation 与崩溃恢复不再重路由，因而宿主可以直接实现 tenant → 专家池隔离。策略拒绝、路由器故障和已选 worker 离线分别 fail-closed，不会静默掉回其它专家。使用自定义认证时，内建 token 签发会明确禁用，避免出现两套身份真相。使用内建 token 时，`ValidateToken` 可在复用持久凭据前核对 type/subject/key ID，`RevokeToken` 只有在 secret 与预期 key ID 同属一条凭据时才吊销，适合安全轮换。当前公共持久实现诚实限定为 SQLite，没有把内部 store 类型伪装成稳定 driver API。
 
-可直接编译运行的 [`embed-local`](examples/embed-local/main.go) 展示一体化嵌入；[`embed-gateway`](examples/embed-gateway/main.go) 展示自有 mux、完整 HTTP/SQLite 生命周期、`Authenticator` 与 tenant → worker 路由。后一个示例里的受信代理 header 只用于说明扩展点，不是生产认证方案；生产必须验证代理跳、剥离外部 header 并阻止客户端直达 handler。完整责任边界见 [Go 库嵌入](docs/07-embedding.md)。
+可直接编译运行的 [`embed-local`](examples/embed-local/main.go) 展示一体化 HumanLLM 嵌入；[`embed-gateway`](examples/embed-gateway/main.go) 展示自有 mux、完整 HTTP/SQLite 生命周期、`Authenticator` 与 tenant → worker 路由；[`embed-agent`](examples/embed-agent/main.go) 展示不带 transport 的受信进程内 HumanAgent 领域。gateway 示例里的受信代理 header 只用于说明扩展点，不是生产认证方案；生产必须验证代理跳、剥离外部 header 并阻止客户端直达 handler。完整责任边界见 [Go 库嵌入](docs/07-embedding.md)。
 
 `worker.Open` 暴露 `Model() tea.Model` 与 `Run`，可把官方 TUI 嵌进更大的 Bubble Tea 程序；`Worker.Close` 会取消并等待自己启动的活动 `Run`。`local.Open` 则组合 loopback listener、gateway、SQLite 和 worker；库自行签发的临时 caller/worker token 默认随 `Local.Close` 撤销，只有宿主在 `Open` 前显式选择 preserve 并接管两个 secret 的持久化时才保留。自行实现 worker WebSocket 时必须为同一进程的所有重连复用稳定的 `X-Human-Worker-Instance`；同一 worker 身份同时只允许一个 instance 活跃，challenger 不顶替 incumbent，而是等待旧连接释放。官方 worker 库会自动维护这套行为。
 
@@ -80,7 +80,7 @@ gateway 是协议与持久正确性的**逻辑组件**。`human local` 把 gatew
 | [04 里程碑](docs/04-milestones.md) | M0 可裁决门、垂直切片、可靠性门与验收 demo |
 | [05 M0 契约](docs/05-m0-contract.md) | 身份边界、adapter 握手、循环状态机与幂等、拒单时序、read/search 与 CAS |
 | [06 产品 TODO](docs/06-product-todos.md) | 已完成、本轮待验收与后续真实 harness 工作，不把本机适配当外部兼容 |
-| [07 Go 库嵌入](docs/07-embedding.md) | `local` / `gateway` / `worker` 公共边界、自有身份与路由、生命周期和 SQLite 单实例限制 |
+| [07 Go 库嵌入](docs/07-embedding.md) | `human.NewLLM/NewAgent`、`agent` / `workspace` / `local` / `gateway` / `worker` 公共边界、自有身份与路由、生命周期和 SQLite 单实例限制 |
 | [08 部署与运维](docs/08-operations.md) | 远程 TLS/WSS 接入、token 生命周期、真实故障门、本机升级/回滚及拆分部署灾备边界 |
 | [09 TLA+ 模型与实现约束](docs/09-formal-model.md) | HumanLLM/HumanAgent 双 surface、共享 runtime/workspace、故障与活性假设、模型到 Go 的 refinement obligations |
 

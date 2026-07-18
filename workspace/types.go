@@ -1,0 +1,42 @@
+// Package workspace contains transport-neutral identities intended for
+// HumanLLM and HumanAgent workspace delivery. The current Agent domain uses
+// them directly; the LLM runtime is not yet wired to the same revision chain.
+// This package does not read or write a filesystem.
+package workspace
+
+// Revision is an opaque workspace chain identity. Implementations compare it
+// for exact equality; they must not infer ordering from its contents.
+type Revision string
+
+// Digest is a content identity in algorithm:value form.
+type Digest string
+
+// Payload is a declarative workspace artifact. Consumers must treat Data as
+// data, never as an implicit command to execute; this value type does not
+// enforce a media-type allowlist. Executable effects need their own authorized,
+// idempotent protocol.
+type Payload struct {
+	MediaType string `json:"media_type"`
+	Data      []byte `json:"data"`
+}
+
+// ApplyDecision is the caller-side durable outcome of applying one exact
+// Artifact. Indeterminate is terminal: reconciliation requires a new Task and
+// Artifact rather than replaying a possibly completed external side effect.
+type ApplyDecision string
+
+const (
+	ApplySuccess       ApplyDecision = "success"
+	ApplyConflict      ApplyDecision = "conflict"
+	ApplyRejected      ApplyDecision = "rejected"
+	ApplyIndeterminate ApplyDecision = "indeterminate"
+)
+
+func (decision ApplyDecision) Valid() bool {
+	switch decision {
+	case ApplySuccess, ApplyConflict, ApplyRejected, ApplyIndeterminate:
+		return true
+	default:
+		return false
+	}
+}

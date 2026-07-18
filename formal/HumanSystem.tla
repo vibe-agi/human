@@ -225,7 +225,7 @@ DraftAgentArtifact ==
                  llmBaseline, agentBaseline>>
 
 FreezeAgentArtifact ==
-  /\ agentTask \in {"working", "input_required"}
+  /\ agentTask = "working"
   /\ agentDraft = AgentVersion
   /\ agentIntent = NoVersion
   /\ agentIntent' = agentDraft
@@ -345,7 +345,7 @@ AgentReply ==
                  llmBaseline, agentBaseline>>
 
 CompleteAgentContent ==
-  /\ agentTask \in {"working", "input_required"}
+  /\ agentTask = "working"
   /\ agentCreated = {}
   /\ agentDraft = NoVersion
   /\ agentIntent = NoVersion

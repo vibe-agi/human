@@ -1,14 +1,19 @@
 # Go 库嵌入
 
-Human Agent 的进程形态不是封闭产品边界。`human local`、`human gateway`、`human worker` 是官方 CLI 装配；同一套能力也通过三个 public Go package 暴露，宿主可以保留自己的 listener、身份系统、路由、终端布局与进程生命周期。
+Human 的进程形态不是封闭产品边界。`human local`、`human gateway`、`human worker` 是 HumanLLM 的官方 CLI 装配；库同时提供 `human.NewLLM()` 与 `human.NewAgent()` 两个根 facade，宿主可以保留自己的 listener、身份系统、路由、终端布局与进程生命周期。
 
-## 三个 public package
+## 根 facade 与五个可组合 package
 
 | package | 宿主获得什么 | 宿主仍负责什么 |
 |---|---|---|
+| `human` | `NewLLM` / `NewAgent` 两个明确命名的 lifecycle 构造器 | 选择并装配 HTTP/A2A/自定义 transport；根包不复制下层所有 DTO |
+| `agent` | durable Task/Context/Message/Event、content-only 或 Artifact Submission、命令幂等、Task revision CAS、apply receipt 与 Workspace confirmed-head CAS | 从已认证 principal 构造 AuthorityID；A2A/HTTP adapter、worker 调度、caller 侧真实 bundle apply ledger/journal |
 | `local` | loopback listener、gateway、SQLite、worker 与官方 TUI 的一体化实例 | 把 `BaseURL()` 和 `CallerToken()` 直接交给进程内 Agent 客户端；默认临时凭据在 `Close` 时撤销，如需跨重启复用须显式选择 preserve 并负责加密或 mode `0600` 的持久化 |
 | `gateway` | completion 状态机、SQLite 恢复、模型 HTTP handler、worker WebSocket handler、内建 token 或自定义认证入口 | listener、路由前缀、TLS、反向代理、HTTP 超时、身份验证、secret 管理和优雅关闭 |
 | `worker` | WebSocket 重连、durable outbox、worker state、Live Workspace mirror 与可运行/可组合的 Bubble Tea model | worker credential 的安全取得与保存、mirror 路径、外层终端程序和关闭时机 |
+| `workspace` | 为两个 surface 的统一写链准备的 opaque Revision/Digest/Payload/ApplyDecision 值类型；当前 Agent 已使用，LLM 尚未接线 | 实际文件树 fingerprint、CAS、bundle journal 与副作用授权 |
+
+`human.NewLLM` 是 `gateway.Open` 的命名 facade，不是 `local.Open`：它不监听端口，也不自动创建 worker/TUI。传给 `NewLLM` 的 context 控制整个 gateway runtime；取消它会停止后台任务与活动 session。桌面一体化仍用 `local.Open`。`human.NewAgent` 同样只打开 durable Agent 领域对象，不监听、不认证 caller，也不声称已经实现 A2A；它的 context 只控制 Open，返回后的生命周期由每次 method context 与 `Close` 控制。Task 等领域类型来自 `human/agent`，避免根包机械复制第二套类型面。
 
 `local.Open` 适合桌面应用把“人 = LLM”直接放进本机进程。最小示例见 [`examples/embed-local`](../examples/embed-local/main.go)：它使用 `local.DefaultConfig()`，因此数据库、outbox 和 TUI state 位于 OS 用户私有数据目录并按真实 workspace 隔离，不会默认写进客户仓库。示例只打印 loopback base URL，绝不打印 caller/worker token；宿主应把 `CallerToken()` 在内存中直接注入自己的 Agent 客户端。库自行签发的凭据默认采用 `IssuedCredentialsRevokeOnClose`，所以示例反复运行不会在 SQLite 留下仍有效但宿主已丢失明文的 token。确需跨重启复用时，必须在 `Open` 前显式设置 `config.IssuedCredentialPolicy = local.IssuedCredentialsPreserve`，并把 `Credentials()` 的 caller/worker 两个 secret 作为一组持久化；`Existing*` 或 `CredentialProvider` 提供的凭据本来就由宿主拥有，不会被 `Close` 隐式撤销。下面的 `go run` 命令用于源码 checkout；二进制归档中的 examples 是可复制到宿主 Go module 的参考源码。
 
@@ -17,6 +22,23 @@ go run ./examples/embed-local
 ```
 
 `worker.Open` 可以单独连接远程 gateway。`Run` 启动官方 TUI；`Model` 返回 `tea.Model`，可以作为更大 Bubble Tea 应用的一部分。一个 `Worker` 只拥有一次 Tea program 生命周期；`Run` 返回后如需重启 UI，应先 `Close` 再 `Open` 新实例，不能复用可能仍有旧 command 回调收尾的 model。`Close` 会取消并等待由 `Worker.Run` 启动的活动程序，再关闭网络恢复、outbox 与 state store；如果宿主取出 `Model()` 后交给自己的 Tea program，那个外部 program 的取消与等待仍由宿主负责。
+
+## 嵌入 HumanAgent 领域
+
+[`examples/embed-agent`](../examples/embed-agent/main.go) 展示 `human.NewAgent` 的最小装配。构造器和配置位于根包，Task/Context/命令类型位于 `agent` 包：
+
+```go
+service, err := human.NewAgent(ctx, human.AgentConfig{DatabasePath: path})
+task, err := service.CreateTask(ctx, agent.CreateTaskCommand{/* ... */})
+```
+
+示例的固定 ID 是有意的：反复运行会走同一命令的精确 replay，而不是重复创建 Task。缺失的数据库父目录由 `NewAgent` 以 mode `0700` 创建，SQLite 文件由库收紧为 mode `0600`；已经存在的显式父目录不会被库改权限或代替宿主审计，因此仍必须位于宿主控制的私有目录。
+
+当前实现已经包含独立 SQLite schema、命令级精确 replay/冲突、Task revision CAS、多轮 `input_required`、终态不可重开、分页 Message/Event、不可变 Artifact、final Submission 原子发布、取消/失败丢弃 frozen Artifact，以及 apply receipt 推进 Workspace confirmed head。Task、final message、Submission、Artifact publish 和 command result 在同一 SQLite 事务里；真实文件写入不在该事务中。caller adapter 必须先把 bundle apply 的 begin/outcome 持久化、执行实际 workspace CAS/journal，再提交精确 receipt；`indeterminate` 是终态决定，不能盲目重跑外部副作用。
+
+Workspace 第一个 Artifact 的 `ExpectedBaseRevision` 是受信 caller adapter 提供的 bootstrap，Agent 不会自行读取或 fingerprint 客户文件树；后续 freeze 必须精确匹配已确认 head。success receipt 还必须回显并观察到 Artifact 的 exact result revision。Artifact payload 默认最大 `16 MiB`，配置硬上限 `64 MiB`；它是声明式 bundle，不得夹带隐式 shell command。
+
+`AuthorityID` 只能从宿主已经认证的 principal 派生，不能直接相信 A2A/HTTP body 里的 tenant 字符串。当前 `NewAgent` 是受信进程内领域 API；把它接到远程 worker 前，还必须实现与 commit 同边界的 lease/fence grant 校验。A2A DTO、worker assignment 和 completion response 都不能反向进入 `agent` 领域类型。
 
 ## 嵌入自有 Gateway
 
@@ -68,8 +90,9 @@ HUMAN_EMBED_GATEWAY_DB=/absolute/private/path/gateway.db \
 公共库不会替宿主隐式接管进程资源：
 
 - `gateway.Server` 不拥有 listener。先停止接收 HTTP，再调用 `Close`；`Close` 会主动终止并等待 `net/http` 无法随 `Shutdown` 收口的已劫持 worker WebSocket，全部 handler 退出后才关闭 SQLite。同一个 SQLite 文件不能被多个 gateway 实例当作集群共享存储。
+- `agent.Agent` 不拥有 listener/transport，持有一个单 owner SQLite；先停止调用它的 adapter，再调用幂等 `Close`。Agent DB 与 gateway DB 是两个独立 schema/identity，不能指向同一个文件。
 - `local.Local` 拥有自己的 loopback listener、gateway 与 worker，`Close` 是幂等的，并按显式 issued-credential policy 处理库签发凭据；一个实例只运行一次 TUI，重启需重新 `Open`。
 - `worker.Worker` 拥有网络客户端、outbox 与可选 state store；`Close` 取消并等待其活动 `Run`，一个实例只运行一次 TUI，重启需重新 `Open`。
 - TLS 终止、代理信任、HTTP/server 超时、secret persistence、备份与数据库文件权限最终都是宿主责任。默认路径是安全起点，不会替代部署审计。
 
-当前公开持久层只支持 SQLite 单实例。内部 store interface 不是稳定 driver API；不要通过复制内部 package 假装获得 PostgreSQL/MySQL/Redis 支持。需要多实例或自有数据库时，应在公开 driver contract 明确后再扩展，或让多个业务入口共享一个独立 `human gateway`。
+当前 gateway 与 Agent 公开持久层都只支持 SQLite 单实例，且各自要求显式、独立的数据库文件。内部 store interface 不是稳定 driver API；不要通过复制内部 package 假装获得 PostgreSQL/MySQL/Redis 支持。需要多实例或自有数据库时，应在公开 driver contract 明确后再扩展，或让多个业务入口共享一个独立 `human gateway`。
