@@ -31,7 +31,7 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 		return FreezeArtifactResult{}, ErrClosed
 	}
 	command.Payload.Data = append([]byte(nil), command.Payload.Data...)
-	if err := validateMeta(command.Meta, false); err != nil {
+	if err := validateWorkerMeta(command.Meta, command.Task); err != nil {
 		return FreezeArtifactResult{}, err
 	}
 	if err := validateTaskRef(command.Task); err != nil {
@@ -74,6 +74,9 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 		if replay.Task.Ref != command.Task || replay.Artifact.Ref != wantRef {
 			return FreezeArtifactResult{}, fmt.Errorf("%w: frozen command result identity mismatch", ErrCorruptStore)
 		}
+		if _, err := verifyLeaseGrantHistory(ctx, tx, command.Meta.Grant); err != nil {
+			return FreezeArtifactResult{}, err
+		}
 		stored, err := loadArtifactContent(ctx, tx, replay.Artifact.Ref)
 		if err != nil || !sameArtifactIdentity(stored.Artifact, replay.Artifact) {
 			return FreezeArtifactResult{}, fmt.Errorf("%w: frozen command result does not match Artifact", ErrCorruptStore)
@@ -88,6 +91,9 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 
 	current, err := loadTask(ctx, tx, command.Task)
 	if err != nil {
+		return FreezeArtifactResult{}, err
+	}
+	if err := requireCurrentLease(ctx, tx, command.Meta.Grant); err != nil {
 		return FreezeArtifactResult{}, err
 	}
 	if current.Revision != command.Meta.ExpectedRevision {
@@ -174,15 +180,23 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 	result, err := tx.ExecContext(ctx, `
 		UPDATE agent_tasks
 		SET revision = ?, event_count = ?, updated_at = ?
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?`,
+		WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?
+		  AND lease_owner = ? AND lease_fence = ?`,
 		next.Revision, next.EventCount, unixNano(now), command.Task.Workspace.Authority,
 		command.Task.Workspace.ID, command.Task.ID, command.Meta.ExpectedRevision,
+		command.Meta.Grant.Worker, command.Meta.Grant.Fence,
 	)
 	if err != nil {
 		return FreezeArtifactResult{}, fmt.Errorf("update Task for frozen Artifact: %w", err)
 	}
 	affected, err := result.RowsAffected()
-	if err != nil || affected != 1 {
+	if err != nil {
+		return FreezeArtifactResult{}, fmt.Errorf("inspect frozen Artifact Task update: %w", err)
+	}
+	if affected != 1 {
+		if leaseErr := requireCurrentLease(ctx, tx, command.Meta.Grant); leaseErr != nil {
+			return FreezeArtifactResult{}, leaseErr
+		}
 		return FreezeArtifactResult{}, &RevisionConflictError{Expected: command.Meta.ExpectedRevision, Actual: current.Revision}
 	}
 	if err := insertEvent(ctx, tx, Event{

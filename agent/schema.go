@@ -9,7 +9,7 @@ import (
 
 const (
 	agentSchemaVersion     = 1
-	agentSchemaFingerprint = "human-agent-v1-20260718e"
+	agentSchemaFingerprint = "human-agent-v1-20260718g"
 )
 
 var errUnsupportedSchema = errors.New("unsupported HumanAgent sqlite schema; use a dedicated database")
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS human_schema (
   fingerprint TEXT NOT NULL
 );
 INSERT INTO human_schema (component, version, fingerprint)
-VALUES ('agent', 1, 'human-agent-v1-20260718e')
+VALUES ('agent', 1, 'human-agent-v1-20260718g')
 ON CONFLICT(component) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS agent_tasks (
@@ -38,11 +38,32 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
   revision INTEGER NOT NULL CHECK(revision > 0),
   message_count INTEGER NOT NULL CHECK(message_count > 0),
   event_count INTEGER NOT NULL CHECK(event_count > 0),
+  lease_owner TEXT NOT NULL DEFAULT '',
+  lease_fence INTEGER NOT NULL DEFAULT 0 CHECK(lease_fence >= 0),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (authority_id, workspace_id, task_id),
+  UNIQUE (authority_id, task_id),
   CHECK(revision = event_count),
+  CHECK(lease_owner = '' OR lease_fence > 0),
+  CHECK(
+    state NOT IN ('completed', 'canceled', 'rejected', 'failed')
+    OR lease_owner = ''
+  ),
   CHECK(updated_at >= created_at)
+);
+
+CREATE TABLE IF NOT EXISTS agent_lease_grants (
+  authority_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  fence INTEGER NOT NULL CHECK(fence > 0),
+  worker_id TEXT NOT NULL CHECK(worker_id <> ''),
+  granted_at INTEGER NOT NULL,
+  PRIMARY KEY (authority_id, workspace_id, task_id, fence),
+  FOREIGN KEY (authority_id, workspace_id, task_id)
+    REFERENCES agent_tasks(authority_id, workspace_id, task_id)
+    ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS agent_messages (
@@ -197,6 +218,11 @@ CREATE INDEX IF NOT EXISTS agent_tasks_context_idx
   ON agent_tasks(authority_id, context_id, created_at, task_id);
 CREATE INDEX IF NOT EXISTS agent_tasks_workspace_idx
   ON agent_tasks(authority_id, workspace_id, created_at, task_id);
+CREATE INDEX IF NOT EXISTS agent_tasks_claimable_idx
+  ON agent_tasks(authority_id, state, lease_owner, created_at, workspace_id, task_id);
+CREATE INDEX IF NOT EXISTS agent_tasks_lease_owner_idx
+  ON agent_tasks(authority_id, lease_owner, created_at, workspace_id, task_id)
+  WHERE lease_owner <> '';
 CREATE INDEX IF NOT EXISTS agent_events_task_idx
   ON agent_events(authority_id, workspace_id, task_id, sequence);
 CREATE INDEX IF NOT EXISTS agent_artifacts_task_idx

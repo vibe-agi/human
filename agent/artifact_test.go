@@ -21,8 +21,9 @@ func createWorkingTask(t *testing.T, service *Agent, contextRef ContextRef, task
 	if err != nil {
 		t.Fatal(err)
 	}
-	working, err := service.AcceptTask(ctx, TaskCommand{
-		Meta: CommandMeta{ID: CommandID("accept-" + suffix), ExpectedRevision: created.Revision},
+	grant := acquireTestLease(t, service, taskRef)
+	working, err := service.AcceptTask(ctx, WorkerTaskCommand{
+		Meta: WorkerCommandMeta{ID: CommandID("accept-" + suffix), ExpectedRevision: created.Revision, Grant: grant},
 		Task: taskRef,
 	})
 	if err != nil {
@@ -31,9 +32,10 @@ func createWorkingTask(t *testing.T, service *Agent, contextRef ContextRef, task
 	return working
 }
 
-func freezeCommand(suffix string, task Task, base workspace.Revision, data []byte) FreezeArtifactCommand {
+func freezeCommand(t *testing.T, service *Agent, suffix string, task Task, base workspace.Revision, data []byte) FreezeArtifactCommand {
+	t.Helper()
 	return FreezeArtifactCommand{
-		Meta: CommandMeta{ID: CommandID("freeze-" + suffix), ExpectedRevision: task.Revision},
+		Meta: workerMeta(t, service, task.Ref, CommandID("freeze-"+suffix), task.Revision),
 		Task: task.Ref, Artifact: ArtifactID("artifact-" + suffix),
 		ExpectedBaseRevision: base,
 		Payload:              workspace.Payload{MediaType: "application/vnd.human.workspace+json", Data: data},
@@ -46,7 +48,7 @@ func TestArtifactFreezePublishReceiptAndRecovery(t *testing.T) {
 	contextRef, taskRef := refs("tenant-a", "context-a", "workspace-a", "task-a")
 	working := createWorkingTask(t, service, contextRef, taskRef, "a")
 	payload := []byte(`{"changes":[{"path":"main.go","content":"package main"}]}`)
-	command := freezeCommand("a", working, "workspace-base-a", payload)
+	command := freezeCommand(t, service, "a", working, "workspace-base-a", payload)
 	frozen, err := service.FreezeArtifact(ctx, command)
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +84,7 @@ func TestArtifactFreezePublishReceiptAndRecovery(t *testing.T) {
 	}
 
 	completed, err := service.CompleteTask(ctx, CompleteTaskCommand{
-		Meta: CommandMeta{ID: "complete-a", ExpectedRevision: frozen.Task.Revision},
+		Meta: workerMeta(t, service, taskRef, "complete-a", frozen.Task.Revision),
 		Task: taskRef, Submission: "submission-a", Artifact: &frozen.Artifact.Ref,
 		Message: textMessage("final-a", "workspace Artifact ready"),
 	})
@@ -190,7 +192,7 @@ func TestFreezeReplayIgnoresLoweredAdmissionLimit(t *testing.T) {
 	}
 	contextRef, taskRef := refs("tenant-a", "limit-context", "limit-workspace", "limit-task")
 	working := createWorkingTask(t, service, contextRef, taskRef, "limit")
-	command := freezeCommand("limit", working, "limit-base", []byte("{}"))
+	command := freezeCommand(t, service, "limit", working, "limit-base", []byte("{}"))
 	frozen, err := service.FreezeArtifact(ctx, command)
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +217,7 @@ func TestFreezeReplayIgnoresLoweredAdmissionLimit(t *testing.T) {
 	newContext, newTask := refs("tenant-a", "limit-context-2", "limit-workspace-2", "limit-task-2")
 	newWorking := createWorkingTask(t, reopened, newContext, newTask, "limit-new")
 	if _, err := reopened.FreezeArtifact(ctx, freezeCommand(
-		"limit-new", newWorking, "limit-base-2", []byte("{}"),
+		t, reopened, "limit-new", newWorking, "limit-base-2", []byte("{}"),
 	)); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("new Artifact bypassed lowered admission limit: %v", err)
 	}
@@ -228,11 +230,11 @@ func TestSharedWorkspaceOnlyOneSuccessReceipt(t *testing.T) {
 	contextB, taskB := refs("tenant-a", "context-b", "shared-workspace", "task-b")
 	workingA := createWorkingTask(t, service, contextA, taskA, "a")
 	workingB := createWorkingTask(t, service, contextB, taskB, "b")
-	frozenA, err := service.FreezeArtifact(ctx, freezeCommand("a", workingA, "shared-base", []byte(`{"edit":"A"}`)))
+	frozenA, err := service.FreezeArtifact(ctx, freezeCommand(t, service, "a", workingA, "shared-base", []byte(`{"edit":"A"}`)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	frozenB, err := service.FreezeArtifact(ctx, freezeCommand("b", workingB, "shared-base", []byte(`{"edit":"B"}`)))
+	frozenB, err := service.FreezeArtifact(ctx, freezeCommand(t, service, "b", workingB, "shared-base", []byte(`{"edit":"B"}`)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +247,7 @@ func TestSharedWorkspaceOnlyOneSuccessReceipt(t *testing.T) {
 	} {
 		artifactRef := item.frozen.Artifact.Ref
 		if _, err := service.CompleteTask(ctx, CompleteTaskCommand{
-			Meta: CommandMeta{ID: CommandID("complete-" + item.suffix), ExpectedRevision: item.frozen.Task.Revision},
+			Meta: workerMeta(t, service, item.ref, CommandID("complete-"+item.suffix), item.frozen.Task.Revision),
 			Task: item.ref, Submission: SubmissionID("submission-" + item.suffix), Artifact: &artifactRef,
 			Message: textMessage("final-"+item.suffix, "done"),
 		}); err != nil {
@@ -303,13 +305,13 @@ func TestConcurrentSharedWorkspaceSuccessCAS(t *testing.T) {
 	frozen := make([]FreezeArtifactResult, 2)
 	var err error
 	frozen[0], err = service.FreezeArtifact(ctx, freezeCommand(
-		"parallel-a", workingA, "parallel-base", []byte(`{"edit":"A"}`),
+		t, service, "parallel-a", workingA, "parallel-base", []byte(`{"edit":"A"}`),
 	))
 	if err != nil {
 		t.Fatal(err)
 	}
 	frozen[1], err = service.FreezeArtifact(ctx, freezeCommand(
-		"parallel-b", workingB, "parallel-base", []byte(`{"edit":"B"}`),
+		t, service, "parallel-b", workingB, "parallel-base", []byte(`{"edit":"B"}`),
 	))
 	if err != nil {
 		t.Fatal(err)
@@ -317,10 +319,8 @@ func TestConcurrentSharedWorkspaceSuccessCAS(t *testing.T) {
 	for index, ref := range []TaskRef{taskA, taskB} {
 		artifactRef := frozen[index].Artifact.Ref
 		if _, err := service.CompleteTask(ctx, CompleteTaskCommand{
-			Meta: CommandMeta{
-				ID:               CommandID("parallel-complete-" + string(rune('a'+index))),
-				ExpectedRevision: frozen[index].Task.Revision,
-			},
+			Meta: workerMeta(t, service, ref,
+				CommandID("parallel-complete-"+string(rune('a'+index))), frozen[index].Task.Revision),
 			Task: ref, Submission: SubmissionID("parallel-submission-" + string(rune('a'+index))),
 			Artifact: &artifactRef, Message: textMessage("parallel-final-"+string(rune('a'+index)), "done"),
 		}); err != nil {
@@ -384,24 +384,24 @@ func TestArtifactPublicationRollbackAndDiscard(t *testing.T) {
 	first := createWorkingTask(t, service, contextRef, firstRef, "a")
 	second := createWorkingTask(t, service, contextRef, secondRef, "b")
 	if _, err := service.CompleteTask(ctx, CompleteTaskCommand{
-		Meta: CommandMeta{ID: "complete-a", ExpectedRevision: first.Revision},
+		Meta: workerMeta(t, service, firstRef, "complete-a", first.Revision),
 		Task: firstRef, Submission: "shared-submission", Message: textMessage("final-a", "done"),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	frozen, err := service.FreezeArtifact(ctx, freezeCommand("b", second, "base", []byte(`{"edit":"B"}`)))
+	frozen, err := service.FreezeArtifact(ctx, freezeCommand(t, service, "b", second, "base", []byte(`{"edit":"B"}`)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.CompleteTask(ctx, CompleteTaskCommand{
-		Meta: CommandMeta{ID: "content-only-b", ExpectedRevision: frozen.Task.Revision},
+		Meta: workerMeta(t, service, secondRef, "content-only-b", frozen.Task.Revision),
 		Task: secondRef, Submission: "content-submission-b", Message: textMessage("content-final-b", "done"),
 	}); !errors.Is(err, ErrArtifactState) {
 		t.Fatalf("content completion with frozen Artifact error = %v", err)
 	}
 	artifactRef := frozen.Artifact.Ref
 	if _, err := service.CompleteTask(ctx, CompleteTaskCommand{
-		Meta: CommandMeta{ID: "complete-b", ExpectedRevision: frozen.Task.Revision},
+		Meta: workerMeta(t, service, secondRef, "complete-b", frozen.Task.Revision),
 		Task: secondRef, Submission: "shared-submission", Artifact: &artifactRef,
 		Message: textMessage("final-b", "done"),
 	}); !errors.Is(err, ErrSubmissionConflict) {
@@ -440,13 +440,13 @@ func TestFailDiscardsFrozenArtifact(t *testing.T) {
 	contextRef, taskRef := refs("tenant-a", "fail-context", "fail-workspace", "fail-task")
 	working := createWorkingTask(t, service, contextRef, taskRef, "fail")
 	frozen, err := service.FreezeArtifact(ctx, freezeCommand(
-		"fail", working, "fail-base", []byte(`{"edit":"fail"}`),
+		t, service, "fail", working, "fail-base", []byte(`{"edit":"fail"}`),
 	))
 	if err != nil {
 		t.Fatal(err)
 	}
-	failed, err := service.FailTask(ctx, TaskCommand{
-		Meta: CommandMeta{ID: "fail-task", ExpectedRevision: frozen.Task.Revision}, Task: taskRef,
+	failed, err := service.FailTask(ctx, WorkerTaskCommand{
+		Meta: workerMeta(t, service, taskRef, "fail-task", frozen.Task.Revision), Task: taskRef,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -473,14 +473,14 @@ func TestReceiptUniqueFailureRollsBackWorkspaceCAS(t *testing.T) {
 	for index, suffix := range []string{"receipt-a", "receipt-b"} {
 		var err error
 		frozen[index], err = service.FreezeArtifact(ctx, freezeCommand(
-			suffix, working[index], "receipt-base", []byte(`{"edit":"`+suffix+`"}`),
+			t, service, suffix, working[index], "receipt-base", []byte(`{"edit":"`+suffix+`"}`),
 		))
 		if err != nil {
 			t.Fatal(err)
 		}
 		artifactRef := frozen[index].Artifact.Ref
 		if _, err := service.CompleteTask(ctx, CompleteTaskCommand{
-			Meta: CommandMeta{ID: CommandID("complete-" + suffix), ExpectedRevision: frozen[index].Task.Revision},
+			Meta: workerMeta(t, service, []TaskRef{taskA, taskB}[index], CommandID("complete-"+suffix), frozen[index].Task.Revision),
 			Task: []TaskRef{taskA, taskB}[index], Submission: SubmissionID("submission-" + suffix),
 			Artifact: &artifactRef, Message: textMessage("final-"+suffix, "done"),
 		}); err != nil {
@@ -536,12 +536,12 @@ func TestArtifactConflictRollsBackWorkspaceHeadBootstrap(t *testing.T) {
 	workingA := createWorkingTask(t, service, contextA, taskA, "bootstrap-a")
 	workingB := createWorkingTask(t, service, contextB, taskB, "bootstrap-b")
 	frozenA, err := service.FreezeArtifact(ctx, freezeCommand(
-		"bootstrap-a", workingA, "bootstrap-base-a", []byte(`{"edit":"A"}`),
+		t, service, "bootstrap-a", workingA, "bootstrap-base-a", []byte(`{"edit":"A"}`),
 	))
 	if err != nil {
 		t.Fatal(err)
 	}
-	conflict := freezeCommand("bootstrap-b", workingB, "bootstrap-base-b", []byte(`{"edit":"B"}`))
+	conflict := freezeCommand(t, service, "bootstrap-b", workingB, "bootstrap-base-b", []byte(`{"edit":"B"}`))
 	conflict.Artifact = frozenA.Artifact.Ref.ID
 	if _, err := service.FreezeArtifact(ctx, conflict); !errors.Is(err, ErrArtifactConflict) {
 		t.Fatalf("duplicate Artifact id error = %v", err)
@@ -564,14 +564,14 @@ func TestReceiptReadAndReplayRejectArtifactIdentityDrift(t *testing.T) {
 	contextRef, taskRef := refs("tenant-a", "drift-context", "drift-workspace", "drift-task")
 	working := createWorkingTask(t, service, contextRef, taskRef, "drift")
 	frozen, err := service.FreezeArtifact(ctx, freezeCommand(
-		"drift", working, "drift-base", []byte(`{"edit":"drift"}`),
+		t, service, "drift", working, "drift-base", []byte(`{"edit":"drift"}`),
 	))
 	if err != nil {
 		t.Fatal(err)
 	}
 	artifactRef := frozen.Artifact.Ref
 	if _, err := service.CompleteTask(ctx, CompleteTaskCommand{
-		Meta: CommandMeta{ID: "complete-drift", ExpectedRevision: frozen.Task.Revision},
+		Meta: workerMeta(t, service, taskRef, "complete-drift", frozen.Task.Revision),
 		Task: taskRef, Submission: "submission-drift", Artifact: &artifactRef,
 		Message: textMessage("final-drift", "done"),
 	}); err != nil {
@@ -623,7 +623,7 @@ func TestArtifactPayloadCorruptionFailsReadAndReplay(t *testing.T) {
 	ctx := context.Background()
 	contextRef, taskRef := refs("tenant-a", "payload-context", "payload-workspace", "payload-task")
 	working := createWorkingTask(t, service, contextRef, taskRef, "payload")
-	command := freezeCommand("payload", working, "payload-base", []byte(`{"edit":"A"}`))
+	command := freezeCommand(t, service, "payload", working, "payload-base", []byte(`{"edit":"A"}`))
 	frozen, err := service.FreezeArtifact(ctx, command)
 	if err != nil {
 		t.Fatal(err)
@@ -651,7 +651,7 @@ func TestSubmissionCannotReferenceAnotherTasksArtifact(t *testing.T) {
 	_, secondRef := refs("tenant-a", "fk-context", "fk-workspace", "fk-task-b")
 	first := createWorkingTask(t, service, contextRef, firstRef, "fk-a")
 	_ = createWorkingTask(t, service, contextRef, secondRef, "fk-b")
-	frozen, err := service.FreezeArtifact(ctx, freezeCommand("fk-a", first, "fk-base", []byte(`{"edit":"A"}`)))
+	frozen, err := service.FreezeArtifact(ctx, freezeCommand(t, service, "fk-a", first, "fk-base", []byte(`{"edit":"A"}`)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -674,14 +674,14 @@ func TestTaskReadRejectsMismatchedArtifactState(t *testing.T) {
 	contextRef, taskRef := refs("tenant-a", "state-context", "state-workspace", "state-task")
 	working := createWorkingTask(t, service, contextRef, taskRef, "state")
 	frozen, err := service.FreezeArtifact(ctx, freezeCommand(
-		"state", working, "state-base", []byte(`{"edit":"state"}`),
+		t, service, "state", working, "state-base", []byte(`{"edit":"state"}`),
 	))
 	if err != nil {
 		t.Fatal(err)
 	}
 	artifactRef := frozen.Artifact.Ref
 	if _, err := service.CompleteTask(ctx, CompleteTaskCommand{
-		Meta: CommandMeta{ID: "complete-state", ExpectedRevision: frozen.Task.Revision},
+		Meta: workerMeta(t, service, taskRef, "complete-state", frozen.Task.Revision),
 		Task: taskRef, Submission: "submission-state", Artifact: &artifactRef,
 		Message: textMessage("final-state", "done"),
 	}); err != nil {

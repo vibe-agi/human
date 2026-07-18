@@ -1,7 +1,7 @@
-// Package workspace contains transport-neutral identities intended for
-// HumanLLM and HumanAgent workspace delivery. The current Agent domain uses
-// them directly; the LLM runtime is not yet wired to the same revision chain.
-// This package does not read or write a filesystem.
+// Package workspace contains transport-neutral identities and the HumanAgent
+// caller-side apply journal. HumanLLM does not yet use these values or join the
+// same durable revision/apply chain. Payload values remain declarative;
+// filesystem mutation belongs to an explicitly supplied, authorized CASApplier.
 package workspace
 
 // Revision is an opaque workspace chain identity. Implementations compare it

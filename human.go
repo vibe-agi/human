@@ -5,9 +5,9 @@
 // separate task-oriented surface; its lifecycle is intentionally not built on
 // completion requests.
 //
-// The lower-level agent, workspace, gateway, local, and worker packages remain
-// available to embedders that need domain types or direct composition of
-// listeners, credentials, and the stock terminal UI.
+// The lower-level agent, a2a, workspace, gateway, local, and worker packages
+// remain available to embedders that need domain types or direct composition
+// of transports, listeners, credentials, and terminal UIs.
 package human
 
 import (
@@ -19,8 +19,9 @@ import (
 // LLMConfig is the configuration for the real-time HumanLLM surface.
 //
 // It is an alias, rather than a copied configuration, so the root facade and
-// gateway package cannot drift. DatabasePath must identify explicit durable
-// storage; DefaultLLMConfig deliberately leaves it empty.
+// gateway package cannot drift. DatabasePath must identify an explicit SQLite
+// database; production durability requires a filesystem path, while :memory:
+// is only ephemeral/test storage. DefaultLLMConfig deliberately leaves it empty.
 type LLMConfig = gateway.Config
 
 // LLM is the real-time HumanLLM surface. It implements http.Handler and owns

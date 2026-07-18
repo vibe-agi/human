@@ -190,6 +190,10 @@ expect_success agent-parallel-context "$FORMAL/HumanAgent.tla" "$FORMAL/HumanAge
 expect_success agent-identity-oracles "$FORMAL/HumanAgent.tla" "$FORMAL/HumanAgentIdentityOracles.cfg" 50
 expect_success agent-apply-oracles "$FORMAL/HumanAgent.tla" "$FORMAL/HumanAgentApplyOracles.cfg" 100000
 expect_success agent-baseline-oracles "$FORMAL/HumanAgent.tla" "$FORMAL/HumanAgentBaselineOracles.cfg" 100
+expect_success agent-transport-safety "$FORMAL/HumanAgentTransport.tla" "$FORMAL/HumanAgentTransportSafety.cfg" 100000
+expect_success agent-transport-lifecycle "$FORMAL/HumanAgentTransport.tla" "$FORMAL/HumanAgentTransportLifecycle.cfg" 50000
+expect_success agent-transport-conflict "$FORMAL/HumanAgentTransport.tla" "$FORMAL/HumanAgentTransportConflict.cfg" 20000
+expect_success agent-transport-liveness "$FORMAL/HumanAgentTransport.tla" "$FORMAL/HumanAgentTransportLiveness.cfg" 600
 expect_success system-composition "$FORMAL/HumanSystem.tla" "$FORMAL/HumanSystem.cfg" 200
 expect_success system-workspace-race "$FORMAL/HumanSystem.tla" "$FORMAL/HumanSystemRace.cfg" 15
 
@@ -216,11 +220,39 @@ expect_model_failure shared-workspace-has-independent-contexts \
 expect_model_failure parallel-tasks-in-context-are-reachable \
   "$FORMAL/HumanAgent.tla" "$FORMAL/HumanAgentParallelContextWitness.cfg" \
   "AtMostOneActiveTaskPerContext" 5
+expect_model_failure fenced-command-exact-replay-is-reachable \
+  "$FORMAL/HumanAgentTransport.tla" "$FORMAL/HumanAgentTransportReplayWitness.cfg" \
+  "NoReplayAfterFenceWitness" 20000
+expect_model_failure input-required-retains-grant-is-reachable \
+  "$FORMAL/HumanAgentTransport.tla" "$FORMAL/HumanAgentTransportInputWitness.cfg" \
+  "NoInputRoundWitness" 20000
 fi
 
 if [ "$PHASE" != "positive" ]; then
 echo
 echo "Mutation/oracle matrix"
+expect_failure agent-transport-owner-only agent_transport_owner_only \
+  "$FORMAL/HumanAgentTransportSafety.cfg" WorkerEffectAuthorizedAtCommit 5000
+expect_failure agent-transport-precheck-only agent_transport_precheck_only \
+  "$FORMAL/HumanAgentTransportSafety.cfg" WorkerEffectAuthorizedAtCommit 1000
+expect_failure agent-transport-revision-precheck agent_transport_revision_precheck_only \
+  "$FORMAL/HumanAgentTransportLifecycle.cfg" TaskRevisionCheckedAtCommit 20000
+expect_failure agent-transport-replay-needs-grant agent_transport_replay_requires_grant \
+  "$FORMAL/HumanAgentTransportSafety.cfg" ExactReplayNeverRejected 20000
+expect_failure agent-transport-replay-reeffects agent_transport_replay_reeffects \
+  "$FORMAL/HumanAgentTransportSafety.cfg" EffectAppliedExactlyOnce 10000
+expect_failure agent-transport-early-ack agent_transport_early_ack \
+  "$FORMAL/HumanAgentTransportSafety.cfg" ACKAfterDurableDecision 30
+expect_failure agent-transport-split-commit agent_transport_split_effect_receipt \
+  "$FORMAL/HumanAgentTransportSafety.cfg" EffectAndCommandReceiptAtomic 500
+expect_failure agent-transport-terminal-grant agent_transport_terminal_keeps_grant \
+  "$FORMAL/HumanAgentTransportLifecycle.cfg" TerminalTaskHasNoActiveGrant 20000
+expect_failure agent-transport-visible-precommit agent_transport_visible_precommit \
+  "$FORMAL/HumanAgentTransportSafety.cfg" VisibleGrantIsDurable 3
+expect_failure agent-transport-digest-replay agent_transport_digest_conflict_replays \
+  "$FORMAL/HumanAgentTransportConflict.cfg" AcceptedDeliveryHasExactCommand 8000
+expect_failure agent-transport-stale-nack agent_transport_stale_nack_keeps_outbox \
+  "$FORMAL/HumanAgentTransportSafety.cfg" SettledAfterDurableDecision 3000
 expect_failure old-frame-absorbs-future-ack sequence_old_frame_absorbs_future_ack \
   "$FORMAL/HumanWorkerSequence.cfg" OutboundACKsBoundAtEnqueue 3
 expect_failure rejection-delete-not-atomic sequence_rejection_not_atomic \

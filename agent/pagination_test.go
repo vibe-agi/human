@@ -37,14 +37,15 @@ func TestAgentPagesUnknownTasksAndNilContext(t *testing.T) {
 		t.Fatalf("second task page = %#v", secondPage)
 	}
 
-	working, err := service.AcceptTask(ctx, TaskCommand{
-		Meta: CommandMeta{ID: "accept-a", ExpectedRevision: 1}, Task: firstRef,
+	grant := acquireTestLease(t, service, firstRef)
+	working, err := service.AcceptTask(ctx, WorkerTaskCommand{
+		Meta: WorkerCommandMeta{ID: "accept-a", ExpectedRevision: 1, Grant: grant}, Task: firstRef,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	asked, err := service.RequestInput(ctx, MessageCommand{
-		Meta: CommandMeta{ID: "ask-a", ExpectedRevision: working.Revision}, Task: firstRef,
+	asked, err := service.RequestInput(ctx, WorkerMessageCommand{
+		Meta: WorkerCommandMeta{ID: "ask-a", ExpectedRevision: working.Revision, Grant: grant}, Task: firstRef,
 		Message: textMessage("question-a", "which environment?"),
 	})
 	if err != nil {

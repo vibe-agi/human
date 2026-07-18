@@ -32,8 +32,14 @@ func TestNewAgentPersistsTaskLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	working, err := service.AcceptTask(ctx, agent.TaskCommand{
-		Meta: agent.CommandMeta{ID: "accept-a", ExpectedRevision: created.Revision},
+	lease, err := service.AcquireLease(ctx, agent.AcquireLeaseCommand{
+		ID: "lease-a", Task: ref, Worker: "worker-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	working, err := service.AcceptTask(ctx, agent.WorkerTaskCommand{
+		Meta: agent.WorkerCommandMeta{ID: "accept-a", ExpectedRevision: created.Revision, Grant: lease.Grant},
 		Task: ref,
 	})
 	if err != nil {

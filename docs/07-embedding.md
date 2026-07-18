@@ -2,18 +2,19 @@
 
 Human 的进程形态不是封闭产品边界。`human local`、`human gateway`、`human worker` 是 HumanLLM 的官方 CLI 装配；库同时提供 `human.NewLLM()` 与 `human.NewAgent()` 两个根 facade，宿主可以保留自己的 listener、身份系统、路由、终端布局与进程生命周期。
 
-## 根 facade 与五个可组合 package
+## 根 facade 与可组合 package
 
 | package | 宿主获得什么 | 宿主仍负责什么 |
 |---|---|---|
 | `human` | `NewLLM` / `NewAgent` 两个明确命名的 lifecycle 构造器 | 选择并装配 HTTP/A2A/自定义 transport；根包不复制下层所有 DTO |
-| `agent` | durable Task/Context/Message/Event、content-only 或 Artifact Submission、命令幂等、Task revision CAS、apply receipt 与 Workspace confirmed-head CAS | 从已认证 principal 构造 AuthorityID；A2A/HTTP adapter、worker 调度、caller 侧真实 bundle apply ledger/journal |
+| `agent` | durable Task/Context/Message/Event、content-only 或 Artifact Submission、命令幂等、Task revision CAS、commit-time lease/fence、原子 claim、apply receipt 与 Workspace confirmed-head CAS | 从已认证 principal 构造 AuthorityID；决定调度策略并为远程 worker 提供 transport/outbox |
+| `a2a` | 官方 A2A 1.0 HTTP+JSON caller handler、Agent Card/extension 合同、SSE subscribe、Workspace Artifact 与 apply-receipt 映射 | 认证、Authority 和 Workspace 路由、HTTP listener/TLS；它不是 Human worker transport |
 | `local` | loopback listener、gateway、SQLite、worker 与官方 TUI 的一体化实例 | 把 `BaseURL()` 和 `CallerToken()` 直接交给进程内 Agent 客户端；默认临时凭据在 `Close` 时撤销，如需跨重启复用须显式选择 preserve 并负责加密或 mode `0600` 的持久化 |
 | `gateway` | completion 状态机、SQLite 恢复、模型 HTTP handler、worker WebSocket handler、内建 token 或自定义认证入口 | listener、路由前缀、TLS、反向代理、HTTP 超时、身份验证、secret 管理和优雅关闭 |
 | `worker` | WebSocket 重连、durable outbox、worker state、Live Workspace mirror 与可运行/可组合的 Bubble Tea model | worker credential 的安全取得与保存、mirror 路径、外层终端程序和关闭时机 |
-| `workspace` | 为两个 surface 的统一写链准备的 opaque Revision/Digest/Payload/ApplyDecision 值类型；当前 Agent 已使用，LLM 尚未接线 | 实际文件树 fingerprint、CAS、bundle journal 与副作用授权 |
+| `workspace` | opaque Revision/Digest/Payload/ApplyDecision、transport-neutral ApplyIntent/CASApplier 与单 owner SQLite apply journal | 实际文件树 fingerprint/CAS 与副作用授权；HumanLLM 尚未接入这条 revision chain |
 
-`human.NewLLM` 是 `gateway.Open` 的命名 facade，不是 `local.Open`：它不监听端口，也不自动创建 worker/TUI。传给 `NewLLM` 的 context 控制整个 gateway runtime；取消它会停止后台任务与活动 session。桌面一体化仍用 `local.Open`。`human.NewAgent` 同样只打开 durable Agent 领域对象，不监听、不认证 caller，也不声称已经实现 A2A；它的 context 只控制 Open，返回后的生命周期由每次 method context 与 `Close` 控制。Task 等领域类型来自 `human/agent`，避免根包机械复制第二套类型面。
+`human.NewLLM` 是 `gateway.Open` 的命名 facade，不是 `local.Open`：它不监听端口，也不自动创建 worker/TUI。传给 `NewLLM` 的 context 控制整个 gateway runtime；取消它会停止后台任务与活动 session。桌面一体化仍用 `local.Open`。`human.NewAgent` 同样只打开 durable Agent 领域对象，不监听、不认证 caller；官方 A2A caller 绑定由独立 `a2a.NewHandler` 装配，因而宿主仍拥有 router 和 HTTP 生命周期。`NewAgent` 的 context 只控制 Open，返回后的生命周期由每次 method context 与 `Close` 控制。Task 等领域类型来自 `human/agent`，避免根包机械复制第二套类型面。
 
 `local.Open` 适合桌面应用把“人 = LLM”直接放进本机进程。最小示例见 [`examples/embed-local`](../examples/embed-local/main.go)：它使用 `local.DefaultConfig()`，因此数据库、outbox 和 TUI state 位于 OS 用户私有数据目录并按真实 workspace 隔离，不会默认写进客户仓库。示例只打印 loopback base URL，绝不打印 caller/worker token；宿主应把 `CallerToken()` 在内存中直接注入自己的 Agent 客户端。库自行签发的凭据默认采用 `IssuedCredentialsRevokeOnClose`，所以示例反复运行不会在 SQLite 留下仍有效但宿主已丢失明文的 token。确需跨重启复用时，必须在 `Open` 前显式设置 `config.IssuedCredentialPolicy = local.IssuedCredentialsPreserve`，并把 `Credentials()` 的 caller/worker 两个 secret 作为一组持久化；`Existing*` 或 `CredentialProvider` 提供的凭据本来就由宿主拥有，不会被 `Close` 隐式撤销。下面的 `go run` 命令用于源码 checkout；二进制归档中的 examples 是可复制到宿主 Go module 的参考源码。
 
@@ -34,11 +35,25 @@ task, err := service.CreateTask(ctx, agent.CreateTaskCommand{/* ... */})
 
 示例的固定 ID 是有意的：反复运行会走同一命令的精确 replay，而不是重复创建 Task。缺失的数据库父目录由 `NewAgent` 以 mode `0700` 创建，SQLite 文件由库收紧为 mode `0600`；已经存在的显式父目录不会被库改权限或代替宿主审计，因此仍必须位于宿主控制的私有目录。
 
-当前实现已经包含独立 SQLite schema、命令级精确 replay/冲突、Task revision CAS、多轮 `input_required`、终态不可重开、分页 Message/Event、不可变 Artifact、final Submission 原子发布、取消/失败丢弃 frozen Artifact，以及 apply receipt 推进 Workspace confirmed head。Task、final message、Submission、Artifact publish 和 command result 在同一 SQLite 事务里；真实文件写入不在该事务中。caller adapter 必须先把 bundle apply 的 begin/outcome 持久化、执行实际 workspace CAS/journal，再提交精确 receipt；`indeterminate` 是终态决定，不能盲目重跑外部副作用。
+当前实现已经包含独立 SQLite schema、命令级精确 replay/冲突、Task revision CAS、多轮 `input_required`、终态不可重开、分页 Message/Event、不可变 Artifact、final Submission 原子发布、取消/失败丢弃 frozen Artifact，以及 apply receipt 推进 Workspace confirmed head。Agent worker mutation 需携带 `LeaseGrant`，并在 effect/command receipt 的同一 commit 内复验 worker、fence 与 expected revision；grant 不用墙钟到期，只由显式 fence 撤销。`ClaimLease` 把最早可领 Task 的选取、fence 增加、不可变 grant 历史和 command receipt 放在同一 SQLite 事务。Task、final message、Submission、Artifact publish 和 command result 也在同一 SQLite 事务里；真实文件写入不在该事务中。
+
+`workspace.OpenSQLiteApplyJournal` 提供 caller 侧的持久边界：它在调用宿主 `CASApplier` 前先持久 exact `ApplyIntent`；已完成记录只重放结果，重启发现的 `pending` 或 applier 错误被固化为 `indeterminate`，不盲目重跑外部副作用。宿主的 applier 必须真正实现 exact-base 文件树 CAS；journal 不会自己解释 bundle 或授权 shell 副作用。终态结果再通过 A2A apply-receipt extension 回传 Agent confirmed head。
 
 Workspace 第一个 Artifact 的 `ExpectedBaseRevision` 是受信 caller adapter 提供的 bootstrap，Agent 不会自行读取或 fingerprint 客户文件树；后续 freeze 必须精确匹配已确认 head。success receipt 还必须回显并观察到 Artifact 的 exact result revision。Artifact payload 默认最大 `16 MiB`，配置硬上限 `64 MiB`；它是声明式 bundle，不得夹带隐式 shell command。
 
-`AuthorityID` 只能从宿主已经认证的 principal 派生，不能直接相信 A2A/HTTP body 里的 tenant 字符串。当前 `NewAgent` 是受信进程内领域 API；把它接到远程 worker 前，还必须实现与 commit 同边界的 lease/fence grant 校验。A2A DTO、worker assignment 和 completion response 都不能反向进入 `agent` 领域类型。
+`AuthorityID` 只能从宿主已经认证的 principal 派生，不能直接相信 A2A/HTTP body 里的 tenant 字符串。领域已将 lease/fence 校验收到 commit 边界；尚未完成的是把 claim/grant 发送给远程人类 worker、持久其返回 command 并处理 ACK/NACK 的 transport/TUI。A2A DTO、worker assignment 和 completion response 都不能反向进入 `agent` 领域类型。
+
+## 嵌入 A2A caller 面
+
+[`examples/embed-a2a`](../examples/embed-a2a/main.go) 展示 `human.NewAgent` 与 `a2a.NewHandler` 的组合：宿主提供认证回调、从认证 principal 路由 Workspace，声明 A2A 1.0 HTTP+JSON Agent Card，再把 handler 挂到自有 mux。若 operations 使用 `/human-agent/` 之类前缀，标准 Agent Card discovery 仍应单独挂在 origin 的 `/.well-known/agent-card.json`；Card 里的 interface URL 则填写外部可达的 operations URL。示例故意不启动 listener，也不伪造 Human worker；没有真正 worker 领取 Task 时，Task 保持 `submitted` 才是正确表现。
+
+handler 支持 A2A send/get/list/cancel、SSE send streaming 和 `/tasks/{id}:subscribe`。A2A 1.0.1 的 proto 注解使用 GET，而同版本生成规范与官方 Go SDK 使用 POST，因此入口接受两者并归一到同一个订阅实现。默认 send 等到 `input-required` 或终态，`returnImmediately` 可只取当前 Task；流到 `input-required` 就按协议关闭，caller 提交回复后为后续 working/terminal 状态开启新的 send/subscribe 流，不用一条连接跨越人工等待。Agent Card 中标记 `required:true` 的 extension，客户端必须通过 `A2A-Extensions` 显式协商；不存在与公开 Card 不一致的隐藏必需项。Workspace 和 apply-receipt 是两个独立 extension，暴露 Artifact 身份不等于授权修改 confirmed head。Card 声明 apply-receipt extension 时必须同时提供 `AuthorizeApplyReceipt`，反过来也一样；`NewHandler` 会拒绝不一致配置，避免广告一个实际不存在或未授权的端点。
+
+当前 handler 没有持久化逐 Task 的 MIME 协商，因此采用可兑现的严格合同：Card 的 `defaultOutputModes` 必须覆盖 worker 可能发布的全部 Message/Artifact；非空 `acceptedOutputModes` 必须覆盖这整组输出；per-skill input/output mode override 会在构造时被拒绝，而不是公开一份运行时无法识别的分支能力。SDK 分发前还会验证请求是单一 UTF-8 JSON 值（send/apply 必须是 object）、递归拒绝重复字段，并拒绝已知标量 query 的重复值，避免官方 SDK 的 last-wins/first-wins 宽松解析进入幂等或过滤语义。
+
+`Config.PollInterval=0` 使用 `250ms` 的领域事件轮询；`KeepAliveInterval=0` 表示不发送 SSE keep-alive；`MaxRequestBytes=0` 使用 `8 MiB`。这些是 handler 行为，不会替宿主设置 `http.Server` 的 header/read/write/idle timeout。默认非流式 send 在 Task 暂停或终态前不会返回，因此宿主应按产品等待时长选择代理和 server deadline，而不能把普通短 API 的绝对 write timeout 原样套到 HumanAgent。
+
+`a2a.NewHandler` 不拥有 `agent.Agent`，也不拥有 listener。宿主应先停止 HTTP 流量，再 `Close` Agent。示例的 `X-Example-*` header **只是说明回调形状，不是生产认证**。生产可在 `Authenticate` 回调中直接验证 JWT/session/mTLS；若回调信任上游身份 header，入口必须先剥离客户端同名 header、验证受信代理跳，并阻止客户端绕过代理直达 handler。
 
 ## 嵌入自有 Gateway
 
@@ -91,8 +106,10 @@ HUMAN_EMBED_GATEWAY_DB=/absolute/private/path/gateway.db \
 
 - `gateway.Server` 不拥有 listener。先停止接收 HTTP，再调用 `Close`；`Close` 会主动终止并等待 `net/http` 无法随 `Shutdown` 收口的已劫持 worker WebSocket，全部 handler 退出后才关闭 SQLite。同一个 SQLite 文件不能被多个 gateway 实例当作集群共享存储。
 - `agent.Agent` 不拥有 listener/transport，持有一个单 owner SQLite；先停止调用它的 adapter，再调用幂等 `Close`。Agent DB 与 gateway DB 是两个独立 schema/identity，不能指向同一个文件。
+- `a2a.NewHandler` 不拥有 listener 或 `agent.Agent`，也没有独立的 `Close`；其请求和 SSE 订阅生命周期由宿主 HTTP server 与 request context 控制。必须先停止并等待这些 handler，再关闭 Agent。
+- `workspace.SQLiteApplyJournal` 拥有第三个独立的单 owner SQLite；`Close` 会等待活跃 `Apply`/`Lookup`。`CASApplier` 可调用 `Lookup`，但不得在回调内同步 `Close` journal，也不得递归 `Apply` 同一 identity，否则会等待自己。
 - `local.Local` 拥有自己的 loopback listener、gateway 与 worker，`Close` 是幂等的，并按显式 issued-credential policy 处理库签发凭据；一个实例只运行一次 TUI，重启需重新 `Open`。
 - `worker.Worker` 拥有网络客户端、outbox 与可选 state store；`Close` 取消并等待其活动 `Run`，一个实例只运行一次 TUI，重启需重新 `Open`。
 - TLS 终止、代理信任、HTTP/server 超时、secret persistence、备份与数据库文件权限最终都是宿主责任。默认路径是安全起点，不会替代部署审计。
 
-当前 gateway 与 Agent 公开持久层都只支持 SQLite 单实例，且各自要求显式、独立的数据库文件。内部 store interface 不是稳定 driver API；不要通过复制内部 package 假装获得 PostgreSQL/MySQL/Redis 支持。需要多实例或自有数据库时，应在公开 driver contract 明确后再扩展，或让多个业务入口共享一个独立 `human gateway`。
+当前 gateway、Agent 与 workspace apply journal 公开持久层都只支持 SQLite 单实例，三者各自要求显式、独立的数据库文件，不得互相共用。内部 store interface 不是稳定 driver API；不要通过复制内部 package 假装获得 PostgreSQL/MySQL/Redis 支持。需要多实例或自有数据库时，应在公开 driver contract 明确后再扩展，或让多个业务入口共享一个独立 `human gateway`。

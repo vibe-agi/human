@@ -45,6 +45,27 @@ func createCommand(commandID string, contextRef ContextRef, taskRef TaskRef, mes
 	}
 }
 
+func acquireTestLease(t *testing.T, service *Agent, task TaskRef) LeaseGrant {
+	t.Helper()
+	assignment, err := service.AcquireLease(context.Background(), AcquireLeaseCommand{
+		ID:   CommandID("lease-" + string(task.Workspace.ID) + "-" + string(task.ID)),
+		Task: task, Worker: "worker-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return assignment.Grant
+}
+
+func workerMeta(t *testing.T, service *Agent, task TaskRef, id CommandID, revision uint64) WorkerCommandMeta {
+	t.Helper()
+	assignment, err := service.GetLease(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return WorkerCommandMeta{ID: id, ExpectedRevision: revision, Grant: assignment.Grant}
+}
+
 func TestDurableTwoRoundConversationAndFreshFollowup(t *testing.T) {
 	service, path := openTestAgent(t)
 	ctx := context.Background()
@@ -57,7 +78,10 @@ func TestDurableTwoRoundConversationAndFreshFollowup(t *testing.T) {
 	if task.State != TaskSubmitted || task.Revision != 1 || task.MessageCount != 1 {
 		t.Fatalf("created task = %#v", task)
 	}
-	task, err = service.AcceptTask(ctx, TaskCommand{Meta: CommandMeta{ID: "cmd-accept-1", ExpectedRevision: 1}, Task: taskRef})
+	grant := acquireTestLease(t, service, taskRef)
+	task, err = service.AcceptTask(ctx, WorkerTaskCommand{
+		Meta: WorkerCommandMeta{ID: "cmd-accept-1", ExpectedRevision: 1, Grant: grant}, Task: taskRef,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,17 +98,19 @@ func TestDurableTwoRoundConversationAndFreshFollowup(t *testing.T) {
 		{false, "cmd-reply-2", "message-5", "yes"},
 	}
 	for _, step := range steps {
-		command := MessageCommand{
-			Meta: CommandMeta{ID: CommandID(step.id), ExpectedRevision: task.Revision},
-			Task: taskRef, Message: textMessage(step.message, step.text),
-		}
 		if step.request {
-			task, err = service.RequestInput(ctx, command)
+			task, err = service.RequestInput(ctx, WorkerMessageCommand{
+				Meta: WorkerCommandMeta{ID: CommandID(step.id), ExpectedRevision: task.Revision, Grant: grant},
+				Task: taskRef, Message: textMessage(step.message, step.text),
+			})
 			if err == nil && task.State != TaskInputRequired {
 				t.Fatalf("request state = %s", task.State)
 			}
 		} else {
-			task, err = service.ReplyTask(ctx, command)
+			task, err = service.ReplyTask(ctx, MessageCommand{
+				Meta: CommandMeta{ID: CommandID(step.id), ExpectedRevision: task.Revision},
+				Task: taskRef, Message: textMessage(step.message, step.text),
+			})
 			if err == nil && task.State != TaskWorking {
 				t.Fatalf("reply state = %s", task.State)
 			}
@@ -95,7 +121,7 @@ func TestDurableTwoRoundConversationAndFreshFollowup(t *testing.T) {
 	}
 
 	complete := CompleteTaskCommand{
-		Meta: CommandMeta{ID: "cmd-complete-1", ExpectedRevision: task.Revision},
+		Meta: WorkerCommandMeta{ID: "cmd-complete-1", ExpectedRevision: task.Revision, Grant: grant},
 		Task: taskRef, Submission: "submission-1",
 		Message: textMessage("message-6", "staging recovered"),
 	}
@@ -136,11 +162,11 @@ func TestDurableTwoRoundConversationAndFreshFollowup(t *testing.T) {
 		t.Fatalf("events = %#v", events)
 	}
 
-	_, err = service.RequestInput(ctx, MessageCommand{
-		Meta: CommandMeta{ID: "cmd-after-terminal", ExpectedRevision: task.Revision},
+	_, err = service.RequestInput(ctx, WorkerMessageCommand{
+		Meta: WorkerCommandMeta{ID: "cmd-after-terminal", ExpectedRevision: task.Revision, Grant: grant},
 		Task: taskRef, Message: textMessage("message-after-terminal", "should fail"),
 	})
-	if !errors.Is(err, ErrTerminalTask) {
+	if !errors.Is(err, ErrStaleLease) {
 		t.Fatalf("terminal request error = %v", err)
 	}
 
@@ -206,9 +232,10 @@ func TestCommandReplayAndRevisionCAS(t *testing.T) {
 		t.Fatalf("conflicting replay error = %v", err)
 	}
 
-	commands := []TaskCommand{
-		{Meta: CommandMeta{ID: "cmd-accept-a", ExpectedRevision: 1}, Task: taskRef},
-		{Meta: CommandMeta{ID: "cmd-accept-b", ExpectedRevision: 1}, Task: taskRef},
+	grant := acquireTestLease(t, service, taskRef)
+	commands := []WorkerTaskCommand{
+		{Meta: WorkerCommandMeta{ID: "cmd-accept-a", ExpectedRevision: 1, Grant: grant}, Task: taskRef},
+		{Meta: WorkerCommandMeta{ID: "cmd-accept-b", ExpectedRevision: 1, Grant: grant}, Task: taskRef},
 	}
 	var wait sync.WaitGroup
 	errorsSeen := make(chan error, len(commands))
@@ -264,8 +291,9 @@ func TestSameContextParallelTasksAndAuthorityIsolation(t *testing.T) {
 		}
 	}
 	for index, ref := range []TaskRef{taskA, taskB} {
-		if _, err := service.AcceptTask(ctx, TaskCommand{
-			Meta: CommandMeta{ID: CommandID("accept-" + string(rune('a'+index))), ExpectedRevision: 1}, Task: ref,
+		grant := acquireTestLease(t, service, ref)
+		if _, err := service.AcceptTask(ctx, WorkerTaskCommand{
+			Meta: WorkerCommandMeta{ID: CommandID("accept-" + string(rune('a'+index))), ExpectedRevision: 1, Grant: grant}, Task: ref,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -302,21 +330,22 @@ func TestMessageAndSubmissionFailuresRollbackWholeTransition(t *testing.T) {
 		}
 	}
 	for index, ref := range []TaskRef{firstRef, secondRef} {
-		if _, err := service.AcceptTask(ctx, TaskCommand{
-			Meta: CommandMeta{ID: CommandID("accept-" + string(rune('a'+index))), ExpectedRevision: 1}, Task: ref,
+		grant := acquireTestLease(t, service, ref)
+		if _, err := service.AcceptTask(ctx, WorkerTaskCommand{
+			Meta: WorkerCommandMeta{ID: CommandID("accept-" + string(rune('a'+index))), ExpectedRevision: 1, Grant: grant}, Task: ref,
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	first, err := service.RequestInput(ctx, MessageCommand{
-		Meta: CommandMeta{ID: "ask-a", ExpectedRevision: 2}, Task: firstRef,
+	first, err := service.RequestInput(ctx, WorkerMessageCommand{
+		Meta: workerMeta(t, service, firstRef, "ask-a", 2), Task: firstRef,
 		Message: textMessage("shared-message", "question"),
 	})
 	if err != nil || first.State != TaskInputRequired {
 		t.Fatalf("first input request = %#v, %v", first, err)
 	}
-	if _, err := service.RequestInput(ctx, MessageCommand{
-		Meta: CommandMeta{ID: "ask-b", ExpectedRevision: 2}, Task: secondRef,
+	if _, err := service.RequestInput(ctx, WorkerMessageCommand{
+		Meta: workerMeta(t, service, secondRef, "ask-b", 2), Task: secondRef,
 		Message: textMessage("shared-message", "another question"),
 	}); !errors.Is(err, ErrMessageConflict) {
 		t.Fatalf("duplicate message error = %v", err)
@@ -339,13 +368,13 @@ func TestMessageAndSubmissionFailuresRollbackWholeTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := service.CompleteTask(ctx, CompleteTaskCommand{
-		Meta: CommandMeta{ID: "complete-a", ExpectedRevision: first.Revision}, Task: firstRef,
+		Meta: workerMeta(t, service, firstRef, "complete-a", first.Revision), Task: firstRef,
 		Submission: "shared-submission", Message: textMessage("final-a", "done A"),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.CompleteTask(ctx, CompleteTaskCommand{
-		Meta: CommandMeta{ID: "complete-b", ExpectedRevision: second.Revision}, Task: secondRef,
+		Meta: workerMeta(t, service, secondRef, "complete-b", second.Revision), Task: secondRef,
 		Submission: "shared-submission", Message: textMessage("final-b", "done B"),
 	}); !errors.Is(err, ErrSubmissionConflict) {
 		t.Fatalf("duplicate submission error = %v", err)
@@ -374,8 +403,9 @@ func TestTransitionsOwnerLockAndClose(t *testing.T) {
 	if _, err := service.CreateTask(ctx, createCommand("create", contextRef, taskRef, "message", "start")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.RequestInput(ctx, MessageCommand{
-		Meta: CommandMeta{ID: "bad-request", ExpectedRevision: 1}, Task: taskRef,
+	grant := acquireTestLease(t, service, taskRef)
+	if _, err := service.RequestInput(ctx, WorkerMessageCommand{
+		Meta: WorkerCommandMeta{ID: "bad-request", ExpectedRevision: 1, Grant: grant}, Task: taskRef,
 		Message: textMessage("bad-message", "not working yet"),
 	}); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("invalid transition error = %v", err)

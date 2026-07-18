@@ -267,27 +267,36 @@ func (agent *Agent) CreateTask(ctx context.Context, command CreateTaskCommand) (
 	return cloneTask(task), nil
 }
 
-func (agent *Agent) AcceptTask(ctx context.Context, command TaskCommand) (Task, error) {
-	return agent.transition(ctx, "accept_task", command.Meta, command.Task, command, transition{
+func (agent *Agent) AcceptTask(ctx context.Context, command WorkerTaskCommand) (Task, error) {
+	if err := validateWorkerMeta(command.Meta, command.Task); err != nil {
+		return Task{}, err
+	}
+	return agent.transition(ctx, "accept_task", commandMeta(command.Meta), &command.Meta.Grant, command.Task, command, transition{
 		allowed: []TaskState{TaskSubmitted}, next: TaskWorking, event: EventTaskAccepted,
 	})
 }
 
-func (agent *Agent) RejectTask(ctx context.Context, command TaskCommand) (Task, error) {
-	return agent.transition(ctx, "reject_task", command.Meta, command.Task, command, transition{
+func (agent *Agent) RejectTask(ctx context.Context, command WorkerTaskCommand) (Task, error) {
+	if err := validateWorkerMeta(command.Meta, command.Task); err != nil {
+		return Task{}, err
+	}
+	return agent.transition(ctx, "reject_task", commandMeta(command.Meta), &command.Meta.Grant, command.Task, command, transition{
 		allowed: []TaskState{TaskSubmitted}, next: TaskRejected, event: EventTaskRejected,
 	})
 }
 
-func (agent *Agent) RequestInput(ctx context.Context, command MessageCommand) (Task, error) {
+func (agent *Agent) RequestInput(ctx context.Context, command WorkerMessageCommand) (Task, error) {
 	if err := validateCallContext(ctx); err != nil {
 		return Task{}, err
 	}
 	command.Message = cloneMessageInput(command.Message)
+	if err := validateWorkerMeta(command.Meta, command.Task); err != nil {
+		return Task{}, err
+	}
 	if err := validateMessageInput(command.Message); err != nil {
 		return Task{}, err
 	}
-	return agent.transition(ctx, "request_input", command.Meta, command.Task, command, transition{
+	return agent.transition(ctx, "request_input", commandMeta(command.Meta), &command.Meta.Grant, command.Task, command, transition{
 		allowed: []TaskState{TaskWorking}, next: TaskInputRequired,
 		event: EventInputRequired, author: AuthorAgent, message: &command.Message,
 	})
@@ -301,21 +310,24 @@ func (agent *Agent) ReplyTask(ctx context.Context, command MessageCommand) (Task
 	if err := validateMessageInput(command.Message); err != nil {
 		return Task{}, err
 	}
-	return agent.transition(ctx, "reply_task", command.Meta, command.Task, command, transition{
+	return agent.transition(ctx, "reply_task", command.Meta, nil, command.Task, command, transition{
 		allowed: []TaskState{TaskInputRequired}, next: TaskWorking,
 		event: EventCallerReplied, author: AuthorCaller, message: &command.Message,
 	})
 }
 
 func (agent *Agent) CancelTask(ctx context.Context, command TaskCommand) (Task, error) {
-	return agent.transition(ctx, "cancel_task", command.Meta, command.Task, command, transition{
+	return agent.transition(ctx, "cancel_task", command.Meta, nil, command.Task, command, transition{
 		allowed: []TaskState{TaskSubmitted, TaskWorking, TaskInputRequired},
 		next:    TaskCanceled, event: EventTaskCanceled, discardArtifact: true,
 	})
 }
 
-func (agent *Agent) FailTask(ctx context.Context, command TaskCommand) (Task, error) {
-	return agent.transition(ctx, "fail_task", command.Meta, command.Task, command, transition{
+func (agent *Agent) FailTask(ctx context.Context, command WorkerTaskCommand) (Task, error) {
+	if err := validateWorkerMeta(command.Meta, command.Task); err != nil {
+		return Task{}, err
+	}
+	return agent.transition(ctx, "fail_task", commandMeta(command.Meta), &command.Meta.Grant, command.Task, command, transition{
 		allowed: []TaskState{TaskWorking, TaskInputRequired},
 		next:    TaskFailed, event: EventTaskFailed, discardArtifact: true,
 	})
@@ -326,6 +338,9 @@ func (agent *Agent) CompleteTask(ctx context.Context, command CompleteTaskComman
 		return Task{}, err
 	}
 	command.Message = cloneMessageInput(command.Message)
+	if err := validateWorkerMeta(command.Meta, command.Task); err != nil {
+		return Task{}, err
+	}
 	if command.Artifact != nil {
 		artifact := *command.Artifact
 		command.Artifact = &artifact
@@ -339,7 +354,7 @@ func (agent *Agent) CompleteTask(ctx context.Context, command CompleteTaskComman
 	if err := validateMessageInput(command.Message); err != nil {
 		return Task{}, err
 	}
-	return agent.transition(ctx, "complete_task", command.Meta, command.Task, command, transition{
+	return agent.transition(ctx, "complete_task", commandMeta(command.Meta), &command.Meta.Grant, command.Task, command, transition{
 		allowed: []TaskState{TaskWorking}, next: TaskCompleted,
 		event: EventTaskCompleted, author: AuthorAgent, message: &command.Message,
 		submission: command.Submission, artifact: command.Artifact,
@@ -361,6 +376,7 @@ func (agent *Agent) transition(
 	ctx context.Context,
 	kind string,
 	meta CommandMeta,
+	grant *LeaseGrant,
 	ref TaskRef,
 	command any,
 	change transition,
@@ -394,11 +410,21 @@ func (agent *Agent) transition(
 		if replay.Ref != ref {
 			return Task{}, fmt.Errorf("%w: transition command result identity mismatch", ErrCorruptStore)
 		}
+		if grant != nil {
+			if _, err := verifyLeaseGrantHistory(ctx, tx, *grant); err != nil {
+				return Task{}, err
+			}
+		}
 		return replay, nil
 	}
 	current, err := loadTask(ctx, tx, ref)
 	if err != nil {
 		return Task{}, err
+	}
+	if grant != nil {
+		if err := requireCurrentLease(ctx, tx, *grant); err != nil {
+			return Task{}, err
+		}
 	}
 	if current.Revision != meta.ExpectedRevision {
 		return Task{}, &RevisionConflictError{Expected: meta.ExpectedRevision, Actual: current.Revision}
@@ -434,13 +460,48 @@ func (agent *Agent) transition(
 			return Task{}, fmt.Errorf("%w: completion must publish the Task's exact frozen Artifact", ErrArtifactState)
 		}
 	}
-	result, err := tx.ExecContext(ctx, `
-		UPDATE agent_tasks
-		SET state = ?, revision = ?, message_count = ?, event_count = ?, updated_at = ?
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?`,
-		next.State, next.Revision, next.MessageCount, next.EventCount, unixNano(now),
-		ref.Workspace.Authority, ref.Workspace.ID, ref.ID, meta.ExpectedRevision,
-	)
+	var result sql.Result
+	if grant != nil {
+		if next.State.Terminal() {
+			result, err = tx.ExecContext(ctx, `
+				UPDATE agent_tasks
+				SET state = ?, revision = ?, message_count = ?, event_count = ?,
+				    updated_at = ?, lease_owner = ''
+				WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?
+				  AND lease_owner = ? AND lease_fence = ?`,
+				next.State, next.Revision, next.MessageCount, next.EventCount, unixNano(now),
+				ref.Workspace.Authority, ref.Workspace.ID, ref.ID, meta.ExpectedRevision,
+				grant.Worker, grant.Fence,
+			)
+		} else {
+			result, err = tx.ExecContext(ctx, `
+				UPDATE agent_tasks
+				SET state = ?, revision = ?, message_count = ?, event_count = ?, updated_at = ?
+				WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?
+				  AND lease_owner = ? AND lease_fence = ?`,
+				next.State, next.Revision, next.MessageCount, next.EventCount, unixNano(now),
+				ref.Workspace.Authority, ref.Workspace.ID, ref.ID, meta.ExpectedRevision,
+				grant.Worker, grant.Fence,
+			)
+		}
+	} else if next.State.Terminal() {
+		result, err = tx.ExecContext(ctx, `
+			UPDATE agent_tasks
+			SET state = ?, revision = ?, message_count = ?, event_count = ?,
+			    updated_at = ?, lease_owner = ''
+			WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?`,
+			next.State, next.Revision, next.MessageCount, next.EventCount, unixNano(now),
+			ref.Workspace.Authority, ref.Workspace.ID, ref.ID, meta.ExpectedRevision,
+		)
+	} else {
+		result, err = tx.ExecContext(ctx, `
+			UPDATE agent_tasks
+			SET state = ?, revision = ?, message_count = ?, event_count = ?, updated_at = ?
+			WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?`,
+			next.State, next.Revision, next.MessageCount, next.EventCount, unixNano(now),
+			ref.Workspace.Authority, ref.Workspace.ID, ref.ID, meta.ExpectedRevision,
+		)
+	}
 	if err != nil {
 		return Task{}, fmt.Errorf("update Agent task for %s: %w", kind, err)
 	}
@@ -449,6 +510,11 @@ func (agent *Agent) transition(
 		return Task{}, fmt.Errorf("inspect Agent task update for %s: %w", kind, err)
 	}
 	if affected != 1 {
+		if grant != nil {
+			if leaseErr := requireCurrentLease(ctx, tx, *grant); leaseErr != nil {
+				return Task{}, leaseErr
+			}
+		}
 		latest, loadErr := loadTask(ctx, tx, ref)
 		if loadErr != nil {
 			return Task{}, loadErr

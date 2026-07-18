@@ -111,8 +111,8 @@ func TestHistoryPagesRejectSequenceGaps(t *testing.T) {
 	ctx := context.Background()
 	contextRef, taskRef := refs("tenant-a", "context", "workspace", "task")
 	task := createWorkingTask(t, service, contextRef, taskRef, "history")
-	task, err := service.RequestInput(ctx, MessageCommand{
-		Meta: CommandMeta{ID: "ask", ExpectedRevision: task.Revision}, Task: taskRef,
+	task, err := service.RequestInput(ctx, WorkerMessageCommand{
+		Meta: workerMeta(t, service, taskRef, "ask", task.Revision), Task: taskRef,
 		Message: textMessage("question", "which environment?"),
 	})
 	if err != nil {
@@ -179,8 +179,9 @@ func TestClockRollbackCannotCommitUnreadableState(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock = clock.Add(-time.Hour)
-	working, err := service.AcceptTask(ctx, TaskCommand{
-		Meta: CommandMeta{ID: "accept", ExpectedRevision: created.Revision}, Task: taskRef,
+	grant := acquireTestLease(t, service, taskRef)
+	working, err := service.AcceptTask(ctx, WorkerTaskCommand{
+		Meta: WorkerCommandMeta{ID: "accept", ExpectedRevision: created.Revision, Grant: grant}, Task: taskRef,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -192,14 +193,14 @@ func TestClockRollbackCannotCommitUnreadableState(t *testing.T) {
 		t.Fatalf("read after clock rollback: %v", err)
 	}
 	frozen, err := service.FreezeArtifact(ctx, freezeCommand(
-		"clock", working, "clock-base", []byte(`{"edit":"clock"}`),
+		t, service, "clock", working, "clock-base", []byte(`{"edit":"clock"}`),
 	))
 	if err != nil {
 		t.Fatal(err)
 	}
 	artifactRef := frozen.Artifact.Ref
 	if _, err := service.CompleteTask(ctx, CompleteTaskCommand{
-		Meta: CommandMeta{ID: "complete", ExpectedRevision: frozen.Task.Revision},
+		Meta: workerMeta(t, service, taskRef, "complete", frozen.Task.Revision),
 		Task: taskRef, Submission: "submission", Artifact: &artifactRef,
 		Message: textMessage("final", "done"),
 	}); err != nil {

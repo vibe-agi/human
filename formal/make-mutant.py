@@ -22,6 +22,110 @@ def replacement(old: str, new: str) -> tuple[str, str]:
 
 
 MUTANTS: dict[str, tuple[str, list[tuple[str, str]]]] = {
+    "agent_transport_owner_only": (
+        "HumanAgentTransport.tla",
+        [replacement(
+            "CommitGrantCurrent(envelope) == GrantCurrent(envelope)\n",
+            "CommitGrantCurrent(envelope) ==\n"
+            "  leaseOwner[EnvelopeTask(envelope)] = envelope.worker\n",
+        )],
+    ),
+    "agent_transport_precheck_only": (
+        "HumanAgentTransport.tla",
+        [replacement(
+            "CommitGrantCurrent(envelope) == GrantCurrent(envelope)\n",
+            "CommitGrantCurrent(envelope) == envelope \\in grantPrechecked\n",
+        )],
+    ),
+    "agent_transport_revision_precheck_only": (
+        "HumanAgentTransport.tla",
+        [replacement(
+            "CommitRevisionCurrent(envelope) == RevisionCurrent(envelope)\n",
+            "CommitRevisionCurrent(envelope) == envelope \\in revisionPrechecked\n",
+        )],
+    ),
+    "agent_transport_replay_requires_grant": (
+        "HumanAgentTransport.tla",
+        [replacement(
+            "ReplayAuthorization(envelope) == TRUE\n",
+            "ReplayAuthorization(envelope) == GrantCurrent(envelope)\n",
+        )],
+    ),
+    "agent_transport_replay_reeffects": (
+        "HumanAgentTransport.tla",
+        [replacement(
+            "  /\\ UNCHANGED <<taskVars, outbox, wire, effects, commandReceipts,\n"
+            "                  commitFacts, effectCount, ackWire, nackWire, settled,\n"
+            "                  environmentVars>>\n\n"
+            "RejectPrepared(envelope) ==\n",
+            "  /\\ effectCount' =\n"
+            "       [effectCount EXCEPT ![CommandInput(envelope)] = @ + 1]\n"
+            "  /\\ UNCHANGED <<taskVars, outbox, wire, effects, commandReceipts,\n"
+            "                  commitFacts, ackWire, nackWire, settled,\n"
+            "                  environmentVars>>\n\n"
+            "RejectPrepared(envelope) ==\n",
+        )],
+    ),
+    "agent_transport_early_ack": (
+        "HumanAgentTransport.tla",
+        [replacement(
+            "  /\\ envelope \\in deliveryAccepted \\cap outbox\n"
+            "  /\\ envelope \\notin ackWire\n",
+            "  /\\ envelope \\in outbox\n"
+            "  /\\ envelope \\notin ackWire\n",
+        )],
+    ),
+    "agent_transport_split_effect_receipt": (
+        "HumanAgentTransport.tla",
+        [replacement(
+            "     /\\ commandReceipts' = commandReceipts \\union {command}\n"
+            "     /\\ commitFacts' = commitFacts \\union {fact}\n",
+            "     /\\ commandReceipts' = commandReceipts\n"
+            "     /\\ commitFacts' = commitFacts \\union {fact}\n",
+        )],
+    ),
+    "agent_transport_terminal_keeps_grant": (
+        "HumanAgentTransport.tla",
+        [replacement(
+            "     /\\ leaseOwner' =\n"
+            "          IF TerminalOperation(envelope)\n"
+            "          THEN [leaseOwner EXCEPT ![ref] = NoWorker]\n"
+            "          ELSE leaseOwner\n",
+            "     /\\ leaseOwner' = leaseOwner\n",
+        )],
+    ),
+    "agent_transport_visible_precommit": (
+        "HumanAgentTransport.tla",
+        [replacement(
+            "ExposeGrant(grant) ==\n"
+            "  /\\ grant \\in durableGrants \\ visibleGrants\n"
+            "  /\\ grant = CurrentGrant(TaskRef(grant.authority, grant.workspace, grant.task))\n",
+            "ExposeGrant(grant) ==\n"
+            "  /\\ grant \\in (durableGrants \\union grantPrepared) \\ visibleGrants\n"
+            "  \\* MUTANT: expose an internal grant before its transaction commits.\n",
+        )],
+    ),
+    "agent_transport_digest_conflict_replays": (
+        "HumanAgentTransport.tla",
+        [replacement(
+            "ExactCommitted(envelope) ==\n"
+            "  CommandInput(envelope) \\in commandReceipts\n",
+            "ExactCommitted(envelope) ==\n"
+            "  \\E receipt \\in commandReceipts :\n"
+            "    CommandKey(receipt) = CommandKey(envelope)\n",
+        )],
+    ),
+    "agent_transport_stale_nack_keeps_outbox": (
+        "HumanAgentTransport.tla",
+        [replacement(
+            "ConsumeNACK(envelope) ==\n"
+            "  /\\ envelope \\in nackWire \\cap outbox\n"
+            "  /\\ outbox' = outbox \\ {envelope}\n",
+            "ConsumeNACK(envelope) ==\n"
+            "  /\\ envelope \\in nackWire \\cap outbox\n"
+            "  /\\ outbox' = outbox\n",
+        )],
+    ),
     "sequence_old_frame_absorbs_future_ack": (
         "HumanWorkerSequence.tla",
         [replacement(
