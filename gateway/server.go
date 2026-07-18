@@ -664,12 +664,14 @@ func (server *Server) Revoke(ctx context.Context, keyID string) error {
 	return server.tokens.Revoke(ctx, keyID)
 }
 
-// Close stops completion and retention work, waits for durable cleanup, and
-// closes SQLite. The embedding application should stop its HTTP server before
-// calling Close so no handler can race store shutdown. Close is idempotent.
+// Close terminates and drains worker WebSockets, stops completion and retention
+// work, waits for durable cleanup, and closes SQLite. The embedding application
+// should still stop its HTTP server before calling Close so no new model handler
+// can race store shutdown. Close is idempotent.
 func (server *Server) Close() error {
 	server.close.Do(func() {
 		server.cancel()
+		server.worker.Close()
 		server.model.Wait()
 		server.run.Wait()
 		server.err = server.database.Close()

@@ -498,7 +498,7 @@ func TestFailedProgressSendRestoresTurnAndMergedDraft(t *testing.T) {
 	t.Parallel()
 	client := newFakeClient()
 	model := receiveAndAccept(t, New(client), testAssignment())
-	client.sendErr = errors.New("outbox unavailable")
+	client.sendErr = definitelyNotStored("outbox unavailable")
 	model = updateModel(t, model, tea.KeyPressMsg{Text: "do not lose me", Code: 0})
 	model, send := updateModelWithCommand(t, model, tea.KeyPressMsg{Code: tea.KeyEnter})
 	if send == nil || model.active == nil || model.pending.kind != pendingReply {

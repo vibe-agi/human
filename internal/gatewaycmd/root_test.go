@@ -67,6 +67,39 @@ func TestTokenIssueAndRevoke(t *testing.T) {
 	}
 }
 
+func TestUnexpectedTokenArgumentsDoNotCreateDatabase(t *testing.T) {
+	t.Parallel()
+	testCases := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "issue",
+			args: []string{"token", "issue", "--type", "caller", "--subject", "caller-1", "extra"},
+		},
+		{
+			name: "revoke",
+			args: []string{"token", "revoke", "--key-id", "key-1", "extra"},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			databasePath := filepath.Join(t.TempDir(), "human.db")
+			args := append([]string{"--db", databasePath}, testCase.args...)
+			output, err := execute(t, args...)
+			if err == nil || !strings.Contains(err.Error(), "unknown command") {
+				t.Fatalf("unexpected argument error = %v", err)
+			}
+			if output != "" {
+				t.Fatalf("unexpected output = %q", output)
+			}
+			if _, statErr := os.Stat(databasePath); !os.IsNotExist(statErr) {
+				t.Fatalf("database exists or could not be checked after rejected command: %v", statErr)
+			}
+		})
+	}
+}
+
 func TestTokenAdministrationRefusesLiveGatewayOwner(t *testing.T) {
 	databasePath := filepath.Join(t.TempDir(), "human.db")
 	config := publicgateway.DefaultConfig()

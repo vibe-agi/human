@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,15 +15,16 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/completion/canonical"
+	workmirror "github.com/vibe-agi/human/internal/mirror"
 	"github.com/vibe-agi/human/internal/workerclient"
 	"github.com/vibe-agi/human/internal/workerstate"
 )
 
 const (
-	workerStateDraftKind        = "tui_draft_v2"
-	workerStateContinuationKind = "tui_continuation_v2"
-	workerStatePendingSendKind  = "tui_pending_send_v2"
-	workerStateVersion          = 2
+	workerStateDraftKind        = "tui_draft_v3"
+	workerStateContinuationKind = "tui_continuation_v3"
+	workerStatePendingSendKind  = "tui_pending_send_v3"
+	workerStateVersion          = 3
 	workerStateLoadTimeout      = 2 * time.Second
 	workerStateWriteTimeout     = 5 * time.Second
 	workerStateRetryMin         = 250 * time.Millisecond
@@ -78,19 +81,24 @@ type savedStateDraft struct {
 }
 
 type persistedDraft struct {
-	Version       int             `json:"version"`
-	Focus         string          `json:"focus,omitempty"`
-	Reply         string          `json:"reply,omitempty"`
-	Command       string          `json:"command,omitempty"`
-	HasTasks      bool            `json:"has_tasks,omitempty"`
-	Tasks         []persistedTask `json:"tasks,omitempty"`
-	TaskSelected  int             `json:"task_selected,omitempty"`
-	TaskDirty     bool            `json:"task_dirty,omitempty"`
-	TaskEditing   bool            `json:"task_editing,omitempty"`
-	TaskEditIndex int             `json:"task_edit_index,omitempty"`
-	TaskInput     string          `json:"task_input,omitempty"`
-	ToolInput     string          `json:"tool_input,omitempty"`
-	ToolCallIDs   []string        `json:"tool_call_ids,omitempty"`
+	Version            int                        `json:"version"`
+	Authority          string                     `json:"authority,omitempty"`
+	RejectedEventIDs   []string                   `json:"rejected_event_ids,omitempty"`
+	RejectedEventKinds map[string]pendingSendKind `json:"rejected_event_kinds,omitempty"`
+	Focus              string                     `json:"focus,omitempty"`
+	Reply              string                     `json:"reply,omitempty"`
+	ReplyRejected      string                     `json:"reply_rejected,omitempty"`
+	ReplyTail          string                     `json:"reply_tail,omitempty"`
+	Command            string                     `json:"command,omitempty"`
+	HasTasks           bool                       `json:"has_tasks,omitempty"`
+	Tasks              []persistedTask            `json:"tasks,omitempty"`
+	TaskSelected       int                        `json:"task_selected,omitempty"`
+	TaskDirty          bool                       `json:"task_dirty,omitempty"`
+	TaskEditing        bool                       `json:"task_editing,omitempty"`
+	TaskEditIndex      int                        `json:"task_edit_index,omitempty"`
+	TaskInput          string                     `json:"task_input,omitempty"`
+	ToolInput          string                     `json:"tool_input,omitempty"`
+	ToolCallIDs        []string                   `json:"tool_call_ids,omitempty"`
 }
 
 type persistedTask struct {
@@ -112,15 +120,25 @@ const (
 )
 
 type persistedPendingSend struct {
-	Version     int                    `json:"version"`
-	Disposition string                 `json:"disposition"`
-	Kind        pendingSendKind        `json:"kind"`
-	Assignment  completion.Assignment  `json:"assignment"`
-	Event       completion.Event       `json:"event"`
-	Context     *completion.Assignment `json:"context,omitempty"`
-	Draft       persistedDraft         `json:"draft"`
-	Remaining   persistedDraft         `json:"remaining_draft"`
-	ToolCalls   []completion.ToolCall  `json:"tool_calls,omitempty"`
+	Version                int                    `json:"version"`
+	Disposition            string                 `json:"disposition"`
+	Kind                   pendingSendKind        `json:"kind"`
+	Assignment             completion.Assignment  `json:"assignment"`
+	Event                  completion.Event       `json:"event"`
+	Context                *completion.Assignment `json:"context,omitempty"`
+	Draft                  persistedDraft         `json:"draft"`
+	Remaining              persistedDraft         `json:"remaining_draft"`
+	DraftOrigins           []persistedDraftOrigin `json:"draft_origins,omitempty"`
+	ToolCalls              []completion.ToolCall  `json:"tool_calls,omitempty"`
+	DeliveryNamespace      string                 `json:"delivery_namespace,omitempty"`
+	DeliveryGeneration     uint64                 `json:"delivery_generation,omitempty"`
+	DeliveryChanges        []workmirror.Change    `json:"delivery_changes,omitempty"`
+	DeliveryIntentRecorded bool                   `json:"delivery_intent_recorded,omitempty"`
+}
+
+type persistedDraftOrigin struct {
+	Scope  workerstate.Scope `json:"scope"`
+	SHA256 string            `json:"sha256"`
 }
 
 type savedPendingSend struct {
@@ -128,6 +146,7 @@ type savedPendingSend struct {
 	disposition    string
 	updatedAt      time.Time
 	intentRevision int64
+	latestRevision int64
 }
 
 type stateWriteOperation struct {
@@ -207,6 +226,7 @@ func (model *Model) loadWorkerState() {
 			allPendingSends = append(allPendingSends, savedPendingSend{
 				pending: pendingSendFromPersisted(persisted), disposition: persisted.Disposition,
 				updatedAt: record.UpdatedAt, intentRevision: record.CreatedRevision,
+				latestRevision: record.Revision,
 			})
 		default:
 			// A newer binary may own this kind. Leave it untouched rather than
@@ -274,11 +294,42 @@ func (model *Model) loadWorkerState() {
 }
 
 func (model *Model) activateRecoveredPending(pending pendingSend) {
+	if pending.kind == pendingDelivery {
+		assignment := pending.assignment
+		model.active = &assignment
+		model.draftAuthority = assignmentDraftAuthority(assignment)
+		if pending.context != nil {
+			model.lastContext = cloneAssignment(pending.context)
+		} else {
+			model.lastContext = cloneAssignment(&assignment)
+		}
+		stage := deliveryConfirming
+		if pending.deliveryIntentRecorded {
+			stage = deliveryConfirmed
+		}
+		model.delivery = deliveryReview{
+			stage: stage, sessionKey: assignment.SessionKey(),
+			namespace: pending.deliveryNamespace, generation: pending.deliveryGeneration,
+			changes: cloneMirrorChanges(pending.deliveryChanges),
+			calls:   append([]completion.ToolCall(nil), pending.event.ToolCalls...),
+			eventID: pending.event.ID,
+		}
+		if draft, origin, ok := model.takePersistentDraft(assignment); ok {
+			if digest := persistedDraftDigest(draft); digest != "" {
+				model.draftOrigins[origin] = digest
+			}
+			model.applyPersistentDraft(draft)
+		}
+		model.focus = focusTasks
+		model.ui.chatFollow = true
+		return
+	}
 	if pending.event.Type != completion.EventProgress {
 		return
 	}
 	assignment := pending.assignment
 	model.active = &assignment
+	model.draftAuthority = assignmentDraftAuthority(assignment)
 	if pending.context != nil {
 		model.lastContext = cloneAssignment(pending.context)
 	} else {
@@ -288,7 +339,10 @@ func (model *Model) activateRecoveredPending(pending pendingSend) {
 		model.appendLocalText(assignment, canonical.RoleAssistant, pending.reply)
 	}
 	model.loadAgentTasks(assignment)
-	if draft, ok := model.takePersistentDraft(assignment); ok {
+	if draft, origin, ok := model.takePersistentDraft(assignment); ok {
+		if digest := persistedDraftDigest(draft); digest != "" {
+			model.draftOrigins[origin] = digest
+		}
 		model.applyPersistentDraft(draft)
 	}
 	model.focus = focusReply
@@ -298,26 +352,40 @@ func (model *Model) activateRecoveredPending(pending pendingSend) {
 func (model *Model) reconcilePendingDraft(saved savedPendingSend) {
 	target := stateScope(saved.pending.assignment)
 	exact := stateRecordKey{scope: target, kind: workerStateDraftKind}
-	var latest savedStateDraft
-	found := false
-	for key, draft := range model.stateDrafts {
-		if key.kind != workerStateDraftKind || !recoverableDraftScope(key.scope, target) {
+	// A pending intent owns only the editor row from its exact request. Other
+	// request rows in the same stable Workspace task may be parked rejected
+	// drafts; consuming them here would silently lose independent human input.
+	latest, found := model.stateDrafts[exact]
+	delete(model.stateDrafts, exact)
+	for _, origin := range saved.pending.draftOrigins {
+		if origin.key.kind != workerStateDraftKind || origin.digest == "" {
 			continue
 		}
-		if !found || draft.revision > latest.revision {
-			latest, found = draft, true
+		if candidate, exists := model.stateDrafts[origin.key]; exists &&
+			persistedDraftDigest(candidate.draft) == origin.digest {
+			delete(model.stateDrafts, origin.key)
 		}
-		delete(model.stateDrafts, key)
 	}
 
+	recoveryRevision := saved.intentRevision
+	if saved.pending.kind == pendingDelivery && saved.pending.deliveryIntentRecorded {
+		// A phase=true delivery row has already frozen its editor remainder. Later
+		// rewrites of that same row advance the causal snapshot boundary; an older
+		// whole-editor row must not overwrite the newer embedded remainder after a
+		// crash. Ordinary sends and restore dispositions intentionally retain their
+		// CreatedRevision boundary so local tails written after the original intent
+		// still win.
+		recoveryRevision = saved.latestRevision
+	}
 	var recovered persistedDraft
 	switch {
-	case found && latest.revision > saved.intentRevision:
+	case found && latest.revision > recoveryRevision:
 		// This row was written after the exact intent and is a new operator tail.
 		// A successful send keeps it byte-for-byte; a failed handoff restores only
 		// the source pane in front of that newer tail.
 		recovered = latest.draft
-		if saved.disposition == pendingSendDispositionRestore {
+		if saved.disposition == pendingSendDispositionRestore &&
+			!hasEventID(latest.draft.RejectedEventIDs, saved.pending.event.ID) {
 			recovered = mergePendingSource(recovered, saved.pending)
 		}
 	default:
@@ -332,7 +400,7 @@ func (model *Model) reconcilePendingDraft(saved savedPendingSend) {
 	recovered = sanitizePersistedDraft(recovered)
 	if persistedDraftHasContent(recovered) {
 		updatedAt := saved.updatedAt
-		revision := saved.intentRevision
+		revision := recoveryRevision
 		if found && latest.revision > revision {
 			updatedAt = latest.updatedAt
 			revision = latest.revision
@@ -347,9 +415,20 @@ func mergePendingSource(tail persistedDraft, pending pendingSend) persistedDraft
 		tail.Version = workerStateVersion
 		tail.TaskEditIndex = -1
 	}
+	tail.Authority = mergeDraftAuthorities(source.Authority, tail.Authority)
+	tail.RejectedEventIDs = uniqueEventIDs(append(
+		append([]string(nil), tail.RejectedEventIDs...), source.RejectedEventIDs...,
+	)...)
+	tail.RejectedEventKinds = mergeEventKinds(tail.RejectedEventKinds, source.RejectedEventKinds)
 	switch pending.kind {
 	case pendingReply:
-		tail.Reply = joinDraftSegments(source.Reply, tail.Reply)
+		localTail := tail.Reply
+		if tail.ReplyRejected != "" || tail.ReplyTail != "" {
+			localTail = tail.ReplyTail
+		}
+		tail.ReplyRejected = joinDraftSegments(tail.ReplyRejected, source.Reply)
+		tail.ReplyTail = localTail
+		tail.Reply = joinDraftSegments(tail.ReplyRejected, tail.ReplyTail)
 	case pendingCommand:
 		tail.Command = joinDraftSegments(source.Command, tail.Command)
 	case pendingTasks:
@@ -369,6 +448,9 @@ func mergePendingSource(tail persistedDraft, pending pendingSend) persistedDraft
 			}
 			tail.ToolCallIDs = append(append([]string(nil), source.ToolCallIDs...), tail.ToolCallIDs...)
 		}
+	case pendingDelivery:
+		// File delivery has no editor source to restore. Its exact event and
+		// reviewed changes remain in the pending journal until outbox handoff.
 	}
 	if tail.Focus == "" {
 		tail.Focus = pendingKindFocus(pending.kind)
@@ -434,9 +516,10 @@ func (model *Model) nextStateCommand() tea.Cmd {
 		if _, keep := protected[key]; keep {
 			continue
 		}
-		if _, exists := model.stateSynced[key]; !exists {
-			continue
-		}
+		// stateManaged means a Put was scheduled or a row was loaded. Even when
+		// stateSynced has no value, a failed Put may have committed before its
+		// error reached us. Delete is idempotent and is the only safe way to close
+		// rejection barriers for that commit-ambiguous row.
 		operation := stateWriteOperation{key: key, delete: true}
 		model.stateWriting = true
 		return writeWorkerState(model.stateStore, operation)
@@ -486,14 +569,28 @@ func (model *Model) applyStateWriteResult(result stateWriteResult) tea.Cmd {
 		}
 		model.stateRetryAttempt = 0
 		model.stateWriteWarning = ""
+		if result.operation.delete && result.operation.key.kind == workerStatePendingSendKind {
+			if command := model.completeRejectedPendingDelete(result.operation.key); command != nil {
+				return command
+			}
+		}
 		if !result.operation.delete && result.operation.key.kind == workerStatePendingSendKind &&
 			model.pending.kind != pendingNone && !model.pending.durable &&
-			pendingSendStateKey(model.pending) == result.operation.key {
+			pendingSendStateKey(model.pending) == result.operation.key &&
+			model.pendingStateWriteMatches(result.operation) {
 			model.pending.durable = true
-			model.status = "response event committed to recovery state · entering the durable outbox…"
-			return sendPersistedEvent(model.client, model.stateStore, model.pending)
+			if model.pending.kind == pendingDelivery {
+				if model.pending.deliveryIntentRecorded {
+					model.status = "file intent handoff phase committed · entering the durable outbox…"
+				} else {
+					model.status = "file delivery committed to recovery state · recording mirror intent…"
+				}
+			} else {
+				model.status = "response event committed to recovery state · entering the durable outbox…"
+			}
+			return model.resumeDurablePending(model.pending)
 		}
-		return nil
+		return model.advanceRejectionFinalizations()
 	}
 	model.stateWriteWarning = "recovery state write failed; draft remains in memory: " + result.err.Error()
 	model.stateRetryAttempt++
@@ -503,6 +600,31 @@ func (model *Model) applyStateWriteResult(result stateWriteResult) tea.Cmd {
 		delay = workerStateRetryMax
 	}
 	return tea.Tick(delay, func(time.Time) tea.Msg { return stateRetryReady{} })
+}
+
+// pendingStateWriteMatches prevents an older successful Put for the same
+// stable scope from authorizing a newer in-memory event phase. Assignment
+// refreshes and mirror-intent confirmation can both replace the pending row
+// while one serialized state write is in flight; only the exact desired bytes
+// may open the outbox gate.
+func (model Model) pendingStateWriteMatches(operation stateWriteOperation) bool {
+	desired, _, err := model.desiredWorkerState()
+	if err != nil {
+		return false
+	}
+	payload, exists := desired[operation.key]
+	return exists && string(payload) == string(operation.payload)
+}
+
+func (model Model) pendingSendStateSynchronized(pending pendingSend) bool {
+	if model.stateStore == nil {
+		return true
+	}
+	payload, err := json.Marshal(persistedPendingFromSend(pending, pendingSendDispositionSend))
+	if err != nil {
+		return false
+	}
+	return model.stateSynced[pendingSendStateKey(pending)] == string(payload)
 }
 
 func writeWorkerState(store StateStore, operation stateWriteOperation) tea.Cmd {
@@ -578,9 +700,27 @@ func (model Model) desiredWorkerState() (
 }
 
 func (model Model) currentPersistedDraft() (persistedDraft, bool) {
+	authority := model.draftAuthority
+	if authority == "" && model.active != nil {
+		authority = assignmentDraftAuthority(*model.active)
+	}
 	draft := persistedDraft{
-		Version: workerStateVersion, Focus: persistedFocus(model.focus),
-		Reply: model.replyInput, Command: model.commandInput,
+		Version: workerStateVersion, Authority: authority,
+		RejectedEventIDs:   append([]string(nil), model.draftRejectedEvents...),
+		RejectedEventKinds: cloneEventKinds(model.draftRejectedKinds),
+		Focus:              persistedFocus(model.focus), Reply: model.replyInput, Command: model.commandInput,
+		TaskEditIndex: -1,
+	}
+	if model.draftReplyRejected != "" {
+		tail := replyTailAfterRejectedPrefix(model.replyInput, model.draftReplyRejected)
+		// If the operator edited the restored prefix itself, it is no longer safe
+		// to claim the old boundary. Preserve all text as a local tail instead.
+		if tail == model.replyInput && model.replyInput != model.draftReplyRejected {
+			draft.ReplyTail = model.replyInput
+		} else {
+			draft.ReplyRejected = model.draftReplyRejected
+			draft.ReplyTail = tail
+		}
 	}
 	if model.taskDirty || model.taskEditing {
 		draft.HasTasks = true
@@ -603,8 +743,16 @@ func (model Model) remainingDraftAfterSend(kind pendingSendKind) persistedDraft 
 	switch kind {
 	case pendingReply:
 		draft.Reply = ""
+		draft.ReplyRejected = ""
+		draft.ReplyTail = ""
+		draft.RejectedEventIDs, draft.RejectedEventKinds = filterEventProvenance(
+			draft.RejectedEventIDs, draft.RejectedEventKinds, pendingReply,
+		)
 	case pendingCommand:
 		draft.Command = ""
+		draft.RejectedEventIDs, draft.RejectedEventKinds = filterEventProvenance(
+			draft.RejectedEventIDs, draft.RejectedEventKinds, pendingCommand,
+		)
 	case pendingTasks:
 		draft.HasTasks = false
 		draft.Tasks = nil
@@ -613,12 +761,24 @@ func (model Model) remainingDraftAfterSend(kind pendingSendKind) persistedDraft 
 		draft.TaskEditing = false
 		draft.TaskEditIndex = -1
 		draft.TaskInput = ""
+		draft.RejectedEventIDs, draft.RejectedEventKinds = filterEventProvenance(
+			draft.RejectedEventIDs, draft.RejectedEventKinds, pendingTasks,
+		)
 	case pendingAdvancedTools:
 		draft.ToolInput = ""
 		draft.ToolCallIDs = nil
+		draft.RejectedEventIDs, draft.RejectedEventKinds = filterEventProvenance(
+			draft.RejectedEventIDs, draft.RejectedEventKinds, pendingAdvancedTools,
+		)
 	}
 	if !persistedDraftHasContent(draft) {
-		return persistedDraft{Version: workerStateVersion, TaskEditIndex: -1}
+		// Remaining is embedded in the pending journal even when every visible
+		// pane is empty. Preserve its semantic authority so a later restore can
+		// distinguish an already-materialized source from an unrelated identical
+		// draft after a crash.
+		draft.Focus = ""
+		draft.TaskEditIndex = -1
+		return draft
 	}
 	if draft.Focus == pendingKindFocus(kind) {
 		switch {
@@ -637,7 +797,7 @@ func pendingKindFocus(kind pendingSendKind) string {
 	switch kind {
 	case pendingCommand:
 		return persistedFocusCommand
-	case pendingTasks, pendingAdvancedTools:
+	case pendingTasks, pendingAdvancedTools, pendingDelivery:
 		return persistedFocusTasks
 	default:
 		return persistedFocusReply
@@ -648,8 +808,44 @@ func persistedDraftHasContent(draft persistedDraft) bool {
 	return draft.Reply != "" || draft.Command != "" || draft.HasTasks || draft.ToolInput != "" || len(draft.ToolCallIDs) > 0
 }
 
+func persistedDraftDigest(draft persistedDraft) string {
+	payload, err := json.Marshal(draft)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}
+
+func persistedDraftEditorDigest(draft persistedDraft, pendingEventID string) string {
+	// Authority and the current pending event's provenance describe how the
+	// snapshot was materialized, not what the operator can still edit. Recovery
+	// deliberately marks a pending event as the draft source; comparing those
+	// fields verbatim would manufacture an edit and insert an unnecessary second
+	// save barrier on every recovered delivery.
+	draft.Version = 0
+	draft.Authority = ""
+	draft.Focus = ""
+	if !draft.HasTasks {
+		draft.Tasks = nil
+		draft.TaskSelected = 0
+		draft.TaskDirty = false
+		draft.TaskEditing = false
+		draft.TaskEditIndex = 0
+		draft.TaskInput = ""
+	}
+	draft.RejectedEventIDs, draft.RejectedEventKinds = removeEventProvenance(
+		draft.RejectedEventIDs, draft.RejectedEventKinds, pendingEventID,
+	)
+	return persistedDraftDigest(draft)
+}
+
 func persistedDraftFromPending(pending pendingSend) (persistedDraft, bool) {
-	draft := persistedDraft{Version: workerStateVersion, TaskEditIndex: -1}
+	draft := persistedDraft{
+		Version: workerStateVersion, Authority: eventDraftAuthority(pending.event.ID), TaskEditIndex: -1,
+		RejectedEventIDs:   eventIDSlice(pending.event.ID),
+		RejectedEventKinds: eventKindMap(pending.event.ID, pending.kind),
+	}
 	switch pending.kind {
 	case pendingReply:
 		draft.Focus = persistedFocusReply
@@ -667,14 +863,26 @@ func persistedDraftFromPending(pending pendingSend) (persistedDraft, bool) {
 		draft.Focus = persistedFocusTasks
 		draft.ToolInput = pending.toolInput
 		draft.ToolCallIDs = append([]string(nil), pending.toolCallIDs...)
+	case pendingDelivery:
+		draft.Focus = persistedFocusTasks
 	}
 	return draft, persistedDraftHasContent(draft)
 }
 
 func persistedDraftFromRejected(rejected rejectedDraftState) (persistedDraft, bool) {
-	draft := persistedDraft{Version: workerStateVersion}
+	authority := rejected.authority
+	if authority == "" {
+		authority = assignmentDraftAuthority(rejected.assignment)
+	}
+	draft := persistedDraft{
+		Version: workerStateVersion, Authority: authority,
+		RejectedEventIDs:   append([]string(nil), rejected.rejectedEventIDs...),
+		RejectedEventKinds: cloneEventKinds(rejected.rejectedEventKinds),
+	}
 	if rejected.hasReply {
 		draft.Reply = rejected.reply
+		draft.ReplyRejected = rejected.replyRejected
+		draft.ReplyTail = rejected.replyTail
 	}
 	if rejected.hasCommand {
 		draft.Command = rejected.command
@@ -683,8 +891,10 @@ func persistedDraftFromRejected(rejected rejectedDraftState) (persistedDraft, bo
 		draft.HasTasks = true
 		draft.Tasks = persistTasks(rejected.tasks)
 		draft.TaskSelected = rejected.selected
-		draft.TaskDirty = true
-		draft.TaskEditIndex = -1
+		draft.TaskDirty = rejected.taskDirty
+		draft.TaskEditing = rejected.taskEditing
+		draft.TaskEditIndex = rejected.taskEditIndex
+		draft.TaskInput = rejected.taskInput
 	}
 	switch rejected.kind {
 	case pendingCommand:
@@ -701,15 +911,17 @@ func persistedDraftFromRejected(rejected rejectedDraftState) (persistedDraft, bo
 	return draft, persistedDraftHasContent(draft)
 }
 
-func (model *Model) takePersistentDraft(assignment completion.Assignment) (persistedDraft, bool) {
+func (model *Model) takePersistentDraft(
+	assignment completion.Assignment,
+) (persistedDraft, stateRecordKey, bool) {
 	target := stateScope(assignment)
 	exact := stateRecordKey{scope: target, kind: workerStateDraftKind}
 	if saved, ok := model.stateDrafts[exact]; ok {
 		delete(model.stateDrafts, exact)
-		return saved.draft, true
+		return saved.draft, exact, true
 	}
 	if target.Tier != completion.TierRemoteTools && target.Tier != completion.TierWorkspace {
-		return persistedDraft{}, false
+		return persistedDraft{}, stateRecordKey{}, false
 	}
 	var selected stateRecordKey
 	var selectedDraft savedStateDraft
@@ -724,14 +936,24 @@ func (model *Model) takePersistentDraft(assignment completion.Assignment) (persi
 		}
 	}
 	if !found {
-		return persistedDraft{}, false
+		return persistedDraft{}, stateRecordKey{}, false
 	}
 	delete(model.stateDrafts, selected)
-	return selectedDraft.draft, true
+	return selectedDraft.draft, selected, true
 }
 
 func (model *Model) applyPersistentDraft(draft persistedDraft) {
-	model.setReplyValue(draft.Reply)
+	if draft.Authority != "" {
+		model.draftAuthority = draft.Authority
+	}
+	model.draftRejectedEvents = append([]string(nil), draft.RejectedEventIDs...)
+	model.draftRejectedKinds = cloneEventKinds(draft.RejectedEventKinds)
+	model.draftReplyRejected = draft.ReplyRejected
+	reply := draft.Reply
+	if reply == "" && (draft.ReplyRejected != "" || draft.ReplyTail != "") {
+		reply = joinDraftSegments(draft.ReplyRejected, draft.ReplyTail)
+	}
+	model.setReplyValue(reply)
 	model.setCommandValue(draft.Command)
 	model.commandConfirm = ""
 	if draft.HasTasks {
@@ -793,16 +1015,6 @@ func sameStableStateScope(left, right workerstate.Scope) bool {
 		left.TaskID == right.TaskID && left.Tier == right.Tier
 }
 
-func recoverableDraftScope(stored, target workerstate.Scope) bool {
-	if stored == target {
-		return true
-	}
-	if target.Tier != completion.TierRemoteTools && target.Tier != completion.TierWorkspace {
-		return false
-	}
-	return sameStableStateScope(stored, target)
-}
-
 func persistedFromContinuation(state continuationState) persistedContinuation {
 	ids := make([]string, 0, len(state.ids))
 	for id := range state.ids {
@@ -821,21 +1033,45 @@ func pendingSendStateKey(pending pendingSend) stateRecordKey {
 
 func persistedPendingFromSend(pending pendingSend, disposition string) persistedPendingSend {
 	draft, _ := persistedDraftFromPending(pending)
+	origins := make([]persistedDraftOrigin, 0, len(pending.draftOrigins))
+	for _, origin := range pending.draftOrigins {
+		if origin.key.kind == workerStateDraftKind && origin.digest != "" {
+			origins = append(origins, persistedDraftOrigin{
+				Scope: origin.key.scope, SHA256: origin.digest,
+			})
+		}
+	}
 	return persistedPendingSend{
 		Version: workerStateVersion, Disposition: disposition, Kind: pending.kind,
 		Assignment: pending.assignment, Event: pending.event, Context: cloneAssignment(pending.context),
-		Draft: draft, Remaining: pending.remainingDraft,
-		ToolCalls: append([]completion.ToolCall(nil), pending.toolCalls...),
+		Draft: draft, Remaining: pending.remainingDraft, DraftOrigins: origins,
+		ToolCalls:              append([]completion.ToolCall(nil), pending.toolCalls...),
+		DeliveryNamespace:      pending.deliveryNamespace,
+		DeliveryGeneration:     pending.deliveryGeneration,
+		DeliveryChanges:        cloneMirrorChanges(pending.deliveryChanges),
+		DeliveryIntentRecorded: pending.deliveryIntentRecorded,
 	}
 }
 
 func pendingSendFromPersisted(persisted persistedPendingSend) pendingSend {
+	origins := make([]draftOrigin, 0, len(persisted.DraftOrigins))
+	for _, origin := range persisted.DraftOrigins {
+		origins = append(origins, draftOrigin{
+			key:    stateRecordKey{scope: origin.Scope, kind: workerStateDraftKind},
+			digest: origin.SHA256,
+		})
+	}
 	pending := pendingSend{
 		kind: persisted.Kind, eventID: persisted.Event.ID,
 		assignment: persisted.Assignment, context: cloneAssignment(persisted.Context),
 		event: persisted.Event, durable: true, recovered: true,
-		toolCalls:      append([]completion.ToolCall(nil), persisted.ToolCalls...),
-		remainingDraft: sanitizePersistedDraft(persisted.Remaining),
+		toolCalls:              append([]completion.ToolCall(nil), persisted.ToolCalls...),
+		remainingDraft:         sanitizePersistedDraft(persisted.Remaining),
+		draftOrigins:           origins,
+		deliveryNamespace:      persisted.DeliveryNamespace,
+		deliveryGeneration:     persisted.DeliveryGeneration,
+		deliveryChanges:        cloneMirrorChanges(persisted.DeliveryChanges),
+		deliveryIntentRecorded: persisted.DeliveryIntentRecorded,
 	}
 	pending.reply = persisted.Draft.Reply
 	pending.command = persisted.Draft.Command
@@ -867,13 +1103,44 @@ func validatePersistedDraft(draft persistedDraft) error {
 	default:
 		return fmt.Errorf("persisted draft has invalid focus %q", draft.Focus)
 	}
-	if len(draft.Reply) > maxPersistedInputBytes || len(draft.Command) > maxPersistedInputBytes ||
+	if len(draft.Reply) > maxPersistedInputBytes || len(draft.ReplyRejected) > maxPersistedInputBytes ||
+		len(draft.ReplyTail) > maxPersistedInputBytes || len(draft.Command) > maxPersistedInputBytes ||
 		len(draft.TaskInput) > maxPersistedInputBytes || len(draft.ToolInput) > maxPersistedInputBytes {
 		return errors.New("persisted draft input is too large")
 	}
-	if !utf8.ValidString(draft.Reply) || !utf8.ValidString(draft.Command) || !utf8.ValidString(draft.TaskInput) ||
+	if !utf8.ValidString(draft.Reply) || !utf8.ValidString(draft.ReplyRejected) ||
+		!utf8.ValidString(draft.ReplyTail) || !utf8.ValidString(draft.Command) || !utf8.ValidString(draft.TaskInput) ||
 		!utf8.ValidString(draft.ToolInput) {
 		return errors.New("persisted draft input is not UTF-8")
+	}
+	if (draft.ReplyRejected != "" || draft.ReplyTail != "") &&
+		draft.Reply != joinDraftSegments(draft.ReplyRejected, draft.ReplyTail) {
+		return errors.New("persisted draft reply provenance does not match its materialized reply")
+	}
+	if len(draft.RejectedEventIDs) > maxAgentTasks {
+		return errors.New("persisted draft has too many rejected event ids")
+	}
+	seenEvents := make(map[string]struct{}, len(draft.RejectedEventIDs))
+	for _, eventID := range draft.RejectedEventIDs {
+		if strings.TrimSpace(eventID) == "" {
+			return errors.New("persisted draft has an empty rejected event id")
+		}
+		if _, duplicate := seenEvents[eventID]; duplicate {
+			return errors.New("persisted draft has a duplicate rejected event id")
+		}
+		seenEvents[eventID] = struct{}{}
+		kind, classified := draft.RejectedEventKinds[eventID]
+		if !classified {
+			return errors.New("persisted draft rejected event is missing its pane kind")
+		}
+		switch kind {
+		case pendingReply, pendingCommand, pendingTasks, pendingAdvancedTools, pendingDelivery:
+		default:
+			return errors.New("persisted draft rejected event has an invalid pane kind")
+		}
+	}
+	if len(draft.RejectedEventKinds) != len(seenEvents) {
+		return errors.New("persisted draft has unbound rejected event kinds")
 	}
 	if len(draft.ToolCallIDs) > maxAgentTasks {
 		return errors.New("persisted tool draft has too many call ids")
@@ -923,7 +1190,7 @@ func validatePersistedPendingSend(scope workerstate.Scope, persisted persistedPe
 		return fmt.Errorf("persisted pending send has invalid disposition %q", persisted.Disposition)
 	}
 	switch persisted.Kind {
-	case pendingReply, pendingCommand, pendingTasks, pendingAdvancedTools:
+	case pendingReply, pendingCommand, pendingTasks, pendingAdvancedTools, pendingDelivery:
 	default:
 		return fmt.Errorf("persisted pending send has unsupported kind %d", persisted.Kind)
 	}
@@ -935,6 +1202,25 @@ func validatePersistedPendingSend(scope workerstate.Scope, persisted persistedPe
 	}
 	if persisted.Context != nil && stateScope(*persisted.Context) != scope {
 		return errors.New("persisted pending send context does not match its scope")
+	}
+	seenOrigins := make(map[workerstate.Scope]struct{}, len(persisted.DraftOrigins))
+	for _, origin := range persisted.DraftOrigins {
+		if strings.TrimSpace(origin.Scope.SessionKey) == "" {
+			return errors.New("persisted pending send has an empty draft origin")
+		}
+		digest, err := hex.DecodeString(origin.SHA256)
+		if err != nil || len(digest) != sha256.Size {
+			return errors.New("persisted pending send has an invalid draft origin digest")
+		}
+		if _, duplicate := seenOrigins[origin.Scope]; duplicate {
+			return errors.New("persisted pending send has duplicate draft origins")
+		}
+		seenOrigins[origin.Scope] = struct{}{}
+		if origin.Scope != scope &&
+			(scope.Tier != completion.TierRemoteTools && scope.Tier != completion.TierWorkspace ||
+				!sameStableStateScope(origin.Scope, scope)) {
+			return errors.New("persisted pending send draft origin is outside its task scope")
+		}
 	}
 	if err := validatePersistedDraft(persisted.Draft); err != nil {
 		return fmt.Errorf("persisted pending send draft: %w", err)
@@ -949,10 +1235,26 @@ func validatePersistedPendingSend(scope workerstate.Scope, persisted persistedPe
 		default:
 			return fmt.Errorf("persisted reply has invalid event type %q", persisted.Event.Type)
 		}
-	case pendingCommand, pendingTasks, pendingAdvancedTools:
+	case pendingCommand, pendingTasks, pendingAdvancedTools, pendingDelivery:
 		if persisted.Event.Type != completion.EventToolCalls || len(persisted.Event.ToolCalls) == 0 {
 			return errors.New("persisted tool send has no tool-call event")
 		}
+	}
+	if persisted.Kind == pendingDelivery {
+		if persisted.Disposition != pendingSendDispositionSend {
+			return errors.New("persisted delivery cannot be converted into a draft restore")
+		}
+		if persisted.DeliveryNamespace != mirrorNamespace(
+			persisted.Assignment.CallerID, persisted.Assignment.WorkspaceKey,
+		) {
+			return errors.New("persisted delivery namespace does not match its assignment")
+		}
+		if persisted.DeliveryGeneration == 0 || len(persisted.DeliveryChanges) == 0 ||
+			len(persisted.DeliveryChanges) != len(persisted.Event.ToolCalls) {
+			return errors.New("persisted delivery has incomplete reviewed changes")
+		}
+	} else if persisted.DeliveryIntentRecorded {
+		return errors.New("non-delivery pending send cannot record mirror intent phase")
 	}
 	return nil
 }
@@ -985,11 +1287,25 @@ func validatePersistedContinuation(scope workerstate.Scope, persisted persistedC
 
 func sanitizePersistedDraft(draft persistedDraft) persistedDraft {
 	draft.Reply = terminalSafe(draft.Reply)
+	draft.ReplyRejected = terminalSafe(draft.ReplyRejected)
+	draft.ReplyTail = terminalSafe(draft.ReplyTail)
 	draft.Command = terminalSafe(draft.Command)
 	draft.TaskInput = terminalSafe(draft.TaskInput)
 	draft.ToolInput = terminalSafe(draft.ToolInput)
 	for index := range draft.Tasks {
 		draft.Tasks[index].Content = terminalSafe(draft.Tasks[index].Content)
+	}
+	draft.RejectedEventIDs = uniqueEventIDs(draft.RejectedEventIDs...)
+	if len(draft.RejectedEventIDs) == 0 {
+		draft.RejectedEventKinds = nil
+	} else {
+		filtered := make(map[string]pendingSendKind, len(draft.RejectedEventIDs))
+		for _, eventID := range draft.RejectedEventIDs {
+			if kind, exists := draft.RejectedEventKinds[eventID]; exists {
+				filtered[eventID] = kind
+			}
+		}
+		draft.RejectedEventKinds = filtered
 	}
 	return draft
 }
@@ -1030,6 +1346,19 @@ func sortedStateKeys(records map[stateRecordKey]json.RawMessage) []stateRecordKe
 		return stateKeyLess(keys[left], keys[right])
 	})
 	return keys
+}
+
+func sortedDraftOriginKeys(origins map[stateRecordKey]string) []draftOrigin {
+	items := make([]draftOrigin, 0, len(origins))
+	for key, digest := range origins {
+		if key.kind == workerStateDraftKind && digest != "" {
+			items = append(items, draftOrigin{key: key, digest: digest})
+		}
+	}
+	sort.Slice(items, func(left, right int) bool {
+		return stateKeyLess(items[left].key, items[right].key)
+	})
+	return items
 }
 
 func stateKeyLess(left, right stateRecordKey) bool {

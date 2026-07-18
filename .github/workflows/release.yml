@@ -19,8 +19,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Verify GitHub release tag semantics
-        run: make release-semantics-test
+      - name: Verify release contracts
+        run: make release-semantics-test release-build-contract-test
       - name: Verify source and race safety
         run: |
           make fmt-check tidy-check build vet
@@ -82,6 +82,8 @@ jobs:
           VERSION: ${{ github.ref_name }}
           COMMIT: ${{ github.sha }}
         run: BUILD_DATE="$(git show -s --format=%cI "$GITHUB_SHA")" ./scripts/build-release.sh
+      - name: Verify release checksums
+        run: (cd dist && sha256sum --check checksums.txt)
       - name: Smoke-test embedded build identity
         env:
           VERSION: ${{ github.ref_name }}

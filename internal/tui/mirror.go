@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -262,11 +263,14 @@ func confirmMirror(
 			err = fmt.Errorf("mirror changed after preview; review it again before sending")
 		}
 		if err == nil {
-			if recorder, ok := workspace.(interface {
+			recorder, ok := workspace.(interface {
 				RecordDeliveryIntents(
 					[]workmirror.Change, []completion.ToolCall, *adapter.Profile, string,
 				) error
-			}); ok {
+			})
+			if !ok {
+				err = errors.New("mirror does not support durable delivery intents")
+			} else {
 				err = recorder.RecordDeliveryIntents(
 					current, calls, assignment.Adapter, assignment.Root,
 				)
@@ -282,6 +286,60 @@ func confirmMirror(
 			err:        err,
 		}
 	}
+}
+
+// resumePendingDelivery always re-validates the reviewed mirror and records
+// its idempotent per-tool intents before the already-durable event may enter
+// the worker outbox. Repeating this after a crash is safe: the pending journal
+// owns the exact event/call IDs and RecordDeliveryIntents verifies their digests.
+func (model *Model) resumePendingDelivery(pending pendingSend) tea.Cmd {
+	if pending.kind != pendingDelivery || pending.event.ID == "" ||
+		len(pending.event.ToolCalls) == 0 || len(pending.deliveryChanges) == 0 {
+		return nil
+	}
+	if pending.deliveryIntentRecorded {
+		model.delivery.prepareInFlight = false
+		model.delivery.intentWriterInFlight = false
+		return model.startRecordedMirrorDelivery()
+	}
+	if workspace := model.mirrors[pending.deliveryNamespace]; workspace != nil {
+		if model.delivery.intentWriterInFlight {
+			return nil
+		}
+		model.delivery.prepareInFlight = false
+		model.delivery.intentWriterInFlight = true
+		return confirmMirror(
+			workspace, pending.assignment, pending.deliveryChanges, pending.event.ToolCalls,
+			pending.deliveryGeneration, pending.event.ID,
+		)
+	}
+	model.delivery.intentWriterInFlight = false
+	if model.mirrorManager != nil {
+		if model.delivery.prepareInFlight {
+			return nil
+		}
+		model.delivery.prepareInFlight = true
+		return prepareMirror(model.mirrorManager, pending.assignment)
+	}
+	model.delivery.prepareInFlight = false
+	return func() tea.Msg {
+		return mirrorConfirmationReady{
+			sessionKey: pending.assignment.SessionKey(), namespace: pending.deliveryNamespace,
+			generation: pending.deliveryGeneration, eventID: pending.event.ID,
+			err: errors.New("durable file delivery cannot resume without a mirror manager"),
+		}
+	}
+}
+
+func cloneMirrorChanges(changes []workmirror.Change) []workmirror.Change {
+	cloned := make([]workmirror.Change, len(changes))
+	for index, change := range changes {
+		cloned[index] = change
+		cloned[index].OldContent = append([]byte(nil), change.OldContent...)
+		cloned[index].NewContent = append([]byte(nil), change.NewContent...)
+		cloned[index].Reasons = append([]string(nil), change.Reasons...)
+	}
+	return cloned
 }
 
 func selectReviewedChanges(current, previewed []workmirror.Change) []workmirror.Change {
@@ -313,8 +371,14 @@ func discardMirrorIntents(
 		discarder, ok := workspace.(interface {
 			DiscardToolIntents([]completion.ToolCall, *adapter.Profile) error
 		})
-		if !ok || len(calls) == 0 {
+		if len(calls) == 0 {
 			return mirrorIntentsDiscarded{reason: reason}
+		}
+		if !ok {
+			return mirrorIntentsDiscarded{
+				reason: reason,
+				err:    errors.New("mirror does not support durable delivery intent cleanup"),
+			}
 		}
 		return mirrorIntentsDiscarded{
 			reason: reason,

@@ -28,6 +28,9 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load local defaults: %w", err)
 	}
+	// The default issued-credential policy is process-local: credentials created
+	// by Open are revoked by Close. A host that needs restart reuse must select
+	// local.IssuedCredentialsPreserve before Open and durably protect both tokens.
 
 	instance, err := local.Open(ctx, config)
 	if err != nil {

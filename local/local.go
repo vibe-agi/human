@@ -4,7 +4,8 @@
 // Human worker with its Bubble Tea model. Applications that need custom
 // routing or identity should compose the gateway and worker packages directly;
 // local intentionally uses built-in tokens and never persists their plaintext
-// values. An embedding application may persist returned credentials itself.
+// values. Credentials issued by Open are revoked on Close by default; an
+// embedding application may explicitly preserve and persist the returned pair.
 package local
 
 import (
@@ -36,6 +37,20 @@ const (
 	defaultShutdownWait  = 5 * time.Second
 )
 
+// IssuedCredentialPolicy defines who owns credentials created by Local.Open.
+// The zero value is intentionally safe for short-lived embedders.
+type IssuedCredentialPolicy uint8
+
+const (
+	// IssuedCredentialsRevokeOnClose keeps newly issued credentials process-local
+	// and revokes them during Close. Existing credentials and credentials returned
+	// by CredentialProvider are always owned by their caller and are not revoked.
+	IssuedCredentialsRevokeOnClose IssuedCredentialPolicy = iota
+	// IssuedCredentialsPreserve transfers ownership of newly issued credentials
+	// to the embedder, which must persist or revoke both values deliberately.
+	IssuedCredentialsPreserve
+)
+
 // Config controls a one-process local deployment. Gateway.Authenticator must
 // be nil: local provisions built-in caller and worker tokens, reuses an
 // existing pair, or obtains one from CredentialProvider so the private
@@ -52,6 +67,12 @@ type Config struct {
 	CallerSubject   string
 	WorkerSubject   string
 	ShutdownTimeout time.Duration
+
+	// IssuedCredentialPolicy applies only when neither Existing* credentials nor
+	// CredentialProvider are supplied and Local.Open therefore issues a new pair.
+	// The zero value revokes that pair on Close. Select Preserve before Open only
+	// when the embedding application durably owns both returned secrets.
+	IssuedCredentialPolicy IssuedCredentialPolicy
 
 	// ExistingCallerToken and ExistingWorkerToken reuse credentials already
 	// issued into Gateway.DatabasePath. Supply both or neither. Local binds both
@@ -74,8 +95,10 @@ type Config struct {
 
 // Credentials are the plaintext values needed by a local caller and worker.
 // NewlyIssued is true only when Open created both credentials. The library
-// keeps these values in memory; an application that wants restart reuse owns
-// any encrypted or mode-0600 persistence outside this package.
+// keeps these values in memory. Newly issued values are revoked on Close unless
+// Config explicitly selects IssuedCredentialsPreserve; a preserving application
+// owns encrypted or mode-0600 persistence and later revocation outside this
+// package.
 type Credentials struct {
 	CallerToken string
 	WorkerToken string
@@ -143,6 +166,10 @@ func (config Config) withDefaults() (Config, error) {
 	if config.ShutdownTimeout < 0 {
 		return Config{}, errors.New("open local: shutdown timeout must be positive")
 	}
+	if config.IssuedCredentialPolicy != IssuedCredentialsRevokeOnClose &&
+		config.IssuedCredentialPolicy != IssuedCredentialsPreserve {
+		return Config{}, errors.New("open local: issued credential policy is invalid")
+	}
 	if strings.TrimSpace(config.Gateway.DatabasePath) == "" {
 		config.Gateway.DatabasePath = defaults.Gateway.DatabasePath
 	}
@@ -184,8 +211,8 @@ func (config Config) withDefaults() (Config, error) {
 }
 
 // Local owns one embedded gateway, loopback HTTP server, and worker. Close is
-// idempotent. A Local supports one active Bubble Tea program at a time through
-// Run, matching worker.Worker.
+// idempotent. Run owns one Bubble Tea program lifetime; open a new Local to run
+// another program after it returns, matching worker.Worker.
 type Local struct {
 	gateway *gateway.Server
 	worker  *worker.Worker
@@ -205,7 +232,7 @@ type Local struct {
 
 	closeOnce        sync.Once
 	closeErr         error
-	revokeOnClose    bool // set only while rolling back a failed Open
+	revokeOnClose    bool // safe default policy, and always true while rolling back a failed Open
 	issuedDuringOpen bool // true as soon as the first built-in token is issued
 }
 
@@ -250,6 +277,7 @@ func Open(ctx context.Context, config Config) (*Local, error) {
 		cancel:          cancel,
 		shutdownTimeout: config.ShutdownTimeout,
 		serveDone:       make(chan struct{}),
+		revokeOnClose:   config.IssuedCredentialPolicy == IssuedCredentialsRevokeOnClose,
 	}
 	cleanupFailure := func(openErr error) (*Local, error) {
 		instance.revokeOnClose = true
@@ -483,10 +511,10 @@ func (local *Local) Wait() error {
 }
 
 // Close stops accepting HTTP requests, closes the worker, and finally closes
-// the gateway and SQLite. Issued credentials remain valid in the database so
-// an application may reuse them on restart; use Gateway().Revoke to retire
-// credentials deliberately. Close waits for the HTTP serving goroutine and is
-// safe to call more than once.
+// the gateway and SQLite. Credentials issued directly by Open are revoked by
+// default; Config may explicitly transfer their persistence and revocation to
+// the embedder. Existing/provider credentials are never implicitly revoked.
+// Close waits for the HTTP serving goroutine and is safe to call more than once.
 func (local *Local) Close() error {
 	if local == nil {
 		return nil

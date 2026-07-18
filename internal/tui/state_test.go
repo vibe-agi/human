@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,133 @@ import (
 	"github.com/vibe-agi/human/internal/workerclient"
 	"github.com/vibe-agi/human/internal/workerstate"
 )
+
+func TestPersistedDraftEditorDigestTracksOnlyEditableState(t *testing.T) {
+	t.Parallel()
+	const pendingEventID = "event-pending-delivery"
+	base := persistedDraft{
+		Version:   workerStateVersion,
+		Authority: "draft-authority-before",
+		RejectedEventIDs: []string{
+			"event-older-reply",
+		},
+		RejectedEventKinds: map[string]pendingSendKind{
+			"event-older-reply": pendingReply,
+		},
+		Focus:         persistedFocusTasks,
+		Reply:         "rejected reply\n\nlocal tail\n\nmore local tail",
+		ReplyRejected: "rejected reply",
+		ReplyTail:     "local tail\n\nmore local tail",
+		Command:       "go test ./...",
+		HasTasks:      true,
+		Tasks: []persistedTask{
+			{Content: "first task", Status: taskInProgress, Priority: "high"},
+			{Content: "second task", Status: taskPending, Priority: "medium"},
+		},
+		TaskSelected:  1,
+		TaskDirty:     true,
+		TaskEditing:   true,
+		TaskEditIndex: 1,
+		TaskInput:     "second task edit",
+		ToolInput:     `search {"query":"draft"}`,
+		ToolCallIDs:   []string{"tool-draft"},
+	}
+	clone := func(source persistedDraft) persistedDraft {
+		copy := source
+		copy.RejectedEventIDs = append([]string(nil), source.RejectedEventIDs...)
+		copy.RejectedEventKinds = cloneEventKinds(source.RejectedEventKinds)
+		copy.Tasks = append([]persistedTask(nil), source.Tasks...)
+		copy.ToolCallIDs = append([]string(nil), source.ToolCallIDs...)
+		return copy
+	}
+
+	tests := []struct {
+		name     string
+		wantSame bool
+		mutate   func(*persistedDraft)
+	}{
+		{
+			name: "reply text", mutate: func(draft *persistedDraft) {
+				draft.Reply += "\n\nnew reply edit"
+				draft.ReplyTail += "\n\nnew reply edit"
+			},
+		},
+		{
+			name: "reply provenance boundary", mutate: func(draft *persistedDraft) {
+				draft.ReplyRejected = "rejected reply\n\nlocal tail"
+				draft.ReplyTail = "more local tail"
+			},
+		},
+		{
+			name: "command", mutate: func(draft *persistedDraft) {
+				draft.Command = "go test -race ./..."
+			},
+		},
+		{
+			name: "tasks", mutate: func(draft *persistedDraft) {
+				draft.Tasks[1].Content = "second task changed"
+				draft.TaskInput = "second task changed edit"
+			},
+		},
+		{
+			name: "advanced tool", mutate: func(draft *persistedDraft) {
+				draft.ToolInput = `search {"query":"changed"}`
+				draft.ToolCallIDs = append(draft.ToolCallIDs, "tool-changed")
+			},
+		},
+		{
+			name: "other rejected event provenance", mutate: func(draft *persistedDraft) {
+				draft.RejectedEventIDs = append(draft.RejectedEventIDs, "event-other-command")
+				draft.RejectedEventKinds["event-other-command"] = pendingCommand
+			},
+		},
+		{
+			name: "version", wantSame: true, mutate: func(draft *persistedDraft) {
+				draft.Version++
+			},
+		},
+		{
+			name: "focus", wantSame: true, mutate: func(draft *persistedDraft) {
+				draft.Focus = persistedFocusCommand
+			},
+		},
+		{
+			name: "authority", wantSame: true, mutate: func(draft *persistedDraft) {
+				draft.Authority = "draft-authority-after"
+			},
+		},
+		{
+			name: "current pending event provenance", wantSame: true, mutate: func(draft *persistedDraft) {
+				draft.RejectedEventIDs = append(draft.RejectedEventIDs, pendingEventID)
+				draft.RejectedEventKinds[pendingEventID] = pendingDelivery
+			},
+		},
+	}
+	baseDigest := persistedDraftEditorDigest(base, pendingEventID)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := clone(base)
+			test.mutate(&candidate)
+			gotSame := persistedDraftEditorDigest(candidate, pendingEventID) == baseDigest
+			if gotSame != test.wantSame {
+				t.Fatalf("digest equality = %t, want %t", gotSame, test.wantSame)
+			}
+		})
+	}
+
+	withoutTasks := persistedDraft{Version: workerStateVersion, TaskEditIndex: -1}
+	inertTaskControls := withoutTasks
+	inertTaskControls.Tasks = []persistedTask{{Content: "ignored while HasTasks is false"}}
+	inertTaskControls.TaskSelected = 1
+	inertTaskControls.TaskDirty = true
+	inertTaskControls.TaskEditing = true
+	inertTaskControls.TaskEditIndex = 7
+	inertTaskControls.TaskInput = "ignored task editor"
+	if persistedDraftEditorDigest(withoutTasks, pendingEventID) !=
+		persistedDraftEditorDigest(inertTaskControls, pendingEventID) {
+		t.Fatal("HasTasks=false task control fields changed the editor digest")
+	}
+}
 
 func TestWorkerStateRestoresDraftsAcrossRestartAndRemoteSession(t *testing.T) {
 	t.Parallel()
@@ -350,6 +478,106 @@ func TestWorkerStateSerializesInFlightUpdatesSoLatestDraftWins(t *testing.T) {
 	}
 }
 
+func TestControlCDrainsNewestInFlightDraftBeforeQuit(t *testing.T) {
+	store := &blockingStateStore{
+		started: make(chan struct{}), release: make(chan struct{}),
+		records: make(map[stateRecordKey]json.RawMessage),
+	}
+	assignment := persistentRemoteAssignment("ctrl-c-drain")
+	model := New(newFakeClient(), WithStateStore(store)).activateAssignment(assignment)
+	model.focus = focusReply
+	model.setReplyValue("older")
+	updated, firstWrite := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	model = updated.(Model)
+	if !model.stateWriting || firstWrite == nil {
+		t.Fatal("older draft did not start a state write")
+	}
+
+	result := make(chan stateWriteResult, 1)
+	go func() {
+		message := trailingCommandMessage(firstWrite)
+		result <- message.(stateWriteResult)
+	}()
+	<-store.started
+
+	model.setReplyValue("latest")
+	updated, quit := model.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	model = updated.(Model)
+	if quit != nil || !model.quitting {
+		t.Fatalf("first Ctrl+C did not wait for the in-flight state transaction: %+v", model)
+	}
+	updated, ignored := model.Update(tea.KeyPressMsg{Text: "x", Code: 'x'})
+	model = updated.(Model)
+	if ignored != nil || model.replyInput != "latest" {
+		t.Fatalf("input mutated while graceful quit was draining: %+v", model)
+	}
+
+	close(store.release)
+	updated, latestWrite := model.Update(<-result)
+	model = updated.(Model)
+	if latestWrite == nil || !model.stateWriting {
+		t.Fatalf("newest snapshot was not scheduled after the old transaction: %+v", model)
+	}
+	latestResult := workerStateResult(t, latestWrite)
+	updated, quit = model.Update(latestResult)
+	model = updated.(Model)
+	if !commandContainsQuit(quit) {
+		t.Fatalf("model did not quit after the newest snapshot became durable: %+v", model)
+	}
+
+	payload := store.payload(stateRecordKey{scope: stateScope(assignment), kind: workerStateDraftKind})
+	var persisted persistedDraft
+	if err := json.Unmarshal(payload, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Reply != "latest" {
+		t.Fatalf("graceful quit persisted %q, want latest", persisted.Reply)
+	}
+}
+
+func TestControlCUnboundOrSecondGestureQuitsImmediately(t *testing.T) {
+	store := &blockingStateStore{records: make(map[stateRecordKey]json.RawMessage)}
+	client := newFakeClient()
+	client.identity = workerclient.Identity{}
+	unbound := New(client, WithStateStore(store)).activateAssignment(persistentRemoteAssignment("unbound-quit"))
+	unbound.setReplyValue("cannot bind yet")
+	updated, quit := unbound.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if updated.(Model).quitting || !commandContainsQuit(quit) {
+		t.Fatal("unbound worker required a second Ctrl+C despite having no durable scope")
+	}
+
+	bound := New(newFakeClient(), WithStateStore(store)).activateAssignment(persistentRemoteAssignment("forced-quit"))
+	bound.setReplyValue("unsynced")
+	updated, first := bound.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	bound = updated.(Model)
+	if commandContainsQuit(first) || !bound.quitting {
+		t.Fatal("first Ctrl+C did not enter graceful drain")
+	}
+	_, second := bound.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if !commandContainsQuit(second) {
+		t.Fatal("second Ctrl+C did not force quit")
+	}
+}
+
+func TestControlCWaitsForCorrectnessBearingMirrorCommand(t *testing.T) {
+	model := New(newFakeClient())
+	model.delivery = deliveryReview{
+		stage: deliveryConfirming, intentWriterInFlight: true,
+	}
+	updated, quit := model.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	model = updated.(Model)
+	if commandContainsQuit(quit) || !model.quitting {
+		t.Fatal("first Ctrl+C abandoned an in-flight mirror intent writer")
+	}
+
+	model.delivery = deliveryReview{}
+	updated, quit = model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	model = updated.(Model)
+	if !commandContainsQuit(quit) {
+		t.Fatal("graceful quit did not finish after the mirror writer settled")
+	}
+}
+
 func TestWorkerStatePendingSendSurvivesCrashBeforeOutboxCommit(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -417,15 +645,14 @@ func TestWorkerStatePendingSendSurvivesCrashBeforeOutboxCommit(t *testing.T) {
 		t.Fatalf("optimistic recovered progress count = %d, want 1", got)
 	}
 	originalEvent := restarted.pending.event
-	replayed := assignment
-	replayed.LeaseOwner = "worker"
-	replayed.HarnessSessionID = "refreshed-routing"
+	replayed := restarted.pending.assignment
 	updated, replayState := restarted.Update(networkMessage{Assignment: &replayed})
 	restarted = updated.(Model)
 	if len(restarted.assignments) != 0 || restarted.active == nil ||
-		restarted.pending.assignment.HarnessSessionID != "refreshed-routing" ||
+		!samePersistedAssignment(restarted.pending.assignment, replayed) ||
+		!restarted.pending.durable ||
 		!reflect.DeepEqual(restarted.pending.event, originalEvent) {
-		t.Fatalf("same-session replay was not suppressed/refreshed exactly: %+v", restarted)
+		t.Fatalf("same-session replay did not preserve the exact recovery snapshot: %+v", restarted)
 	}
 	restarted = settleTrailingStateWrites(t, restarted, replayState)
 	if _, stale := restarted.stateDrafts[stateRecordKey{
@@ -455,9 +682,143 @@ func TestWorkerStatePendingSendSurvivesCrashBeforeOutboxCommit(t *testing.T) {
 	}
 	for _, record := range records {
 		if record.Kind == workerStatePendingSendKind ||
-			(record.Kind == workerStateDraftKind && recoverableDraftScope(record.Scope, stateScope(assignment))) {
+			(record.Kind == workerStateDraftKind && record.Scope == stateScope(assignment)) {
 			t.Fatalf("completed recovery state was not cleaned up: %+v", records)
 		}
+	}
+}
+
+func TestWorkerStatePendingIntentPreservesOlderCrossSessionDraft(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "worker.db")
+	store, err := workerstate.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Bind the real SQLite store to the same authenticated namespace that the
+	// restarted TUI will use before seeding the two independent rows.
+	_ = New(newFakeClient(), WithStateStore(store))
+
+	parkedAssignment := allPaneStateAssignment("parked-draft-e1")
+	pendingAssignment := parkedAssignment
+	pendingAssignment.IdempotencyKey = "pending-final-e2"
+	laterAssignment := parkedAssignment
+	laterAssignment.IdempotencyKey = "later-request-e3"
+	if parkedAssignment.SessionKey() == pendingAssignment.SessionKey() ||
+		parkedAssignment.SessionKey() == laterAssignment.SessionKey() ||
+		pendingAssignment.SessionKey() == laterAssignment.SessionKey() {
+		t.Fatal("test requires three distinct HTTP session keys in one stable Workspace task")
+	}
+
+	parked := persistedDraft{
+		Version: workerStateVersion, Focus: persistedFocusReply,
+		Reply:         "E1 reply that must remain parked",
+		ToolInput:     `search {"query":"E1 advanced draft"}`,
+		ToolCallIDs:   []string{"tool-e1-first", "tool-e1-second"},
+		TaskEditIndex: -1,
+	}
+	parkedPayload, err := json.Marshal(parked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parkedRecord, err := store.Put(
+		ctx, stateScope(parkedAssignment), workerStateDraftKind, parkedPayload,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pending := pendingSend{
+		kind: pendingReply, eventID: "event-e2-final", assignment: pendingAssignment,
+		reply: "E2 final already committed for handoff",
+		event: completion.Event{
+			ID: "event-e2-final", Type: completion.EventFinal,
+			Text: "E2 final already committed for handoff",
+		},
+		remainingDraft: persistedDraft{Version: workerStateVersion, TaskEditIndex: -1},
+	}
+	pendingPayload, err := json.Marshal(persistedPendingFromSend(pending, pendingSendDispositionSend))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingRecord, err := store.Put(
+		ctx, stateScope(pendingAssignment), workerStatePendingSendKind, pendingPayload,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pendingRecord.CreatedRevision <= parkedRecord.Revision {
+		t.Fatalf("pending intent revision %d is not newer than parked draft revision %d",
+			pendingRecord.CreatedRevision, parkedRecord.Revision)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = workerstate.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	client := newFakeClient()
+	restarted := New(client, WithStateStore(store))
+	parkedKey := stateRecordKey{scope: stateScope(parkedAssignment), kind: workerStateDraftKind}
+	saved, exists := restarted.stateDrafts[parkedKey]
+	if !exists || !reflect.DeepEqual(saved.draft, parked) {
+		t.Fatalf("E2 pending reconciliation consumed E1 parked draft: exists=%t draft=%+v", exists, saved.draft)
+	}
+	if restarted.pending.event.ID != pending.event.ID || !restarted.pending.recovered ||
+		!restarted.pending.durable || restarted.pending.assignment.SessionKey() != pendingAssignment.SessionKey() {
+		t.Fatalf("E2 exact pending intent was not recovered independently: %+v", restarted.pending)
+	}
+
+	sent, ok := sendPersistedEvent(client, store, restarted.pending)().(eventSent)
+	if !ok || sent.err != nil || sent.eventID != pending.event.ID {
+		t.Fatalf("E2 durable handoff = %#v", sent)
+	}
+	updated, cleanup := restarted.Update(sent)
+	restarted = updated.(Model)
+	restarted = flushWorkerStateCommand(t, restarted, cleanup)
+	if restarted.pending.kind != pendingNone {
+		t.Fatalf("E2 pending intent was not consumed: %+v", restarted.pending)
+	}
+	if _, exists := restarted.stateDrafts[parkedKey]; !exists {
+		t.Fatal("completing E2 swallowed the independent E1 parked draft")
+	}
+	records, err := store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundParked := false
+	for _, record := range records {
+		if record.Scope == stateScope(pendingAssignment) && record.Kind == workerStatePendingSendKind {
+			t.Fatalf("completed E2 pending row remained durable: %+v", record)
+		}
+		if record.Scope == stateScope(parkedAssignment) && record.Kind == workerStateDraftKind {
+			foundParked = true
+		}
+	}
+	if !foundParked {
+		t.Fatal("E1 parked draft row was deleted while E2 completed")
+	}
+
+	restarted = restarted.activateAssignment(laterAssignment)
+	if restarted.replyInput != parked.Reply || restarted.input != parked.ToolInput ||
+		!restarted.composing || !reflect.DeepEqual(restarted.toolCallIDs, parked.ToolCallIDs) {
+		t.Fatalf("E3 did not recover E1 reply/tool draft exactly: reply=%q composing=%t input=%q ids=%v",
+			restarted.replyInput, restarted.composing, restarted.input, restarted.toolCallIDs)
+	}
+	if _, exists := restarted.stateDrafts[parkedKey]; exists {
+		t.Fatal("E3 activation did not consume the E1 parked row")
+	}
+	// Replaying the same E3 activation must retain the editor, not merge the E1
+	// body or tool IDs a second time.
+	restarted = restarted.activateAssignment(laterAssignment)
+	if restarted.replyInput != parked.Reply || restarted.input != parked.ToolInput ||
+		!reflect.DeepEqual(restarted.toolCallIDs, parked.ToolCallIDs) {
+		t.Fatalf("E1 parked draft was consumed more than once: reply=%q input=%q ids=%v",
+			restarted.replyInput, restarted.input, restarted.toolCallIDs)
 	}
 }
 
@@ -485,7 +846,7 @@ func TestWorkerStateSendFailureDecisionSurvivesCrashBeforeUIRestore(t *testing.T
 	}
 
 	failing := newFakeClient()
-	failing.sendErr = errors.New("local outbox unavailable")
+	failing.sendErr = definitelyNotStored("local outbox unavailable")
 	// Re-run the command with a deterministic failing client. sendPersistedEvent
 	// commits disposition=restore before returning eventSent; dropping that UI
 	// message simulates a crash after the decision but before in-memory restore.
@@ -510,6 +871,89 @@ func TestWorkerStateSendFailureDecisionSurvivesCrashBeforeUIRestore(t *testing.T
 	restarted = restarted.activateAssignment(assignment)
 	if restarted.replyInput != "restore me instead of silently retrying" || restarted.focus != focusReply {
 		t.Fatalf("durable restore decision did not recover the editor draft: %+v", restarted)
+	}
+}
+
+func TestAcceptAndRejectAmbiguousOutboxRetryExactEventWithStateStore(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		eventType completion.EventType
+		begin     func(Model, completion.Assignment) (tea.Model, tea.Cmd)
+	}{
+		{
+			name: "manual accept", eventType: completion.EventAccepted,
+			begin: func(model Model, _ completion.Assignment) (tea.Model, tea.Cmd) {
+				return model.acceptSelected()
+			},
+		},
+		{
+			name: "automatic accept", eventType: completion.EventAccepted,
+			begin: func(model Model, assignment completion.Assignment) (tea.Model, tea.Cmd) {
+				return model.beginAccept(assignment, 0, true)
+			},
+		},
+		{
+			name: "reject", eventType: completion.EventRejected,
+			begin: func(model Model, _ completion.Assignment) (tea.Model, tea.Cmd) {
+				return model.rejectSelected()
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := workerstate.Open(ctx, filepath.Join(t.TempDir(), "state", "worker.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			client := newFakeClient()
+			client.sendErr = errors.New("outbox commit result unavailable")
+			assignment := persistentRemoteAssignment("ambiguous-" + test.name)
+			model := New(client, WithStateStore(store))
+			model.queueAssignmentOnce(assignment)
+
+			updated, command := test.begin(model, assignment)
+			model = updated.(Model)
+			if command == nil || model.pending.event.ID == "" || model.pending.event.Type != test.eventType {
+				t.Fatalf("immutable pending event not captured: %+v", model.pending)
+			}
+			original := model.pending.event
+			first, ok := commandResult(t, command).(eventSent)
+			if !ok || first.err == nil {
+				t.Fatalf("first ambiguous result = %#v", first)
+			}
+			updated, _ = model.Update(first)
+			model = updated.(Model)
+			if model.pending.event.ID != original.ID || model.pending.event.Type != original.Type ||
+				model.pending.kind == pendingNone {
+				t.Fatalf("ambiguous result changed or cleared pending event: %+v", model.pending)
+			}
+
+			client.sendErr = nil
+			updated, retry := model.Update(pendingSendRetry{eventID: original.ID, attempt: 1})
+			model = updated.(Model)
+			if retry == nil {
+				t.Fatal("exact accept/reject retry was suppressed by the state store")
+			}
+			second, ok := commandResult(t, retry).(eventSent)
+			if !ok || second.err != nil {
+				t.Fatalf("retry result = %#v", second)
+			}
+			updated, _ = model.Update(second)
+			model = updated.(Model)
+			if len(client.events) != 2 || client.events[0].ID != original.ID ||
+				client.events[1].ID != original.ID || client.events[0].Type != original.Type ||
+				client.events[1].Type != original.Type || model.pending.kind != pendingNone {
+				t.Fatalf("retry did not preserve the exact event: events=%+v pending=%+v", client.events, model.pending)
+			}
+			if test.eventType == completion.EventAccepted {
+				if model.active == nil || model.active.SessionKey() != assignment.SessionKey() || len(model.assignments) != 0 {
+					t.Fatalf("accepted request left a ghost Inbox row: active=%+v assignments=%+v", model.active, model.assignments)
+				}
+			} else if model.active != nil || len(model.assignments) != 0 {
+				t.Fatalf("rejected request was not removed: active=%+v assignments=%+v", model.active, model.assignments)
+			}
+		})
 	}
 }
 
@@ -904,20 +1348,34 @@ func TestRecoveredFinalSuppressesReplayWithoutReopeningStream(t *testing.T) {
 		t.Fatalf("final recovery reopened an active stream: %+v", restarted)
 	}
 	original := restarted.pending.event
-	replayed := assignment
-	replayed.LeaseOwner = "worker"
-	replayed.HarnessSessionID = "new-route"
-	updated, _ = restarted.Update(networkMessage{Assignment: &replayed})
+	replayed := restarted.pending.assignment
+	client.messages <- workerclient.Message{Assignment: &replayed}
+	boot := executeTestCommand(restarted.Init())
+	incoming, ok := firstTestMessage[networkMessage](boot)
+	if !ok || incoming.Assignment == nil {
+		t.Fatalf("Init did not surface the replayed assignment: %#v", boot)
+	}
+	resume, ok := firstTestMessage[resumeDurablePendingRequest](boot)
+	if !ok || resume.eventID != original.ID {
+		t.Fatalf("Init did not defer recovered outbox capture through Update: %#v", boot)
+	}
+	client.messages <- workerclient.Message{ConnectionRestored: true}
+	updated, _ = restarted.Update(incoming)
 	restarted = updated.(Model)
 	if len(restarted.assignments) != 0 || restarted.active != nil ||
-		restarted.pending.assignment.HarnessSessionID != "new-route" ||
-		!reflect.DeepEqual(restarted.pending.event, original) {
+		!samePersistedAssignment(restarted.pending.assignment, replayed) ||
+		!restarted.pending.durable || !reflect.DeepEqual(restarted.pending.event, original) ||
+		len(client.events) != 0 {
 		t.Fatalf("final replay was not suppressed with stable event body: %+v", restarted)
 	}
-	message := sendPersistedEvent(client, store, restarted.pending)()
-	ack, ok := message.(eventSent)
-	if !ok || ack.err != nil {
-		t.Fatalf("final replay handoff = %#v", message)
+	// Assignment replay must not rewrite the recovered pending snapshot: the
+	// exact event may already be present in the durable outbox from before crash.
+	updated, handoff := restarted.Update(resume)
+	restarted = updated.(Model)
+	ack, ok := firstTestMessage[eventSent](executeTestCommand(handoff))
+	if !ok || ack.err != nil || len(client.assignments) != 1 ||
+		!samePersistedAssignment(client.assignments[0], replayed) {
+		t.Fatalf("final replay handoff = %#v, assignments=%+v", ack, client.assignments)
 	}
 	updated, _ = restarted.Update(ack)
 	restarted = updated.(Model)
@@ -992,8 +1450,15 @@ func TestMultipleRecoveredPendingEventsResumeInOrder(t *testing.T) {
 	secondReplay.HarnessSessionID = "second-refreshed"
 	updated, _ = model.Update(networkMessage{Assignment: &secondReplay})
 	model = updated.(Model)
-	if len(model.assignments) != 0 || model.pending.assignment.HarnessSessionID != "second-refreshed" {
-		t.Fatalf("queued terminal replay entered Inbox: %+v", model)
+	if len(model.assignments) != 0 ||
+		!samePersistedAssignment(model.pending.assignment, secondAssignment) ||
+		!model.pending.outboxInFlight {
+		t.Fatalf("queued terminal replay changed the already-captured outbox payload: %+v", model)
+	}
+	executeTestCommand(next)
+	if len(client.assignments) != 2 ||
+		!samePersistedAssignment(client.assignments[1], secondAssignment) {
+		t.Fatalf("queued terminal outbox assignment = %+v", client.assignments)
 	}
 }
 
@@ -1158,6 +1623,23 @@ func allPaneStateAssignment(idempotencyKey string) completion.Assignment {
 		canonical.Tool{Name: "search", InputSchema: json.RawMessage(`{"type":"object"}`)},
 	)
 	return assignment
+}
+
+func TestRecoveredAssignmentSnapshotRejectsEveryMutation(t *testing.T) {
+	current := allPaneStateAssignment("immutable-recovery-assignment")
+	current.LeaseOwner = "worker-old"
+	model := New(newFakeClient())
+	model.pending = pendingSend{
+		kind: pendingReply, recovered: true, durable: true, assignment: current,
+		event: completion.Event{ID: "event-immutable", Type: completion.EventFinal, Text: "done"},
+	}
+
+	tampered := current
+	tampered.LeaseOwner = "worker-new"
+	model.refreshRecoveredAssignment(tampered)
+	if !samePersistedAssignment(model.pending.assignment, current) || !model.pending.durable {
+		t.Fatalf("recovered assignment mutation changed the exact snapshot: %+v", model.pending)
+	}
 }
 
 func populateEveryPane(model *Model) {
@@ -1362,4 +1844,85 @@ func trailingStateWriteResult(t *testing.T, command tea.Cmd) stateWriteResult {
 		t.Fatalf("trailing state command returned %T", message)
 	}
 	return result
+}
+
+type blockingStateStore struct {
+	mu      sync.Mutex
+	started chan struct{}
+	release chan struct{}
+	puts    int
+	records map[stateRecordKey]json.RawMessage
+}
+
+func (store *blockingStateStore) Bind(context.Context, string, string) error { return nil }
+
+func (store *blockingStateStore) List(context.Context) ([]workerstate.Record, error) { return nil, nil }
+
+func (store *blockingStateStore) Put(
+	_ context.Context,
+	scope workerstate.Scope,
+	kind string,
+	payload json.RawMessage,
+) (workerstate.Record, error) {
+	store.mu.Lock()
+	store.puts++
+	first := store.puts == 1 && store.started != nil && store.release != nil
+	store.mu.Unlock()
+	if first {
+		close(store.started)
+		<-store.release
+	}
+	key := stateRecordKey{scope: scope, kind: kind}
+	copy := append(json.RawMessage(nil), payload...)
+	store.mu.Lock()
+	if store.records == nil {
+		store.records = make(map[stateRecordKey]json.RawMessage)
+	}
+	store.records[key] = copy
+	store.mu.Unlock()
+	return workerstate.Record{Scope: scope, Kind: kind, Payload: copy}, nil
+}
+
+func (store *blockingStateStore) Delete(_ context.Context, scope workerstate.Scope, kind string) error {
+	store.mu.Lock()
+	delete(store.records, stateRecordKey{scope: scope, kind: kind})
+	store.mu.Unlock()
+	return nil
+}
+
+func (store *blockingStateStore) payload(key stateRecordKey) json.RawMessage {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return append(json.RawMessage(nil), store.records[key]...)
+}
+
+func trailingCommandMessage(command tea.Cmd) tea.Msg {
+	message := command()
+	for {
+		batch, ok := message.(tea.BatchMsg)
+		if !ok || len(batch) == 0 {
+			return message
+		}
+		message = batch[len(batch)-1]()
+	}
+}
+
+func commandContainsQuit(command tea.Cmd) bool {
+	if command == nil {
+		return false
+	}
+	message := command()
+	if _, ok := message.(tea.QuitMsg); ok {
+		return true
+	}
+	batch, ok := message.(tea.BatchMsg)
+	if !ok {
+		return false
+	}
+	for _, child := range batch {
+		if child != nil && commandContainsQuit(child) {
+			return true
+		}
+	}
+	return false
 }

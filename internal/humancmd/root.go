@@ -34,6 +34,7 @@ func New() *cobra.Command {
 	mustBind(settings, "config", command.PersistentFlags().Lookup("config"))
 	workerCommand := &cobra.Command{
 		Use: "worker", Short: "connect this Human worker to a gateway",
+		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			return run(command.Context(), settings)
 		},

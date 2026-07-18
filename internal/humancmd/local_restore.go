@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	localRestoreJournalVersion   = 2
+	localRestoreJournalVersion   = 3
 	localRestorePhaseInstalling  = "installing"
 	localRestorePhaseRollingBack = "rolling_back"
 )
@@ -110,7 +110,7 @@ func newLocalRestoreCommand(settings *viper.Viper) *cobra.Command {
 		},
 	}
 	command.Flags().StringVarP(&input, "input", "i", "", "source .tar.gz archive")
-	command.Flags().BoolVar(&force, "force", false, "replace non-empty local databases, credentials, and mirror scope")
+	command.Flags().BoolVar(&force, "force", false, "replace non-empty local databases, credentials, and selected mirror workspace")
 	command.Flags().BoolVar(&resume, "resume", false, "complete an interrupted restore from its durable journal")
 	command.Flags().BoolVar(&acceptWorkspaceMismatch, "accept-workspace-mismatch", false,
 		"acknowledge a verified same-workspace relocation; archived in-flight workspace/root identities are not rewritten")
@@ -207,8 +207,14 @@ func prepareLocalRestore(ctx context.Context, paths localBackupPaths, manifest l
 		{"gateway", "file", "gateway/gateway.db", paths.GatewayDB, true, true, false},
 		{"credentials", "file", "credentials/credentials.json", paths.Credentials, true, false, true},
 		{"outbox", "file", "worker/worker-outbox.db", paths.OutboxDB, true, true, false},
-		{"mirror-workspaces", "directory", "mirror/workspaces", filepath.Join(paths.MirrorRoot, paths.CallerSubject), true, false, false},
-		{"mirror-state", "directory", "mirror/state", filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject), true, false, false},
+		{
+			"mirror-workspace", "directory", "mirror/workspace",
+			filepath.Join(paths.MirrorRoot, paths.CallerSubject, paths.WorkspaceKey), true, false, false,
+		},
+		{
+			"mirror-state", "directory", "mirror/state",
+			filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, paths.WorkspaceKey), true, false, false,
+		},
 	}
 	if paths.StateDB != "" {
 		components = append(components, struct {
@@ -230,9 +236,16 @@ func prepareLocalRestore(ctx context.Context, paths localBackupPaths, manifest l
 	}
 
 	for _, component := range components {
-		if err := os.MkdirAll(filepath.Dir(component.target), 0o700); err != nil {
+		var targetDirectoryErr error
+		switch component.id {
+		case "mirror-workspace", "mirror-state":
+			targetDirectoryErr = ensureLocalMirrorCallerRoot(filepath.Dir(component.target))
+		default:
+			targetDirectoryErr = os.MkdirAll(filepath.Dir(component.target), 0o700)
+		}
+		if targetDirectoryErr != nil {
 			removeLocalRestoreStages(journal)
-			return localRestoreJournal{}, fmt.Errorf("create restore target directory: %w", err)
+			return localRestoreJournal{}, fmt.Errorf("create restore target directory: %w", targetDirectoryErr)
 		}
 		if component.credentials && runtime.GOOS != "windows" {
 			info, err := os.Stat(filepath.Dir(component.target))
@@ -780,10 +793,18 @@ func validateLocalRestoreJournal(paths localBackupPaths, journal localRestoreJou
 		journal.CallerSubject != paths.CallerSubject || journal.WorkerSubject != paths.WorkerSubject {
 		return errors.New("local restore journal does not belong to the selected workspace and caller")
 	}
+	for _, callerRoot := range []string{
+		filepath.Join(paths.MirrorRoot, paths.CallerSubject),
+		filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject),
+	} {
+		if err := validateLocalMirrorCallerRoot(callerRoot, false); err != nil {
+			return err
+		}
+	}
 	allowed := map[string]string{
 		"gateway": paths.GatewayDB, "credentials": paths.Credentials, "outbox": paths.OutboxDB,
-		"mirror-workspaces": filepath.Join(paths.MirrorRoot, paths.CallerSubject),
-		"mirror-state":      filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject),
+		"mirror-workspace": filepath.Join(paths.MirrorRoot, paths.CallerSubject, paths.WorkspaceKey),
+		"mirror-state":     filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, paths.WorkspaceKey),
 	}
 	if paths.StateDB != "" {
 		allowed["state"] = paths.StateDB
@@ -850,7 +871,7 @@ func validateRestoreEntrySemantics(entry localRestoreJournalEntry) error {
 		valid = entry.Kind == "file" && entry.Present && entry.SQLite && !entry.Credentials
 	case "credentials":
 		valid = entry.Kind == "file" && entry.Present && !entry.SQLite && entry.Credentials
-	case "mirror-workspaces", "mirror-state":
+	case "mirror-workspace", "mirror-state":
 		valid = entry.Kind == "directory" && entry.Present && !entry.SQLite && !entry.Credentials
 	case "state":
 		valid = entry.Kind == "file" && entry.SQLite == entry.Present && !entry.Credentials

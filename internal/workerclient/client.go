@@ -46,6 +46,11 @@ var (
 	// authenticated worker subject. Reject it before touching the durable outbox:
 	// assignment JSON is not an authority source and must never cross subjects.
 	ErrAssignmentWorkerMismatch = errors.New("assignment lease owner does not match authenticated worker")
+	// ErrEventNotStored marks a deterministic failure which occurred before the
+	// exact event could enter the durable outbox. Errors without this marker are
+	// commit-ambiguous and callers must retry the same event ID instead of
+	// restoring its source draft as though delivery were impossible.
+	ErrEventNotStored = errors.New("worker event was definitely not stored")
 )
 
 const (
@@ -390,7 +395,7 @@ func (client *Client) SendEvent(ctx context.Context, assignment completion.Assig
 		var err error
 		event.ID, err = canonical.NewOpaqueID("event_")
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: allocate worker event id: %w", ErrEventNotStored, err)
 		}
 	}
 	workerID := client.WorkerID()
@@ -398,14 +403,14 @@ func (client *Client) SendEvent(ctx context.Context, assignment completion.Assig
 		return ErrWorkerIdentityUnavailable
 	}
 	if strings.TrimSpace(assignment.LeaseOwner) == "" || assignment.LeaseOwner != workerID {
-		return ErrAssignmentWorkerMismatch
+		return fmt.Errorf("%w: %w", ErrEventNotStored, ErrAssignmentWorkerMismatch)
 	}
 	// Keep the durable outbox payload bound to the server-issued identity for
 	// every event type. gateway still overwrites this field from authentication;
 	// the client copy makes retries byte-stable across ACK loss.
 	event.WorkerID = workerID
 	if err := validateWorkerEventSize(assignment, event, workerproto.MaxWireMessageBytes); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrEventNotStored, err)
 	}
 	if _, err := client.outbox.Put(ctx, assignment, event); err != nil {
 		return err

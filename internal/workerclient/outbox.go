@@ -344,10 +344,10 @@ func (outbox *durableOutbox) Put(
 ) (outboxRecord, error) {
 	if strings.TrimSpace(assignment.CallerID) == "" || strings.TrimSpace(assignment.IdempotencyKey) == "" ||
 		strings.TrimSpace(assignment.TaskID) == "" {
-		return outboxRecord{}, errors.New("worker event requires caller, task, and idempotency identity")
+		return outboxRecord{}, fmt.Errorf("%w: worker event requires caller, task, and idempotency identity", ErrEventNotStored)
 	}
 	if strings.TrimSpace(event.ID) == "" || event.Type == "" {
-		return outboxRecord{}, errors.New("worker event requires id and type")
+		return outboxRecord{}, fmt.Errorf("%w: worker event requires id and type", ErrEventNotStored)
 	}
 	record := outboxRecord{
 		EventID: event.ID, TaskID: assignment.TaskID,
@@ -359,11 +359,11 @@ func (outbox *durableOutbox) Put(
 	}
 	payload, err := json.Marshal(record.Message)
 	if err != nil {
-		return outboxRecord{}, fmt.Errorf("marshal worker outbox event: %w", err)
+		return outboxRecord{}, fmt.Errorf("%w: marshal worker outbox event: %v", ErrEventNotStored, err)
 	}
 	assignmentPayload, err := json.Marshal(record.Assignment)
 	if err != nil {
-		return outboxRecord{}, fmt.Errorf("marshal worker outbox assignment snapshot: %w", err)
+		return outboxRecord{}, fmt.Errorf("%w: marshal worker outbox assignment snapshot: %v", ErrEventNotStored, err)
 	}
 	tx, err := outbox.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -382,7 +382,7 @@ func (outbox *durableOutbox) Put(
 	case err == nil:
 		if storedTask != assignment.TaskID || !bytes.Equal(storedPayload, payload) ||
 			!bytes.Equal(storedAssignment, assignmentPayload) {
-			return outboxRecord{}, errOutboxConflict
+			return outboxRecord{}, fmt.Errorf("%w: %w", ErrEventNotStored, errOutboxConflict)
 		}
 		if err := tx.Commit(); err != nil {
 			return outboxRecord{}, fmt.Errorf("commit worker outbox replay: %w", err)
@@ -414,7 +414,7 @@ func (outbox *durableOutbox) Put(
 		// the ordinary outbox and sending it to the gateway again.
 		if storedTask != assignment.TaskID || !bytes.Equal(storedPayload, payload) ||
 			!bytes.Equal(storedAssignment, assignmentPayload) {
-			return outboxRecord{}, errOutboxConflict
+			return outboxRecord{}, fmt.Errorf("%w: %w", ErrEventNotStored, errOutboxConflict)
 		}
 		if err := tx.Commit(); err != nil {
 			return outboxRecord{}, fmt.Errorf("commit worker rejected event replay: %w", err)
@@ -434,7 +434,7 @@ func (outbox *durableOutbox) Put(
 	case err == nil:
 		if confirmedEventDigest != digestHex(payload) ||
 			confirmedAssignmentDigest != digestHex(assignmentPayload) {
-			return outboxRecord{}, errOutboxConflict
+			return outboxRecord{}, fmt.Errorf("%w: %w", ErrEventNotStored, errOutboxConflict)
 		}
 		if err := tx.Commit(); err != nil {
 			return outboxRecord{}, fmt.Errorf("commit confirmed worker rejection replay: %w", err)

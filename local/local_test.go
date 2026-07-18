@@ -3,6 +3,7 @@ package local
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -45,6 +46,9 @@ func TestDefaultConfigScopesPrivateStoresOutsideWorkspace(t *testing.T) {
 		t.Fatalf("local private defaults = %q / %q / %q, want %q / %q / %q",
 			config.Gateway.DatabasePath, config.Worker.OutboxPath, config.Worker.StatePath,
 			wantGateway, wantOutbox, wantState)
+	}
+	if config.IssuedCredentialPolicy != IssuedCredentialsRevokeOnClose {
+		t.Fatalf("default issued credential policy = %d, want revoke-on-close", config.IssuedCredentialPolicy)
 	}
 }
 
@@ -204,9 +208,23 @@ func TestOpenConnectsWorkerServesCallerAndClosesIdempotently(t *testing.T) {
 	if bytes.Contains(databaseBytes, []byte(credentials.WorkerToken)) {
 		t.Fatal("gateway database persisted the plaintext worker token")
 	}
+
+	reopened, err := gateway.Open(context.Background(), config.Gateway)
+	if err != nil {
+		t.Fatalf("reopen gateway after Local.Close: %v", err)
+	}
+	defer reopened.Close()
+	for label, secret := range map[string]string{
+		"caller": credentials.CallerToken,
+		"worker": credentials.WorkerToken,
+	} {
+		if _, err := reopened.ValidateToken(context.Background(), secret); !errors.Is(err, gateway.ErrUnauthorized) {
+			t.Fatalf("default %s credential after Local.Close = %v, want revoked", label, err)
+		}
+	}
 }
 
-func TestOpenReusesExistingCredentials(t *testing.T) {
+func TestOpenExplicitlyPreservesAndReusesExistingCredentials(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	privateRoot := filepath.Join(root, "private")
@@ -220,9 +238,10 @@ func TestOpenReusesExistingCredentials(t *testing.T) {
 			OutboxPath: filepath.Join(privateRoot, "outbox.db"),
 			StatePath:  filepath.Join(privateRoot, "state.db"),
 		},
-		ListenAddress: "127.0.0.1:0",
-		CallerSubject: "stable-caller",
-		WorkerSubject: "stable-worker",
+		ListenAddress:          "127.0.0.1:0",
+		CallerSubject:          "stable-caller",
+		WorkerSubject:          "stable-worker",
+		IssuedCredentialPolicy: IssuedCredentialsPreserve,
 	}
 	first, err := Open(context.Background(), config)
 	if err != nil {
@@ -357,12 +376,28 @@ func TestOpenUsesCredentialProviderBeforeStartingWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = instance.Close() })
 	if !providerCalled {
 		t.Fatal("credential provider was not called")
 	}
 	if got := instance.Credentials(); got.NewlyIssued || got.CallerToken == "" || got.WorkerToken == "" {
 		t.Fatalf("provided credentials = %+v", got)
+	}
+	provided := instance.Credentials()
+	if err := instance.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := gateway.Open(context.Background(), config.Gateway)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	for label, secret := range map[string]string{
+		"caller": provided.CallerToken,
+		"worker": provided.WorkerToken,
+	} {
+		if _, err := reopened.ValidateToken(context.Background(), secret); err != nil {
+			t.Fatalf("provider-owned %s credential was revoked: %v", label, err)
+		}
 	}
 }
 
@@ -391,6 +426,13 @@ func TestOpenRejectsCustomAuthenticatorAndNonLoopbackListener(t *testing.T) {
 	if instance, err := Open(context.Background(), partialCredentials); err == nil {
 		_ = instance.Close()
 		t.Fatal("Open accepted only one existing credential")
+	}
+
+	invalidPolicy := base
+	invalidPolicy.IssuedCredentialPolicy = IssuedCredentialPolicy(255)
+	if instance, err := Open(context.Background(), invalidPolicy); err == nil {
+		_ = instance.Close()
+		t.Fatal("Open accepted an invalid issued credential policy")
 	}
 
 	nonLoopback := base

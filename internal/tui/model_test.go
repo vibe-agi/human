@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -28,11 +29,16 @@ import (
 type fakeClient struct {
 	messages         chan workerclient.Message
 	events           []completion.Event
+	assignments      []completion.Assignment
 	confirmed        []string
 	sendErr          error
 	confirmationErr  error
 	confirmationErrs []error
 	identity         workerclient.Identity
+}
+
+func definitelyNotStored(message string) error {
+	return fmt.Errorf("%w: %s", workerclient.ErrEventNotStored, message)
 }
 
 func newFakeClient() *fakeClient {
@@ -46,7 +52,8 @@ func (client *fakeClient) Messages() <-chan workerclient.Message { return client
 func (client *fakeClient) WorkerIdentity() (workerclient.Identity, bool) {
 	return client.identity, client.identity.GatewayID != "" && client.identity.WorkerID != ""
 }
-func (client *fakeClient) SendEvent(_ context.Context, _ completion.Assignment, event completion.Event) error {
+func (client *fakeClient) SendEvent(_ context.Context, assignment completion.Assignment, event completion.Event) error {
+	client.assignments = append(client.assignments, assignment)
 	client.events = append(client.events, event)
 	return client.sendErr
 }
@@ -583,6 +590,85 @@ func TestAdvancedToolInputUsesQualifiedNamespaceAndHonorsSerialPolicy(t *testing
 	draft, ids, ok := advancedDraftFromCalls([]completion.ToolCall{call})
 	if !ok || draft != `workspace::read {"path":"README.md"}` || len(ids) != 1 || ids[0] != "call-ns" {
 		t.Fatalf("namespaced rejected draft = %q, %#v, %v", draft, ids, ok)
+	}
+}
+
+func TestRejectedAdvancedToolDraftUsesDeterministicFreshCallIDs(t *testing.T) {
+	t.Parallel()
+	assignment := remoteStreamAssignment()
+	event := completion.Event{
+		ID: "event-deterministic-rekey", Type: completion.EventToolCalls,
+		ToolCalls: []completion.ToolCall{
+			{ID: "tool-old-one", Name: "search", Input: map[string]any{"query": "one"}},
+			{ID: "tool-old-two", Name: "lookup", Input: map[string]any{"path": "two"}},
+		},
+	}
+	fromEvent, ok := rejectedDraftFromEvent(assignment, event)
+	if !ok {
+		t.Fatal("rejected event did not reconstruct an advanced draft")
+	}
+	model := New(newFakeClient())
+	fromPending, ok := model.rejectedDraftFromPending(pendingSend{
+		kind: pendingAdvancedTools, assignment: assignment, eventID: event.ID, event: event,
+		toolInput:   "search {\"query\":\"one\"}\nlookup {\"path\":\"two\"}",
+		toolCallIDs: []string{"tool-old-one", "tool-old-two"},
+	})
+	if !ok {
+		t.Fatal("rejected pending event did not reconstruct an advanced draft")
+	}
+	if !reflect.DeepEqual(fromEvent.toolCallIDs, fromPending.toolCallIDs) ||
+		len(fromEvent.toolCallIDs) != 2 ||
+		fromEvent.toolCallIDs[0] == "tool-old-one" || fromEvent.toolCallIDs[1] == "tool-old-two" ||
+		fromEvent.toolCallIDs[0] == fromEvent.toolCallIDs[1] ||
+		!strings.HasPrefix(fromEvent.toolCallIDs[0], "tool_retry_") ||
+		!strings.HasPrefix(fromEvent.toolCallIDs[1], "tool_retry_") {
+		t.Fatalf("deterministic replacement IDs = event %v pending %v",
+			fromEvent.toolCallIDs, fromPending.toolCallIDs)
+	}
+}
+
+func TestAdvancedComposerRejectsMappedMirrorMutationsWithoutProvenance(t *testing.T) {
+	t.Parallel()
+	client := newFakeClient()
+	assignment := workspaceAssignment(canonical.Request{})
+	model := New(client).activateAssignment(assignment)
+	model.composing = true
+	model.input = `human_write_file {"path":"/workspace/unsafe.txt","content":"unsafe"}`
+	model.toolCallIDs = []string{"tool-direct-mutation"}
+	beforeContext := cloneAssignment(model.lastContext)
+	beforeContinueIDs := maps.Clone(model.continueIDs)
+
+	updated, command := model.sendDeclaredToolCalls()
+	model = updated.(Model)
+	if command != nil || model.pending.kind != pendingNone || model.active == nil ||
+		!model.composing || model.input == "" || len(model.toolCallIDs) != 1 ||
+		len(client.events) != 0 || !reflect.DeepEqual(model.lastContext, beforeContext) ||
+		!reflect.DeepEqual(model.continueIDs, beforeContinueIDs) || model.continueContext != nil ||
+		!strings.Contains(model.status, "must use Live Workspace") {
+		t.Fatalf("generic composer emitted an unprovenanced mirror mutation: %+v events=%+v",
+			model, client.events)
+	}
+}
+
+func TestAdvancedComposerStillSendsDeclaredNonMutationToolInWorkspace(t *testing.T) {
+	t.Parallel()
+	client := newFakeClient()
+	request := canonical.Request{Tools: []canonical.Tool{{
+		Name: "search", InputSchema: []byte(`{"type":"object"}`),
+	}}}
+	model := New(client).activateAssignment(workspaceAssignment(request))
+	model.composing = true
+	model.input = `search {"query":"status"}`
+	model.toolCallIDs = []string{"tool-custom-search"}
+
+	updated, command := model.sendDeclaredToolCalls()
+	model = updated.(Model)
+	if command == nil || model.pending.kind != pendingAdvancedTools || model.active != nil ||
+		model.composing || model.input != "" || model.toolCallIDs != nil ||
+		len(model.pending.event.ToolCalls) != 1 ||
+		model.pending.event.ToolCalls[0].ID != "tool-custom-search" ||
+		model.pending.event.ToolCalls[0].Name != "search" {
+		t.Fatalf("declared non-mutation tool was blocked in workspace mode: %+v", model)
 	}
 }
 
@@ -1544,8 +1630,18 @@ func TestRejectedOpenCodePullRestoresDraftAndCleansIntentAfterRestart(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(state, []byte(event.ToolCalls[0].ID)) {
-		t.Fatalf("rejected pull intent remained durable: %s", state)
+	var mirrorState struct {
+		Deliveries map[string]json.RawMessage `json:"deliveries"`
+		Hydrations map[string]json.RawMessage `json:"hydrations"`
+		Results    map[string]string          `json:"results"`
+	}
+	if err := json.Unmarshal(state, &mirrorState); err != nil {
+		t.Fatal(err)
+	}
+	ledgerID := "adapter:" + assignment.Adapter.Key() + ":" + event.ToolCalls[0].ID
+	if len(mirrorState.Deliveries) != 0 || len(mirrorState.Hydrations) != 0 ||
+		mirrorState.Results[ledgerID] != "discarded-before-outbox" {
+		t.Fatalf("rejected pull cleanup state = %s", state)
 	}
 }
 
@@ -1605,7 +1701,12 @@ func TestWorkspaceDeliveryRejectsChangesAfterPreview(t *testing.T) {
 		!strings.Contains(model.status, "changed after preview") {
 		t.Fatalf("changed preview was sent: model=%+v events=%+v", model, client.events)
 	}
-	updated, _ = model.Update(commandResult(t, sendCommand))
+	updated, reviewCommand := model.Update(commandResult(t, sendCommand))
+	model = updated.(Model)
+	if reviewCommand == nil {
+		t.Fatal("intent cleanup did not refresh the changed workspace")
+	}
+	updated, _ = model.Update(commandResult(t, reviewCommand))
 	model = updated.(Model)
 	if model.delivery.stage != deliveryReviewed || len(model.delivery.changes) != 1 ||
 		string(model.delivery.changes[0].NewContent) != "v2" {
@@ -1638,7 +1739,7 @@ func TestWorkspacePreviewRejectsToolEventBeyondWireBudget(t *testing.T) {
 func TestWorkspaceDeliverySendFailureRetainsPreviewAndStableEventID(t *testing.T) {
 	t.Parallel()
 	client := newFakeClient()
-	client.sendErr = errors.New("ack lost")
+	client.sendErr = definitelyNotStored("outbox unavailable")
 	manager := newFilesystemMirrorManager(t.TempDir())
 	assignment := workspaceAssignment(canonical.Request{Messages: []canonical.Message{{
 		Role: canonical.RoleUser, Blocks: []canonical.Block{{Type: canonical.BlockText, Text: "add it"}},
@@ -1667,7 +1768,8 @@ func TestWorkspaceDeliverySendFailureRetainsPreviewAndStableEventID(t *testing.T
 	updated, _ = model.Update(commandResult(t, command))
 	model = updated.(Model)
 	if model.active == nil || model.delivery.stage != deliveryConfirmed ||
-		model.delivery.eventID != firstEventID || !strings.Contains(model.status, "exact event") {
+		model.pending.kind != pendingDelivery || model.pending.durable ||
+		model.pending.eventID != firstEventID || !strings.Contains(model.status, "exact in-memory event") {
 		t.Fatalf("send failure lost delivery state: %+v", model)
 	}
 	client.sendErr = nil

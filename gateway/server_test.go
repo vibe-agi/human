@@ -15,9 +15,11 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 	internalauth "github.com/vibe-agi/human/internal/auth"
 	"github.com/vibe-agi/human/internal/completion"
 	completiongateway "github.com/vibe-agi/human/internal/completion/gateway"
+	"github.com/vibe-agi/human/internal/workerproto"
 )
 
 func TestPublicGatewayRequiresExplicitDatabaseIdentity(t *testing.T) {
@@ -181,6 +183,80 @@ func TestBuiltInTokenIssueAuthenticateAndRevoke(t *testing.T) {
 	}
 	if response := models(); response.Code != http.StatusUnauthorized {
 		t.Fatalf("models after revoke status = %d, want 401", response.Code)
+	}
+}
+
+func TestCloseTerminatesAndWaitsForActiveWorkerWebSocket(t *testing.T) {
+	config := DefaultConfig()
+	config.DatabasePath = filepath.Join(t.TempDir(), "gateway.db")
+	server, err := Open(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+
+	issued, err := server.Issue(context.Background(), PrincipalWorker, "close-worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := http.Header{"Authorization": {"Bearer " + issued.Secret}}
+	header.Set(workerproto.WorkerInstanceHeader, "close-worker-instance")
+	workerURL := "ws" + httpServer.URL[len("http"):] + WorkerPath
+	connection, response, err := websocket.Dial(
+		context.Background(), workerURL, &websocket.DialOptions{HTTPHeader: header},
+	)
+	if err != nil {
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		t.Fatalf("connect worker: %v", err)
+	}
+	defer connection.CloseNow()
+
+	readContext, cancelRead := context.WithTimeout(context.Background(), time.Second)
+	var hello workerproto.Envelope
+	err = wsjson.Read(readContext, connection, &hello)
+	cancelRead()
+	if err != nil || hello.Type != workerproto.MessageHello {
+		t.Fatalf("read worker hello = (%+v, %v)", hello, err)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- server.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close gateway: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway Close did not drain the active worker WebSocket")
+	}
+	if err := server.Close(); err != nil {
+		t.Fatalf("second gateway Close: %v", err)
+	}
+
+	readContext, cancelRead = context.WithTimeout(context.Background(), time.Second)
+	err = wsjson.Read(readContext, connection, &hello)
+	cancelRead()
+	if err == nil {
+		t.Fatal("worker WebSocket remained readable after gateway Close returned")
+	}
+
+	// The HTTP listener is deliberately still alive. A late handshake must be
+	// rejected by the transport lifecycle gate before authentication can touch
+	// the SQLite store which Close has already released.
+	late, response, err := websocket.Dial(
+		context.Background(), workerURL, &websocket.DialOptions{HTTPHeader: header},
+	)
+	if late != nil {
+		_ = late.CloseNow()
+	}
+	if response != nil {
+		defer response.Body.Close()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("late worker dial = (%v, %#v), want HTTP 503", err, response)
 	}
 }
 

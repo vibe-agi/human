@@ -23,6 +23,7 @@ func newShimCommand(settings *viper.Viper) *cobra.Command {
 	command := &cobra.Command{
 		Use:   "shim",
 		Short: "run the demand-side model proxy and tool execution boundary",
+		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			return runShim(command.Context(), settings)
 		},

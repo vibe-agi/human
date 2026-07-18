@@ -52,6 +52,13 @@ type Server struct {
 	hub      *hub.Hub
 	receipts storeapi.WorkerEventReceiptStore
 
+	lifecycle       context.Context
+	cancelLifecycle context.CancelFunc
+	lifecycleMu     sync.Mutex
+	closing         bool
+	handlers        sync.WaitGroup
+	closeOnce       sync.Once
+
 	// writeEnvelope and observeOutbound are narrow test seams for deterministic
 	// transport-failure coverage. Production always uses wsjson.Write and leaves
 	// observeOutbound nil.
@@ -124,8 +131,10 @@ func New(
 	if len(receiptStores) > 1 {
 		return nil, errors.New("at most one worker event receipt store is allowed")
 	}
+	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
 	server := &Server{
 		config: config.withDefaults(), auth: authenticator, hub: workerHub,
+		lifecycle: lifecycle, cancelLifecycle: cancelLifecycle,
 		writeEnvelope: func(ctx context.Context, connection *websocket.Conn, envelope workerproto.Envelope) error {
 			return wsjson.Write(ctx, connection, envelope)
 		},
@@ -137,6 +146,13 @@ func New(
 }
 
 func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	lifecycle, accepted := server.beginHandler()
+	if !accepted {
+		http.Error(response, "worker transport is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer server.handlers.Done()
+
 	principal, err := server.authenticate(request)
 	if err != nil || principal.Type != auth.PrincipalWorker ||
 		principal.SubjectID == workerproto.GatewayEventOwner {
@@ -168,7 +184,7 @@ func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 	}
 	defer worker.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(lifecycle)
 	defer cancel()
 	outbound := newOutboundQueue(64)
 	if server.observeOutbound != nil {
@@ -247,6 +263,34 @@ func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 			}
 		}
 	}
+}
+
+// Close prevents new worker handshakes, terminates every active WebSocket, and
+// waits until its handler has released the hub session and stopped touching the
+// receipt store. net/http Server.Shutdown does not close hijacked WebSockets,
+// so the embedding gateway must include this transport-specific drain before
+// it closes SQLite.
+func (server *Server) Close() {
+	if server == nil {
+		return
+	}
+	server.closeOnce.Do(func() {
+		server.lifecycleMu.Lock()
+		server.closing = true
+		server.cancelLifecycle()
+		server.lifecycleMu.Unlock()
+		server.handlers.Wait()
+	})
+}
+
+func (server *Server) beginHandler() (context.Context, bool) {
+	server.lifecycleMu.Lock()
+	defer server.lifecycleMu.Unlock()
+	if server.closing {
+		return nil, false
+	}
+	server.handlers.Add(1)
+	return server.lifecycle, true
 }
 
 // keepaliveLoop uses WebSocket control frames, not worker-protocol envelopes,

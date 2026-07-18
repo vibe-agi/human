@@ -6,17 +6,17 @@ Human Agent 的进程形态不是封闭产品边界。`human local`、`human gat
 
 | package | 宿主获得什么 | 宿主仍负责什么 |
 |---|---|---|
-| `local` | loopback listener、gateway、SQLite、worker 与官方 TUI 的一体化实例 | 把 `BaseURL()` 和 `CallerToken()` 直接交给进程内 Agent 客户端；如需跨重启复用明文凭据，负责加密或 mode `0600` 的持久化 |
+| `local` | loopback listener、gateway、SQLite、worker 与官方 TUI 的一体化实例 | 把 `BaseURL()` 和 `CallerToken()` 直接交给进程内 Agent 客户端；默认临时凭据在 `Close` 时撤销，如需跨重启复用须显式选择 preserve 并负责加密或 mode `0600` 的持久化 |
 | `gateway` | completion 状态机、SQLite 恢复、模型 HTTP handler、worker WebSocket handler、内建 token 或自定义认证入口 | listener、路由前缀、TLS、反向代理、HTTP 超时、身份验证、secret 管理和优雅关闭 |
 | `worker` | WebSocket 重连、durable outbox、worker state、Live Workspace mirror 与可运行/可组合的 Bubble Tea model | worker credential 的安全取得与保存、mirror 路径、外层终端程序和关闭时机 |
 
-`local.Open` 适合桌面应用把“人 = LLM”直接放进本机进程。最小示例见 [`examples/embed-local`](../examples/embed-local/main.go)：它使用 `local.DefaultConfig()`，因此数据库、outbox 和 TUI state 位于 OS 用户私有数据目录并按真实 workspace 隔离，不会默认写进客户仓库。示例只打印 loopback base URL，绝不打印 caller/worker token；宿主应把 `CallerToken()` 在内存中直接注入自己的 Agent 客户端。下面的 `go run` 命令用于源码 checkout；二进制归档中的 examples 是可复制到宿主 Go module 的参考源码。
+`local.Open` 适合桌面应用把“人 = LLM”直接放进本机进程。最小示例见 [`examples/embed-local`](../examples/embed-local/main.go)：它使用 `local.DefaultConfig()`，因此数据库、outbox 和 TUI state 位于 OS 用户私有数据目录并按真实 workspace 隔离，不会默认写进客户仓库。示例只打印 loopback base URL，绝不打印 caller/worker token；宿主应把 `CallerToken()` 在内存中直接注入自己的 Agent 客户端。库自行签发的凭据默认采用 `IssuedCredentialsRevokeOnClose`，所以示例反复运行不会在 SQLite 留下仍有效但宿主已丢失明文的 token。确需跨重启复用时，必须在 `Open` 前显式设置 `config.IssuedCredentialPolicy = local.IssuedCredentialsPreserve`，并把 `Credentials()` 的 caller/worker 两个 secret 作为一组持久化；`Existing*` 或 `CredentialProvider` 提供的凭据本来就由宿主拥有，不会被 `Close` 隐式撤销。下面的 `go run` 命令用于源码 checkout；二进制归档中的 examples 是可复制到宿主 Go module 的参考源码。
 
 ```sh
 go run ./examples/embed-local
 ```
 
-`worker.Open` 可以单独连接远程 gateway。`Run` 启动官方 TUI；`Model` 返回 `tea.Model`，可以作为更大 Bubble Tea 应用的一部分。一个 `Worker` 同时只允许一个 Tea program，结束后可再次 `Run`；退出时必须调用 `Close`，让网络恢复循环、outbox 和 state store 有确定终点。
+`worker.Open` 可以单独连接远程 gateway。`Run` 启动官方 TUI；`Model` 返回 `tea.Model`，可以作为更大 Bubble Tea 应用的一部分。一个 `Worker` 只拥有一次 Tea program 生命周期；`Run` 返回后如需重启 UI，应先 `Close` 再 `Open` 新实例，不能复用可能仍有旧 command 回调收尾的 model。`Close` 会取消并等待由 `Worker.Run` 启动的活动程序，再关闭网络恢复、outbox 与 state store；如果宿主取出 `Model()` 后交给自己的 Tea program，那个外部 program 的取消与等待仍由宿主负责。
 
 ## 嵌入自有 Gateway
 
@@ -67,9 +67,9 @@ HUMAN_EMBED_GATEWAY_DB=/absolute/private/path/gateway.db \
 
 公共库不会替宿主隐式接管进程资源：
 
-- `gateway.Server` 不拥有 listener。先停止接收 HTTP，再调用 `Close`；同一个 SQLite 文件不能被多个 gateway 实例当作集群共享存储。
-- `local.Local` 拥有自己的 loopback listener、gateway 与 worker，`Close` 是幂等的；一个实例一次只能运行一个 TUI。
-- `worker.Worker` 拥有网络客户端、outbox 与可选 state store；一个实例一次只能运行一个 TUI。
+- `gateway.Server` 不拥有 listener。先停止接收 HTTP，再调用 `Close`；`Close` 会主动终止并等待 `net/http` 无法随 `Shutdown` 收口的已劫持 worker WebSocket，全部 handler 退出后才关闭 SQLite。同一个 SQLite 文件不能被多个 gateway 实例当作集群共享存储。
+- `local.Local` 拥有自己的 loopback listener、gateway 与 worker，`Close` 是幂等的，并按显式 issued-credential policy 处理库签发凭据；一个实例只运行一次 TUI，重启需重新 `Open`。
+- `worker.Worker` 拥有网络客户端、outbox 与可选 state store；`Close` 取消并等待其活动 `Run`，一个实例只运行一次 TUI，重启需重新 `Open`。
 - TLS 终止、代理信任、HTTP/server 超时、secret persistence、备份与数据库文件权限最终都是宿主责任。默认路径是安全起点，不会替代部署审计。
 
 当前公开持久层只支持 SQLite 单实例。内部 store interface 不是稳定 driver API；不要通过复制内部 package 假装获得 PostgreSQL/MySQL/Redis 支持。需要多实例或自有数据库时，应在公开 driver contract 明确后再扩展，或让多个业务入口共享一个独立 `human gateway`。

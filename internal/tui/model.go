@@ -3,6 +3,8 @@ package tui
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +75,10 @@ type Model struct {
 	handledRejections   map[string]struct{}
 	handledRejectOrder  []string
 	draftSession        string
+	draftAuthority      string
+	draftRejectedEvents []string
+	draftRejectedKinds  map[string]pendingSendKind
+	draftReplyRejected  string
 	detailMode          bool
 	composing           bool
 	toolCallIDs         []string
@@ -89,6 +95,7 @@ type Model struct {
 	stateLoaded         bool
 	stateIdentity       workerclient.Identity
 	stateDrafts         map[stateRecordKey]savedStateDraft
+	draftOrigins        map[stateRecordKey]string
 	stateSynced         map[stateRecordKey]string
 	stateManaged        map[stateRecordKey]struct{}
 	stateWriting        bool
@@ -98,6 +105,9 @@ type Model struct {
 	stateWriteWarning   string
 	outboxWarning       string
 	deferredSend        deferredSendIntent
+	rejectionFinalizers map[string]rejectionFinalizer
+	recoveryDrainPaused bool
+	quitting            bool
 }
 
 type connectionState int
@@ -161,19 +171,22 @@ const (
 	deliveryConfirming
 	deliveryConfirmed
 	deliverySending
+	deliveryDiscarding
 )
 
 type deliveryReview struct {
-	stage      deliveryStage
-	sessionKey string
-	namespace  string
-	changes    []workmirror.Change
-	calls      []completion.ToolCall
-	warnings   []string
-	eventID    string
-	generation uint64
-	assignment completion.Assignment
-	context    *completion.Assignment
+	stage                deliveryStage
+	sessionKey           string
+	namespace            string
+	changes              []workmirror.Change
+	calls                []completion.ToolCall
+	warnings             []string
+	eventID              string
+	generation           uint64
+	prepareInFlight      bool
+	intentWriterInFlight bool
+	assignment           completion.Assignment
+	context              *completion.Assignment
 }
 
 type pendingSendKind int
@@ -186,26 +199,52 @@ const (
 	pendingAdvancedTools
 	pendingAccept
 	pendingReject
+	// Keep new durable kinds appended: persisted worker-state rows encode these
+	// numeric values and must never be reinterpreted by a later binary.
+	pendingDelivery
 )
 
 type pendingSend struct {
-	kind           pendingSendKind
-	eventID        string
-	assignment     completion.Assignment
-	context        *completion.Assignment
-	reply          string
-	command        string
-	tasks          []agentTask
-	toolInput      string
-	toolCallIDs    []string
-	toolCalls      []completion.ToolCall
-	remainingDraft persistedDraft
-	selected       int
-	automatic      bool
-	event          completion.Event
-	durable        bool
-	recovered      bool
-	retryAttempt   int
+	kind                   pendingSendKind
+	eventID                string
+	assignment             completion.Assignment
+	context                *completion.Assignment
+	reply                  string
+	command                string
+	tasks                  []agentTask
+	toolInput              string
+	toolCallIDs            []string
+	toolCalls              []completion.ToolCall
+	remainingDraft         persistedDraft
+	draftOrigins           []draftOrigin
+	selected               int
+	automatic              bool
+	event                  completion.Event
+	durable                bool
+	recovered              bool
+	retryAttempt           int
+	deliveryNamespace      string
+	deliveryGeneration     uint64
+	deliveryChanges        []workmirror.Change
+	deliveryIntentRecorded bool
+	// outboxInFlight is process-local. Once a send command captures this pending
+	// payload, assignment replay may refresh UI routing but must not rewrite the
+	// recovery row to a snapshot different from the durable outbox event.
+	outboxInFlight bool
+}
+
+type pendingDeliveryIntentsDiscarded struct {
+	eventID   string
+	namespace string
+	reason    string
+	attempt   int
+	retry     tea.Cmd
+	err       error
+}
+
+type draftOrigin struct {
+	key    stateRecordKey
+	digest string
 }
 
 // deferredSendIntent is an in-memory user gesture waiting for the latest
@@ -242,9 +281,15 @@ type continuationState struct {
 // and is restored only when that exact scope is activated again.
 type rejectedDraftState struct {
 	assignment completion.Assignment
-	kind       pendingSendKind
-	hasReply   bool
-	reply      string
+	authority  string
+	// rejectedEventIDs is the durable, ordered provenance of source events
+	// materialized into this draft. It makes replay idempotence and ordering
+	// decidable across process restarts; the opaque authority hash cannot.
+	rejectedEventIDs   []string
+	rejectedEventKinds map[string]pendingSendKind
+	kind               pendingSendKind
+	hasReply           bool
+	reply              string
 	// replyRejected contains only the sent segments rejected by the gateway;
 	// replyTail is text typed after those sends. Keeping the two pieces apart
 	// lets a later rejection insert an older sent segment before the still-local
@@ -255,6 +300,10 @@ type rejectedDraftState struct {
 	command       string
 	hasTasks      bool
 	tasks         []agentTask
+	taskDirty     bool
+	taskEditing   bool
+	taskEditIndex int
+	taskInput     string
 	hasTools      bool
 	toolInput     string
 	toolCallIDs   []string
@@ -267,6 +316,7 @@ type eventSent struct {
 	eventID        string
 	intentKey      stateRecordKey
 	restorePayload json.RawMessage
+	restorePending bool
 	intentErr      error
 	err            error
 }
@@ -274,14 +324,35 @@ type pendingSendRetry struct {
 	eventID string
 	attempt int
 }
+type pendingRestoreRetry struct {
+	eventID string
+	attempt int
+	sendErr error
+}
+type resumeDurablePendingRequest struct{ eventID string }
 type rejectedEventConfirmed struct {
 	eventID string
 	attempt int
 	err     error
 }
-type deliveryEventSent struct {
-	sessionKey string
-	err        error
+
+// rejectionFinalizer keeps the rejected inbox as the crash authority until
+// both local correctness stores are clean. A pending-send journal may be
+// deleted in parallel with mirror cleanup, but ConfirmRejectedEvent is never
+// issued until both operations have committed and any already-running mirror
+// confirmation has settled.
+type rejectionFinalizer struct {
+	scope                     string
+	pendingKey                stateRecordKey
+	waitsForPendingDelete     bool
+	pendingDeleted            bool
+	waitsForStateSync         bool
+	mirrorConfirmationPending bool
+	cleanup                   tea.Cmd
+	cleanupDone               bool
+	cleanupInFlight           bool
+	confirming                bool
+	resumeRecoveries          bool
 }
 
 type mirrorIntentsDiscarded struct {
@@ -295,19 +366,21 @@ type mirrorIntentsDiscarded struct {
 func New(client Client, options ...Option) Model {
 	model := Model{
 		client: client, status: "ready",
-		mirrors:           make(map[string]MirrorWorkspace),
-		mirrorWatches:     make(map[string]mirrorWatchState),
-		mirrorDirty:       make(map[string]bool),
-		mirrorGeneration:  make(map[string]uint64),
-		mirrorReviewing:   make(map[string]uint64),
-		continueIDs:       make(map[string]struct{}),
-		recoveredSessions: make(map[string]struct{}),
-		rejectedDrafts:    make(map[string]rejectedDraftState),
-		handledRejections: make(map[string]struct{}),
-		stateDrafts:       make(map[stateRecordKey]savedStateDraft),
-		stateSynced:       make(map[stateRecordKey]string),
-		stateManaged:      make(map[stateRecordKey]struct{}),
-		width:             80, height: 24, focus: focusTasks, taskEditIndex: -1,
+		mirrors:             make(map[string]MirrorWorkspace),
+		mirrorWatches:       make(map[string]mirrorWatchState),
+		mirrorDirty:         make(map[string]bool),
+		mirrorGeneration:    make(map[string]uint64),
+		mirrorReviewing:     make(map[string]uint64),
+		continueIDs:         make(map[string]struct{}),
+		recoveredSessions:   make(map[string]struct{}),
+		rejectedDrafts:      make(map[string]rejectedDraftState),
+		handledRejections:   make(map[string]struct{}),
+		rejectionFinalizers: make(map[string]rejectionFinalizer),
+		stateDrafts:         make(map[stateRecordKey]savedStateDraft),
+		draftOrigins:        make(map[stateRecordKey]string),
+		stateSynced:         make(map[stateRecordKey]string),
+		stateManaged:        make(map[stateRecordKey]struct{}),
+		width:               80, height: 24, focus: focusTasks, taskEditIndex: -1,
 		connection: connectionConnected, ui: newWorkspaceUI(),
 	}
 	for _, option := range options {
@@ -328,7 +401,13 @@ func New(client Client, options ...Option) Model {
 func (model Model) Init() tea.Cmd {
 	commands := []tea.Cmd{waitForNetwork(model.client), tea.RequestBackgroundColor}
 	if model.pending.kind != pendingNone && model.pending.durable && model.pending.event.ID != "" {
-		commands = append(commands, sendPersistedEvent(model.client, model.stateStore, model.pending))
+		// Init has a value receiver, so it cannot publish correctness-bearing
+		// in-flight flags. Re-enter through Update before any mirror writer or
+		// outbox command captures the recovered payload.
+		eventID := model.pending.event.ID
+		commands = append(commands, func() tea.Msg {
+			return resumeDurablePendingRequest{eventID: eventID}
+		})
 	}
 	if model.animationActive() {
 		commands = append(commands, model.ui.spinner.Tick)
@@ -360,8 +439,14 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 				command = tea.Batch(command, intent)
 			}
 		}
+		if rejection := next.advanceRejectionFinalizations(); rejection != nil {
+			command = tea.Batch(command, rejection)
+		}
 		if !wasAnimating && next.animationActive() {
 			command = tea.Batch(command, next.ui.spinner.Tick)
+		}
+		if next.quitting && next.workerStateSynchronized() && !next.correctnessWorkInFlight() {
+			command = tea.Batch(command, tea.Quit)
 		}
 		updated = next
 	}()
@@ -382,18 +467,44 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 	case tea.KeyboardEnhancementsMsg:
 		return model, nil
 	case stateWriteResult:
-		return model, model.applyStateWriteResult(message)
+		stateCommand := model.applyStateWriteResult(message)
+		return model, stateCommand
 	case stateRetryReady:
 		model.stateRetryPending = false
 		return model, nil
 	case pendingSendRetry:
 		if model.pending.eventID != message.eventID || model.pending.kind == pendingNone ||
-			!model.pending.durable {
+			(model.stateStore != nil && !model.pending.durable &&
+				model.pending.kind != pendingAccept && model.pending.kind != pendingReject) {
 			return model, nil
 		}
 		model.pending.retryAttempt = message.attempt
-		model.status = "retrying the durable local response intent…"
+		if model.pending.kind == pendingDelivery {
+			model.status = "retrying the exact durable file delivery…"
+		} else {
+			model.status = "retrying the durable local response intent…"
+		}
+		if model.stateStore == nil || model.pending.kind == pendingAccept || model.pending.kind == pendingReject {
+			return model, sendEvent(model.client, model.pending.assignment, model.pending.event)
+		}
 		return model, sendPersistedEvent(model.client, model.stateStore, model.pending)
+	case pendingRestoreRetry:
+		if model.pending.eventID != message.eventID || model.pending.kind == pendingNone ||
+			model.stateStore == nil || !model.pending.durable {
+			return model, nil
+		}
+		model.pending.retryAttempt = message.attempt
+		model.status = "retrying the durable draft-restore decision…"
+		return model, persistPendingRestore(
+			model.stateStore, model.pending, message.sendErr,
+		)
+	case resumeDurablePendingRequest:
+		if model.pending.kind == pendingNone || !model.pending.durable ||
+			model.pending.event.ID != message.eventID {
+			return model, nil
+		}
+		resume := model.resumeDurablePending(model.pending)
+		return model, resume
 	case networkClosed:
 		model.invalidateChat()
 		model.connection = connectionClosed
@@ -415,7 +526,7 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 			}
 			commands := []tea.Cmd{waitForNetwork(model.client)}
 			if !wasBound && model.pending.kind != pendingNone && model.pending.durable && model.pending.event.ID != "" {
-				commands = append(commands, sendPersistedEvent(model.client, model.stateStore, model.pending))
+				commands = append(commands, model.resumeDurablePending(model.pending))
 			}
 			return model, tea.Batch(commands...)
 		}
@@ -467,6 +578,15 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 		if message.EventRejected != nil {
 			rejected := message.EventRejected
 			var intentCleanup tea.Cmd
+			if _, finalizing := model.rejectionFinalizers[rejected.EventID]; finalizing {
+				// A live barrier is stronger than the bounded duplicate receipt cache.
+				// Never let cache eviction re-enter first-delivery handling and replace
+				// its writer/delete/drain obligations.
+				return model, tea.Batch(
+					waitForNetwork(model.client),
+					model.advanceRejectionFinalization(rejected.EventID),
+				)
+			}
 			if model.rememberHandledRejection(rejected.EventID) {
 				if message.RejectedEvent != nil {
 					var assignment *completion.Assignment
@@ -485,6 +605,11 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 						intentCleanup = model.discardIntentCommand(
 							*assignment, message.RejectedEvent.ToolCalls, "replayed durable event rejection",
 						)
+						if rejectedMirrorEvent(*assignment, *message.RejectedEvent) && intentCleanup == nil {
+							intentCleanup = unavailableIntentCleanup(
+								"durable workspace delivery intent cleanup is unavailable",
+							)
+						}
 					}
 				}
 				// The durable rejected inbox may replay while an earlier finalization
@@ -498,32 +623,95 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 			sessionKey := (completion.Assignment{
 				CallerID: rejected.CallerID, IdempotencyKey: rejected.IdempotencyKey,
 			}).SessionKey()
+			// A rejected event does not cover its source request. Let a gateway replay
+			// re-enter Inbox (with the saved draft) instead of suppressing the only
+			// correction surface as if the durable response had succeeded.
+			delete(model.recoveredSessions, sessionKey)
+			rejectedPending := pendingSend{}
+			pendingIndex := -1 // -1 is current; non-negative values index pendingRecoveries.
 			pendingMatches := model.pending.eventID == rejected.EventID &&
 				model.pending.assignment.SessionKey() == sessionKey
+			if pendingMatches {
+				rejectedPending = model.pending
+			} else {
+				for index := range model.pendingRecoveries {
+					candidate := model.pendingRecoveries[index]
+					if candidate.eventID == rejected.EventID &&
+						candidate.assignment.SessionKey() == sessionKey {
+						rejectedPending = candidate
+						pendingIndex = index
+						pendingMatches = true
+						break
+					}
+				}
+			}
+			stalePendingKey, stalePendingJournal := model.rejectedPendingJournal(
+				rejected.EventID, sessionKey,
+			)
+			// A recovered delivery may still be executing RecordDeliveryIntents in
+			// another Bubble Tea command. Capture that writer before clearing the UI
+			// delivery state below; rejection cleanup must run after it settles or the
+			// old writer can recreate an intent after cleanup has committed.
+			mirrorWriterPending := pendingMatches && pendingIndex < 0 &&
+				rejectedPending.kind == pendingDelivery &&
+				model.delivery.intentWriterInFlight &&
+				model.delivery.eventID == rejected.EventID
 			activeMatches := model.active != nil && model.active.SessionKey() == sessionKey
+			contextMatches := model.lastContext != nil && model.lastContext.SessionKey() == sessionKey
 			continuationMatches := model.hasContinuationOrigin(sessionKey)
+			otherPendingSameSession := !pendingMatches && model.pending.kind != pendingNone &&
+				model.pending.assignment.SessionKey() == sessionKey
+			var activeEditor persistedDraft
+			activeEditorPresent := false
+			if activeMatches {
+				activeEditor, activeEditorPresent = model.currentPersistedDraft()
+				if pendingMatches || otherPendingSameSession {
+					// rejectedDraftFromPending already owns the pane being sent and
+					// its live tail. A different event from the same session may also
+					// be rejected first; its pending snapshot retains ownership of
+					// that pane until its own ACK/NACK resolves. Capture only the
+					// independent panes here.
+					kind := rejectedPending.kind
+					if otherPendingSameSession {
+						kind = model.pending.kind
+					}
+					activeEditor = model.remainingDraftAfterSend(kind)
+					activeEditorPresent = persistedDraftHasContent(activeEditor)
+				}
+			}
 			taskSyncMatches := model.taskSyncWait && (activeMatches || continuationMatches ||
-				(pendingMatches && model.pending.kind == pendingTasks))
+				(pendingMatches && rejectedPending.kind == pendingTasks))
 			var restoredDraft *rejectedDraftState
+			rejectionScope := ""
 			draftEvicted := false
+			draftParked := false
 			mirrorRejected := false
 			originalMatches := message.RejectedEvent != nil &&
 				message.RejectedEvent.ID == rejected.EventID
 			if pendingMatches {
-				pending := model.pending
-				if originalMatches {
+				pending := rejectedPending
+				rejectionScope = rejectedDraftScopeKey(pending.assignment)
+				if pending.kind == pendingDelivery {
+					mirrorRejected = true
+				}
+				if len(pending.event.ToolCalls) > 0 {
 					intentCleanup = model.discardIntentCommand(
-						pending.assignment, message.RejectedEvent.ToolCalls, "durable event rejection",
+						pending.assignment, pending.event.ToolCalls, "durable event rejection",
+					)
+				}
+				if pending.kind == pendingDelivery && intentCleanup == nil {
+					intentCleanup = unavailableIntentCleanup(
+						"durable workspace delivery intent cleanup is unavailable",
 					)
 				}
 				prior, hasPrior := model.rejectedDraftForAssignment(pending.assignment)
 				priorSameSession := hasPrior && prior.assignment.SessionKey() == sessionKey
-				if priorSameSession && originalMatches {
+				if pendingIndex < 0 && priorSameSession && originalMatches {
 					// Another event from this expired stream was rejected first.
 					// Keep its surgical rollback and retract only this event;
 					// restoring pending.context would resurrect the earlier item.
 					model.rollbackRejectedEvent(*message.RejectedEvent)
-				} else if pending.context != nil {
+				} else if pendingIndex < 0 && pending.context != nil {
 					model.lastContext = cloneAssignment(pending.context)
 					model.invalidateChat()
 				}
@@ -533,6 +721,7 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 			} else if originalMatches && model.lastContext != nil &&
 				model.lastContext.SessionKey() == sessionKey {
 				assignment := *model.lastContext
+				rejectionScope = rejectedDraftScopeKey(assignment)
 				intentCleanup = model.discardIntentCommand(
 					assignment, message.RejectedEvent.ToolCalls, "durable event rejection",
 				)
@@ -548,6 +737,7 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 				// reduced assignment snapshot (routing identity, adapter and declared
 				// tools, but no conversation payload) alongside the rejected event.
 				assignment := *message.RejectedAssignment
+				rejectionScope = rejectedDraftScopeKey(assignment)
 				intentCleanup = model.discardIntentCommand(
 					assignment, message.RejectedEvent.ToolCalls, "durable event rejection",
 				)
@@ -556,12 +746,65 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 					restoredDraft = &draft
 				}
 			}
+			if activeEditorPresent {
+				editor, ok := rejectedDraftFromPersisted(*model.active, activeEditor)
+				if ok {
+					editor.authority = mergeDraftAuthorities(
+						editor.authority, eventDraftAuthority(rejected.EventID),
+					)
+					if restoredDraft == nil {
+						restoredDraft = &editor
+					} else {
+						merged := mergeRejectedDraft(restoredDraft, editor)
+						restoredDraft = &merged
+					}
+				}
+				delete(model.stateDrafts, stateRecordKey{
+					scope: stateScope(*model.active), kind: workerStateDraftKind,
+				})
+			} else if pendingMatches && persistedDraftHasContent(rejectedPending.remainingDraft) {
+				// Terminal sends clear active before their outbox command completes.
+				// A NACK can therefore arrive before eventSent while every independent
+				// pane exists only in the immutable pending snapshot. Materialize that
+				// remainder into the rejected draft before deleting the journal.
+				editor, ok := rejectedDraftFromPersisted(
+					rejectedPending.assignment, rejectedPending.remainingDraft,
+				)
+				if ok {
+					if restoredDraft == nil {
+						restoredDraft = &editor
+					} else {
+						merged := mergeRejectedDraft(restoredDraft, editor)
+						restoredDraft = &merged
+					}
+				}
+			}
+			if mirrorRejected && intentCleanup == nil {
+				intentCleanup = unavailableIntentCleanup(
+					"durable workspace delivery intent cleanup is unavailable",
+				)
+			}
+			if rejectionScope == "" {
+				rejectionScope = rejectedDraftScopeFromStateKey(stalePendingKey)
+			}
+			if rejectionScope == "" {
+				rejectionScope = "session\x00" + sessionKey
+			}
 			model.connection = connectionConnected
 			if pendingMatches {
-				model.pending = pendingSend{}
+				if pendingIndex < 0 {
+					model.pending = pendingSend{}
+					model.draftOrigins = make(map[stateRecordKey]string)
+				} else {
+					model.pendingRecoveries = append(
+						model.pendingRecoveries[:pendingIndex:pendingIndex],
+						model.pendingRecoveries[pendingIndex+1:]...,
+					)
+				}
 			}
 			if activeMatches {
 				model.active = nil
+				model.draftOrigins = make(map[stateRecordKey]string)
 				model.focus = focusTasks
 				model.commandConfirm = ""
 				model.composing = false
@@ -584,12 +827,25 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 				model.taskDirty = true
 			}
 			if restoredDraft != nil {
-				draftEvicted = model.installRejectedDraft(*restoredDraft)
+				if (pendingMatches && pendingIndex >= 0) || model.active != nil {
+					// A rejection for an older/out-of-order session must not apply its
+					// recovered editor over a newer active request. Keep it in the
+					// scope tray; activation after the current request reaches a safe
+					// boundary will merge/restore it deliberately.
+					draftEvicted = model.storeRejectedDraft(*restoredDraft)
+					draftParked = true
+				} else {
+					draftEvicted = model.installRejectedDraft(*restoredDraft)
+				}
 			}
 			model.removeQueuedSession(sessionKey)
 			reason := strings.TrimSpace(rejected.Message)
 			if restoredDraft != nil {
-				model.status = "response not delivered; draft restored: " + terminalSafe(reason)
+				if draftParked {
+					model.status = "response not delivered; draft saved for its task after the active request: " + terminalSafe(reason)
+				} else {
+					model.status = "response not delivered; draft restored: " + terminalSafe(reason)
+				}
 				if draftEvicted {
 					model.status += " · oldest saved draft evicted at the 32-scope limit"
 				}
@@ -598,22 +854,55 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 			} else {
 				model.status = "response not delivered: " + terminalSafe(reason)
 			}
-			return model, tea.Batch(
-				waitForNetwork(model.client),
-				finalizeRejectedEvent(model.client, rejected.EventID, intentCleanup),
-			)
+			var finalization tea.Cmd
+			if pendingMatches {
+				pendingKey := pendingSendStateKey(rejectedPending)
+				_, stateSynced := model.stateSynced[pendingKey]
+				_, stateManaged := model.stateManaged[pendingKey]
+				// durable is deliberately false while an already-existing phase=false
+				// row is being replaced with phase=true. The row still exists and must
+				// be deleted before the rejected inbox can be confirmed.
+				waitsForDelete := model.stateStore != nil && model.stateBound &&
+					(stateSynced || stateManaged)
+				resumeRecoveries := pendingIndex < 0 &&
+					(rejectedPending.recovered || model.recoveryDrainPaused)
+				finalization = model.beginRejectionFinalization(
+					rejected.EventID, rejectionScope, pendingKey, waitsForDelete, mirrorWriterPending,
+					intentCleanup, resumeRecoveries,
+				)
+			} else if stalePendingJournal ||
+				(model.recoveryDrainPaused && len(model.pendingRecoveries) > 0 &&
+					(activeMatches || contextMatches || continuationMatches)) {
+				finalization = model.beginRejectionFinalization(
+					rejected.EventID, rejectionScope, stalePendingKey, stalePendingJournal, false,
+					intentCleanup,
+					model.recoveryDrainPaused && len(model.pendingRecoveries) > 0 &&
+						(activeMatches || contextMatches || continuationMatches),
+				)
+			} else {
+				finalization = model.beginRejectionFinalization(
+					rejected.EventID, rejectionScope, stateRecordKey{}, false, false, intentCleanup, false,
+				)
+			}
+			return model, tea.Batch(waitForNetwork(model.client), finalization)
 		}
 		if message.Assignment != nil {
 			model.connection = connectionConnected
 			incoming := *message.Assignment
 			commands := []tea.Cmd{waitForNetwork(model.client)}
-			if model.mirrorManager != nil && mirrorEnabled(incoming) {
-				commands = append(commands, prepareMirror(model.mirrorManager, incoming))
-			}
 			if _, recovered := model.recoveredSessions[incoming.SessionKey()]; recovered {
 				model.refreshRecoveredAssignment(incoming)
+				if model.pending.kind == pendingDelivery && model.pending.recovered &&
+					model.pending.assignment.SessionKey() == incoming.SessionKey() {
+					if resume := model.resumePendingDelivery(model.pending); resume != nil {
+						commands = append(commands, resume)
+					}
+				}
 				model.status = "replayed request is already covered by a recovered durable response event"
 				return model, tea.Batch(commands...)
+			}
+			if model.mirrorManager != nil && mirrorEnabled(incoming) {
+				commands = append(commands, prepareMirror(model.mirrorManager, incoming))
 			}
 			if model.pending.kind == pendingAccept &&
 				model.pending.assignment.SessionKey() == incoming.SessionKey() {
@@ -663,6 +952,13 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 					// The follow-up assignment proves the prior terminal event made
 					// it through the gateway even if its local command result is
 					// delivered to Bubble Tea out of order.
+					if model.pending.recovered && len(model.pendingRecoveries) > 0 {
+						// The follow-up proves this recovered event reached the caller,
+						// but the new request now owns the operator. Hold later recovered
+						// events until that request reaches a terminal/handoff/tool event.
+						model.recoveryDrainPaused = true
+					}
+					model.retainPendingRemainder(model.pending)
 					model.pending = pendingSend{}
 				}
 				if model.delivery.stage == deliverySending {
@@ -672,6 +968,14 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 				model = next.(Model)
 				if acceptCommand != nil {
 					commands = append(commands, acceptCommand)
+				} else if model.recoveryDrainPaused && model.pending.kind == pendingNone && model.active == nil {
+					// ID allocation failed before the automatic accept entered an
+					// outbox. The follow-up remains in Inbox, so no active owner exists
+					// to release this pause later.
+					model.recoveryDrainPaused = false
+					if recovered := model.resumePendingRecovery(); recovered != nil {
+						commands = append(commands, recovered)
+					}
 				}
 				return model, tea.Batch(commands...)
 			}
@@ -709,8 +1013,13 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 		if message.attempt > 0 {
 			model.status = "rejected draft retained · durable inbox confirmation recovered"
 		}
-		return model, nil
+		finalization := model.finishRejectionFinalization(message.eventID)
+		return model, finalization
 	case tea.PasteMsg:
+		if model.quitting {
+			model.status = "finishing durable recovery work before exit · Ctrl+C again forces quit"
+			return model, nil
+		}
 		if model.deferredSend.kind != pendingNone {
 			model.status = "send is waiting for recovery state; input is locked · Esc cancels and keeps the draft"
 			return model, nil
@@ -751,6 +1060,7 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 			}
 			return model, nil
 		}
+		_, finalizingRejection := model.rejectionFinalizers[message.eventID]
 		if message.err != nil {
 			// ConfirmRejectedEvent must not run until this durable cleanup succeeds.
 			// The workerclient inbox therefore remains the crash-recovery source
@@ -761,20 +1071,72 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 				message.eventID, message.retry, message.attempt+1,
 			)
 		}
+		if finalizingRejection {
+			if message.attempt > 0 {
+				model.status = "workspace intent cleanup recovered · waiting for local rejection journal…"
+			}
+			confirmation := model.completeRejectedIntentCleanup(message.eventID)
+			return model, confirmation
+		}
 		if message.attempt > 0 {
 			model.status = "workspace intent cleanup recovered · confirming durable rejected inbox…"
 		}
 		return model, confirmRejectedEvent(model.client, message.eventID)
+	case pendingDeliveryIntentsDiscarded:
+		if model.pending.kind != pendingDelivery || model.pending.event.ID != message.eventID ||
+			model.pending.deliveryNamespace != message.namespace ||
+			model.delivery.stage != deliveryDiscarding {
+			return model, nil
+		}
+		if message.err != nil {
+			model.status = "delivery not sent; preserving its recovery journal while workspace intent cleanup retries: " +
+				terminalSafe(message.err.Error())
+			return model, discardPendingDeliveryIntentsAttempt(
+				message.eventID, message.namespace, message.reason,
+				message.retry, message.attempt+1,
+			)
+		}
+		followup := model.completePendingDeliveryFailure(message.namespace, errors.New(message.reason))
+		return model, followup
 	case mirrorPrepared:
 		model.invalidateChat()
 		if message.err != nil {
+			if model.pending.kind == pendingDelivery && model.pending.durable &&
+				model.pending.assignment.SessionKey() == message.sessionKey &&
+				model.pending.deliveryNamespace == message.namespace &&
+				model.delivery.stage == deliveryConfirming &&
+				model.delivery.eventID == model.pending.event.ID {
+				model.delivery.prepareInFlight = false
+				followup := model.failPendingDeliveryConfirmation(message.namespace, message.err)
+				return model, followup
+			}
 			if model.active != nil && model.active.SessionKey() == message.sessionKey {
 				model.status = "mirror error: " + message.err.Error()
 			}
 			return model, nil
 		}
-		model.mirrors[message.namespace] = message.workspace
-		model.requireMirrorReview(message.namespace)
+		if existing := model.mirrors[message.namespace]; existing != nil &&
+			model.pendingDeliveryPinsMirror(message.namespace) {
+			// The exact delivery was reviewed against the cached workspace. A
+			// concurrent prepare for another session in the same namespace must not
+			// redirect its writer/cleanup to a different custom manager instance.
+			// This pin spans the phase=true state write, where pending.durable is
+			// deliberately false even though the old mirror already owns the intent.
+			message.workspace = existing
+		} else {
+			model.mirrors[message.namespace] = message.workspace
+		}
+		resumingDelivery := model.pending.kind == pendingDelivery && model.pending.durable &&
+			model.pending.assignment.SessionKey() == message.sessionKey &&
+			model.pending.deliveryNamespace == message.namespace &&
+			model.delivery.stage == deliveryConfirming &&
+			model.delivery.eventID == model.pending.event.ID
+		if resumingDelivery {
+			model.delivery.prepareInFlight = false
+		}
+		if !resumingDelivery {
+			model.requireMirrorReview(message.namespace)
+		}
 		if model.mirrorWatches == nil {
 			model.mirrorWatches = make(map[string]mirrorWatchState)
 		}
@@ -788,6 +1150,11 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 		}
 		summary := reconcileSummary(message.report)
 		model.pruneMirrorCache()
+		if resumingDelivery {
+			model.status = "durable file delivery restored · rechecking its exact mirror intent…"
+			commands = append(commands, model.resumePendingDelivery(model.pending))
+			return model, tea.Batch(commands...)
+		}
 		if model.active != nil && model.active.SessionKey() == message.sessionKey {
 			model.status = summary + " · checking local workspace changes…"
 			if review := model.drainDirtyMirrorReview(); review != nil {
@@ -870,7 +1237,7 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 			mirrorNamespace(model.active.CallerID, model.active.WorkspaceKey) != message.namespace {
 			return model, nextWatch
 		}
-		if model.responseInFlight() {
+		if model.responseInFlightFor(model.active) {
 			model.status = "workspace changed · queued until the current response event is committed"
 			return model, nextWatch
 		}
@@ -946,48 +1313,45 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 		return model, nil
 	case mirrorConfirmationReady:
 		model.invalidateChat()
+		if finalizer, finalizing := model.rejectionFinalizers[message.eventID]; finalizing {
+			if finalizer.mirrorConfirmationPending {
+				cleanup := model.settleRejectedMirrorConfirmation(message.eventID)
+				return model, cleanup
+			}
+			return model, nil
+		}
 		if model.active == nil || model.active.SessionKey() != message.sessionKey ||
+			model.pending.kind != pendingDelivery || model.pending.eventID != message.eventID ||
 			model.delivery.stage != deliveryConfirming || model.delivery.sessionKey != message.sessionKey ||
 			model.delivery.namespace != message.namespace ||
 			model.delivery.generation != message.generation || model.delivery.eventID != message.eventID {
 			return model, nil
 		}
+		model.delivery.intentWriterInFlight = false
 		if message.err != nil {
-			model.delivery = deliveryReview{}
-			model.markMirrorChanged(message.namespace)
-			failure := "delivery not sent: " + message.err.Error()
-			followup := model.drainDirtyMirrorReview()
-			model.status = failure
-			if followup != nil {
-				model.status += " · refreshing the changed workspace"
-			}
+			followup := model.failPendingDeliveryConfirmation(message.namespace, message.err)
 			return model, followup
 		}
 		assignment := *model.active
 		model.delivery.calls = append([]completion.ToolCall(nil), message.calls...)
 		model.delivery.stage = deliveryConfirmed
+		model.pending.deliveryIntentRecorded = true
+		// The first phase=true write must already cover every editor pane visible
+		// when mirror intent recording completed. startRecordedMirrorDelivery repeats
+		// this freeze if the operator edits again while that write is in flight.
+		model.pending.remainingDraft = sanitizePersistedDraft(
+			model.remainingDraftAfterSend(pendingDelivery),
+		)
+		model.pending.draftOrigins = sortedDraftOriginKeys(model.draftOrigins)
+		if model.stateStore != nil {
+			// Record the intent phase in the same save-ahead row before the worker
+			// outbox can observe the event. A restart can then distinguish a merely
+			// staged delivery from one whose provenance must be preserved.
+			model.pending.durable = false
+			model.status = "file intent recorded · saving its durable handoff phase…"
+			return model, nil
+		}
 		return model.sendConfirmedMirrorDelivery(assignment)
-	case deliveryEventSent:
-		model.invalidateChat()
-		if model.delivery.stage != deliverySending || model.delivery.sessionKey != message.sessionKey {
-			return model, nil
-		}
-		if message.err != nil {
-			model.clearContinuation()
-			assignment := model.delivery.assignment
-			model.active = &assignment
-			model.lastContext = cloneAssignment(model.delivery.context)
-			model.delivery.stage = deliveryConfirmed
-			model.focus = focusTasks
-			model.status = "confirmed delivery not queued; Enter retries the exact event: " + message.err.Error()
-			return model, nil
-		}
-		count := len(model.delivery.calls)
-		model.delivery = deliveryReview{}
-		model.ui.chatFollow = true
-		model.status = fmt.Sprintf("confirmed · %d file change(s) queued · waiting for client Agent result", count)
-		model.pruneMirrorCache()
-		return model, nil
 	case eventSent:
 		model.invalidateChat()
 		if message.intentKey.kind == workerStatePendingSendKind && len(message.restorePayload) > 0 {
@@ -998,8 +1362,38 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 			model.pending.kind != pendingNone {
 			attempt := model.pending.retryAttempt + 1
 			model.pending.retryAttempt = attempt
-			model.status = "durable response intent retained; local handoff will retry: " +
-				terminalSafe(message.intentErr.Error())
+			if message.restorePending {
+				model.status = "durable draft-restore decision retained; state commit will retry: " +
+					terminalSafe(message.intentErr.Error())
+			} else if model.pending.kind == pendingDelivery {
+				model.status = "durable file delivery retained; local outbox handoff will retry: " +
+					terminalSafe(message.intentErr.Error())
+			} else {
+				model.status = "durable response intent retained; local handoff will retry: " +
+					terminalSafe(message.intentErr.Error())
+			}
+			delay := rejectionRetryDelay(attempt)
+			if message.restorePending {
+				sendErr := message.err
+				return model, tea.Tick(delay, func(time.Time) tea.Msg {
+					return pendingRestoreRetry{
+						eventID: message.eventID, attempt: attempt, sendErr: sendErr,
+					}
+				})
+			}
+			return model, tea.Tick(delay, func(time.Time) tea.Msg {
+				return pendingSendRetry{eventID: message.eventID, attempt: attempt}
+			})
+		}
+		if message.err != nil && model.pending.eventID == message.eventID &&
+			model.pending.kind != pendingNone &&
+			!errors.Is(message.err, workerclient.ErrEventNotStored) &&
+			!errors.Is(message.err, workerclient.ErrEventRejectionPending) &&
+			!errors.Is(message.err, workerclient.ErrEventPreviouslyRejected) {
+			attempt := model.pending.retryAttempt + 1
+			model.pending.retryAttempt = attempt
+			model.status = "local outbox outcome is uncertain; retrying the exact event ID: " +
+				terminalSafe(message.err.Error())
 			delay := rejectionRetryDelay(attempt)
 			return model, tea.Tick(delay, func(time.Time) tea.Msg {
 				return pendingSendRetry{eventID: message.eventID, attempt: attempt}
@@ -1016,13 +1410,39 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 				}
 				return model, nil
 			}
+			if errors.Is(message.err, workerclient.ErrEventPreviouslyRejected) &&
+				model.pending.eventID == message.eventID && model.pending.kind != pendingNone {
+				finalization := model.finalizePreviouslyRejectedPending()
+				return model, finalization
+			}
 			if model.pending.eventID != "" && model.pending.eventID == message.eventID {
 				pending := model.pending
+				if pending.recovered {
+					// A local handoff failure means this event never covered its source
+					// request. Re-enable source replay and hold later recovered events
+					// behind the operator's correction until it reaches a stable end.
+					delete(model.recoveredSessions, pending.assignment.SessionKey())
+					if len(model.pendingRecoveries) > 0 {
+						model.recoveryDrainPaused = true
+					}
+				}
+				if pending.kind == pendingDelivery && model.stateStore == nil {
+					model.clearContinuation()
+					assignment := pending.assignment
+					model.active = &assignment
+					model.lastContext = cloneAssignment(pending.context)
+					model.pending.durable = false
+					model.delivery.stage = deliveryConfirmed
+					model.focus = focusTasks
+					model.status = "confirmed delivery not queued; Enter retries the exact in-memory event: " +
+						terminalSafe(message.err.Error())
+					return model, nil
+				}
 				switch pending.kind {
 				case pendingAccept:
 					model.pending = pendingSend{}
 					if pending.automatic {
-						model.assignments = append(model.assignments, pending.assignment)
+						model.queueAssignmentOnce(pending.assignment)
 					}
 					model.focus = focusTasks
 					model.status = "accept failed; request kept in Inbox: " + message.err.Error()
@@ -1039,12 +1459,14 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 		} else if model.pending.eventID != "" && model.pending.eventID == message.eventID {
 			pending := model.pending
 			model.retainPendingRemainder(pending)
+			model.draftOrigins = make(map[stateRecordKey]string)
+			model.draftAuthority = mergeDraftAuthorities(
+				model.draftAuthority, "after-event", pending.event.ID,
+			)
 			model.pending = pendingSend{}
 			switch pending.kind {
 			case pendingAccept:
-				if !pending.automatic {
-					model.removeQueuedAssignment(pending.assignment.SessionKey(), pending.selected)
-				}
+				model.removeQueuedSession(pending.assignment.SessionKey())
 				model = model.activateAssignment(pending.assignment)
 				if mirrorEnabled(pending.assignment) {
 					namespace := mirrorNamespace(pending.assignment.CallerID, pending.assignment.WorkspaceKey)
@@ -1074,18 +1496,35 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 						len(model.assignments),
 					)
 				}
+			case pendingDelivery:
+				count := len(pending.event.ToolCalls)
+				model.delivery = deliveryReview{}
+				model.ui.chatFollow = true
+				model.status = fmt.Sprintf(
+					"confirmed · %d file change(s) queued · waiting for client Agent result", count,
+				)
 			}
 			followup := model.drainDirtyMirrorReview()
 			var recovered tea.Cmd
 			if pending.recovered {
+				recovered = model.resumePendingRecovery()
+			} else if model.recoveryDrainPaused && model.active == nil {
+				model.recoveryDrainPaused = false
 				recovered = model.resumePendingRecovery()
 			}
 			model.pruneMirrorCache()
 			return model, tea.Batch(followup, recovered)
 		}
 		followup := model.drainDirtyMirrorReview()
+		var recovered tea.Cmd
+		if model.recoveryDrainPaused && model.pending.kind == pendingNone && model.active == nil {
+			// This covers a failed automatic accept: its follow-up remains visible in
+			// Inbox, while older committed recovery events are free to keep draining.
+			model.recoveryDrainPaused = false
+			recovered = model.resumePendingRecovery()
+		}
 		model.pruneMirrorCache()
-		return model, followup
+		return model, tea.Batch(followup, recovered)
 	case tea.KeyPressMsg:
 		return model.updateKey(message)
 	default:
@@ -1094,29 +1533,140 @@ func (model Model) Update(message tea.Msg) (updated tea.Model, command tea.Cmd) 
 }
 
 func (model *Model) resumePendingRecovery() tea.Cmd {
-	if model.pending.kind != pendingNone || len(model.pendingRecoveries) == 0 {
+	if model.recoveryDrainPaused || model.pending.kind != pendingNone || len(model.pendingRecoveries) == 0 {
 		return nil
 	}
 	next := model.pendingRecoveries[0]
+	if model.active != nil && recoveredPendingNeedsActive(next) &&
+		model.active.SessionKey() != next.assignment.SessionKey() {
+		// Progress and workspace delivery recovery both need the active editor/
+		// review surface. Never replace a request which an earlier recovered
+		// progress event has left open; terminal events may still drain headlessly.
+		model.recoveryDrainPaused = true
+		return nil
+	}
 	model.pendingRecoveries = append([]pendingSend(nil), model.pendingRecoveries[1:]...)
+	if model.stateStore != nil {
+		next.durable = model.pendingSendStateSynchronized(next)
+	}
 	model.pending = next
 	model.activateRecoveredPending(next)
 	model.status = "resuming the next locally committed response event…"
-	return sendPersistedEvent(model.client, model.stateStore, next)
+	return model.resumeDurablePending(next)
+}
+
+func recoveredPendingNeedsActive(pending pendingSend) bool {
+	return pending.kind == pendingDelivery || pending.event.Type == completion.EventProgress
+}
+
+func (model *Model) failPendingDeliveryConfirmation(namespace string, failure error) tea.Cmd {
+	pending := model.pending
+	if pending.kind != pendingDelivery {
+		return nil
+	}
+	if model.delivery.stage == deliveryDiscarding {
+		return nil
+	}
+	model.delivery.stage = deliveryDiscarding
+	model.delivery.prepareInFlight = false
+	model.delivery.intentWriterInFlight = false
+	cleanup := model.discardIntentCommand(
+		pending.assignment, pending.event.ToolCalls,
+		"delivery confirmation failed: "+failure.Error(),
+	)
+	if cleanup == nil {
+		cleanup = unavailableIntentCleanup(
+			"durable workspace delivery intent cleanup is unavailable",
+		)
+	}
+	model.status = "delivery not sent: " + terminalSafe(failure.Error()) +
+		" · removing any recorded workspace intent before restoring the request…"
+	return discardPendingDeliveryIntentsAttempt(
+		pending.event.ID, namespace, failure.Error(), cleanup, 0,
+	)
+}
+
+func (model *Model) completePendingDeliveryFailure(namespace string, failure error) tea.Cmd {
+	pending := model.pending
+	if pending.kind != pendingDelivery || model.delivery.stage != deliveryDiscarding {
+		return nil
+	}
+	model.pending = pendingSend{}
+	model.delivery = deliveryReview{}
+	if pending.recovered {
+		// A phase=false delivery can never have reached the outbox. After its exact
+		// mirror intents are gone, replay of the source request must be allowed to
+		// become the correction surface instead of being suppressed as delivered.
+		delete(model.recoveredSessions, pending.assignment.SessionKey())
+		if len(model.pendingRecoveries) > 0 {
+			model.recoveryDrainPaused = true
+		}
+	}
+	assignment := pending.assignment
+	model.active = &assignment
+	if pending.context != nil {
+		model.lastContext = cloneAssignment(pending.context)
+	} else {
+		model.lastContext = cloneAssignment(&assignment)
+	}
+	model.markMirrorChanged(namespace)
+	followup := model.drainDirtyMirrorReview()
+	model.status = "delivery not sent: " + failure.Error()
+	if followup != nil {
+		model.status += " · refreshing the changed workspace"
+	}
+	return followup
+}
+
+func (model *Model) resumeDurablePending(pending pendingSend) tea.Cmd {
+	if model.stateStore != nil && !pending.durable {
+		return nil
+	}
+	if pending.kind == pendingDelivery {
+		return model.resumePendingDelivery(pending)
+	}
+	if model.pending.event.ID == pending.event.ID && model.pending.kind == pending.kind {
+		model.pending.outboxInFlight = true
+		pending.outboxInFlight = true
+	}
+	return sendPersistedEvent(model.client, model.stateStore, pending)
 }
 
 func (model *Model) refreshRecoveredAssignment(incoming completion.Assignment) {
 	if model.pending.recovered && model.pending.assignment.SessionKey() == incoming.SessionKey() {
-		model.pending.assignment = incoming
-		if model.pending.event.Type == completion.EventProgress {
+		// A recovered row proves only that its event had reached the local state
+		// store. The same exact event may also already exist in the durable worker
+		// outbox (crash after Put, before Bubble Tea observed success). Rewriting any
+		// assignment byte here would make the next idempotent outbox Put conflict
+		// with that indistinguishable state. The gateway's task lease is sticky, so
+		// an exact replay is the only safe refresh; everything else fails closed.
+		if !samePersistedAssignment(model.pending.assignment, incoming) {
+			return
+		}
+		if model.active != nil && model.active.SessionKey() == incoming.SessionKey() {
 			model.active = &incoming
 		}
-	}
-	for index := range model.pendingRecoveries {
-		if model.pendingRecoveries[index].assignment.SessionKey() == incoming.SessionKey() {
-			model.pendingRecoveries[index].assignment = incoming
+		if model.pending.kind == pendingDelivery &&
+			model.delivery.sessionKey == incoming.SessionKey() {
+			model.delivery.assignment = incoming
 		}
 	}
+}
+
+func samePersistedAssignment(left, right completion.Assignment) bool {
+	leftPayload, leftErr := json.Marshal(left)
+	rightPayload, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && string(leftPayload) == string(rightPayload)
+}
+
+func (model Model) pendingDeliveryPinsMirror(namespace string) bool {
+	return model.pending.kind == pendingDelivery &&
+		model.pending.event.ID != "" &&
+		model.pending.deliveryNamespace == namespace &&
+		model.delivery.namespace == namespace &&
+		model.delivery.eventID == model.pending.event.ID &&
+		model.delivery.stage >= deliveryConfirming &&
+		model.delivery.stage <= deliveryDiscarding
 }
 
 func (model Model) animationActive() bool {
@@ -1196,7 +1746,20 @@ func (model *Model) removeQueuedAssignment(sessionKey string, preferred int) {
 
 func (model Model) updateKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key.Keystroke() == "ctrl+c" {
+		if model.quitting {
+			return model, tea.Quit
+		}
+		if (model.stateStore != nil && model.stateBound && !model.workerStateSynchronized()) ||
+			model.correctnessWorkInFlight() {
+			model.quitting = true
+			model.status = "finishing durable recovery work before exit · Ctrl+C again forces quit"
+			return model, nil
+		}
 		return model, tea.Quit
+	}
+	if model.quitting {
+		model.status = "finishing durable recovery work before exit · Ctrl+C again forces quit"
+		return model, nil
 	}
 	if model.deferredSend.kind != pendingNone {
 		if key.Keystroke() == "esc" {
@@ -1287,6 +1850,20 @@ func (model Model) updateKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	default:
 		return model.updateTaskKey(key)
 	}
+}
+
+func (model Model) correctnessWorkInFlight() bool {
+	if model.delivery.prepareInFlight || model.delivery.intentWriterInFlight ||
+		model.delivery.stage == deliveryDiscarding {
+		return true
+	}
+	for _, finalizer := range model.rejectionFinalizers {
+		if finalizer.mirrorConfirmationPending || finalizer.cleanupInFlight ||
+			!finalizer.cleanupDone || !finalizer.pendingDeleted || finalizer.confirming {
+			return true
+		}
+	}
+	return false
 }
 
 func (model Model) updateTaskKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -1578,7 +2155,7 @@ func (model Model) updateReplyKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return model, nil
 	}
-	if model.responseInFlight() {
+	if model.responseInFlightFor(model.active) {
 		switch key.Keystroke() {
 		case "enter", "ctrl+s", "ctrl+enter", "ctrl+r", "ctrl+d":
 			model.status = "previous response segment is still being committed; your draft is retained"
@@ -1630,7 +2207,7 @@ func (model Model) updateCommandKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		model.commandConfirm = ""
 		return model, model.updateCommandEditor(key)
 	case "enter", "ctrl+s":
-		if model.responseInFlight() {
+		if model.responseInFlightFor(model.active) {
 			model.status = "another response event is still being committed; command draft retained"
 			return model, nil
 		}
@@ -1646,6 +2223,23 @@ func (model Model) responseInFlight() bool {
 	return model.pending.kind != pendingNone ||
 		model.delivery.stage == deliveryConfirming || model.delivery.stage == deliveryConfirmed ||
 		model.delivery.stage == deliverySending
+}
+
+func (model Model) responseInFlightFor(assignment *completion.Assignment) bool {
+	return model.responseInFlight() ||
+		(assignment != nil && model.rejectionFinalizationInFlight(*assignment))
+}
+
+func (model Model) rejectionFinalizationInFlight(assignment completion.Assignment) bool {
+	scope := rejectedDraftScopeKey(assignment)
+	for _, finalizer := range model.rejectionFinalizers {
+		// An empty scope can only come from an incomplete embedder/test-created
+		// finalizer. Treat it as global rather than accidentally failing open.
+		if finalizer.scope == "" || finalizer.scope == scope {
+			return true
+		}
+	}
+	return false
 }
 
 func (model Model) responseCommitInFlight() bool {
@@ -1747,7 +2341,7 @@ func (model *Model) beginMirrorReview(
 }
 
 func (model *Model) drainDirtyMirrorReview() tea.Cmd {
-	if model.active == nil || !mirrorEnabled(*model.active) || model.responseInFlight() {
+	if model.active == nil || !mirrorEnabled(*model.active) || model.responseInFlightFor(model.active) {
 		return nil
 	}
 	namespace := mirrorNamespace(model.active.CallerID, model.active.WorkspaceKey)
@@ -1775,43 +2369,83 @@ func (model Model) acceptSelected() (tea.Model, tea.Cmd) {
 	if len(model.assignments) == 0 {
 		return model, nil
 	}
-	if model.responseInFlight() {
+	assignment := model.assignments[model.selected]
+	if model.responseInFlight() || model.rejectionFinalizationInFlight(assignment) {
 		model.status = "another response event is still being committed"
 		return model, nil
 	}
-	assignment := model.assignments[model.selected]
 	return model.beginAccept(assignment, model.selected, false)
 }
 
 func (model Model) beginAccept(assignment completion.Assignment, selected int, automatic bool) (tea.Model, tea.Cmd) {
+	if model.rejectionFinalizationInFlight(assignment) {
+		model.status = "the rejected response is still being finalized; this request remains in Inbox"
+		if automatic {
+			model.queueAssignmentOnce(assignment)
+		}
+		return model, nil
+	}
 	eventID, err := allocateEventID()
 	if err != nil {
 		model.status = "allocate accept event id: " + err.Error()
 		if automatic {
-			model.assignments = append(model.assignments, assignment)
+			model.queueAssignmentOnce(assignment)
 		}
 		return model, nil
 	}
+	if automatic {
+		// A continuation may have been queued while a rejection finalizer owned
+		// its task scope. Once the barrier clears, its replay moves that exact
+		// request from Inbox into the automatic accept transaction.
+		model.removeQueuedSession(assignment.SessionKey())
+	}
+	event := completion.Event{ID: eventID, Type: completion.EventAccepted}
 	model.pending = pendingSend{
 		kind: pendingAccept, eventID: eventID, assignment: assignment,
-		selected: selected, automatic: automatic,
+		selected: selected, automatic: automatic, event: event,
 	}
 	model.focus = focusTasks
 	model.status = "accepting " + terminalSafe(assignment.TaskID) + "…"
-	return model, sendEvent(model.client, assignment, completion.Event{ID: eventID, Type: completion.EventAccepted})
+	return model, sendEvent(model.client, assignment, event)
 }
 
 func (model Model) activateAssignment(assignment completion.Assignment) Model {
 	model.invalidateChat()
 	sameTaskScope := sameAgentTaskScope(model.lastContext, assignment)
 	draft, restoredDraft := model.rejectedDraftForAssignment(assignment)
-	persistedDraft, restoredPersistedDraft := model.takePersistentDraft(assignment)
+	model.draftOrigins = make(map[stateRecordKey]string)
+	persistedDraft, persistedOrigin, restoredPersistedDraft := model.takePersistentDraft(assignment)
+	if restoredPersistedDraft {
+		if digest := persistedDraftDigest(persistedDraft); digest != "" {
+			model.draftOrigins[persistedOrigin] = digest
+		}
+	}
+	if restoredDraft {
+		if persisted, ok := persistedDraftFromRejected(draft); ok {
+			if digest := persistedDraftDigest(persisted); digest != "" {
+				model.draftOrigins[stateRecordKey{
+					scope: stateScope(draft.assignment), kind: workerStateDraftKind,
+				}] = digest
+			}
+		}
+	}
+	mergedPersistentDraft := false
+	if restoredDraft && restoredPersistedDraft {
+		if local, ok := rejectedDraftFromPersisted(assignment, persistedDraft); ok {
+			// The parked rejection is an undelivered source; the independently
+			// persisted editor is newer local work. Merge them before touching the
+			// UI so apply order can never overwrite either authority on the same pane.
+			draft = mergeRejectedDraft(&draft, local)
+			mergedPersistentDraft = true
+		}
+	}
 	preserveTaskDraft := sameTaskScope && (model.taskDirty || model.taskEditing) ||
 		restoredDraft && draft.hasTasks || restoredPersistedDraft && persistedDraft.HasTasks
 	if !sameTaskScope && !preserveTaskDraft {
 		model.resetAgentTasks()
 	}
 	model.active = &assignment
+	model.draftAuthority = assignmentDraftAuthority(assignment)
 	model.rememberContext(assignment)
 	// loadAgentTasks may derive a correctness-bearing pending/conflict state and
 	// a diagnostic from the caller's transcript. Do not overwrite either with
@@ -1833,12 +2467,15 @@ func (model Model) activateAssignment(assignment completion.Assignment) Model {
 	model.focus = focusReply
 	if model.draftSession != assignment.SessionKey() && !restoredDraft && !restoredPersistedDraft {
 		model.setReplyValue("")
+		model.draftReplyRejected = ""
+		model.draftRejectedEvents = nil
+		model.draftRejectedKinds = nil
 		model.setCommandValue("")
 		model.composing = false
 		model.input = ""
 		model.toolCallIDs = nil
 	}
-	if restoredPersistedDraft {
+	if restoredPersistedDraft && !mergedPersistentDraft {
 		model.applyPersistentDraft(persistedDraft)
 	}
 	if restoredDraft {
@@ -1892,24 +2529,26 @@ func (model Model) rejectSelected() (tea.Model, tea.Cmd) {
 	if len(model.assignments) == 0 {
 		return model, nil
 	}
-	if model.responseInFlight() {
+	assignment := model.assignments[model.selected]
+	if model.responseInFlight() || model.rejectionFinalizationInFlight(assignment) {
 		model.status = "another response event is still being committed"
 		return model, nil
 	}
-	assignment := model.assignments[model.selected]
 	eventID, err := allocateEventID()
 	if err != nil {
 		model.status = "allocate reject event id: " + err.Error()
 		return model, nil
 	}
-	model.pending = pendingSend{
-		kind: pendingReject, eventID: eventID, assignment: assignment, selected: model.selected,
-	}
-	model.status = "rejecting " + terminalSafe(assignment.TaskID) + "…"
-	return model, sendEvent(model.client, assignment, completion.Event{
+	event := completion.Event{
 		ID: eventID, Type: completion.EventRejected,
 		ErrorCode: "human_rejected", Error: "human rejected the request",
-	})
+	}
+	model.pending = pendingSend{
+		kind: pendingReject, eventID: eventID, assignment: assignment, selected: model.selected,
+		event: event,
+	}
+	model.status = "rejecting " + terminalSafe(assignment.TaskID) + "…"
+	return model, sendEvent(model.client, assignment, event)
 }
 
 func (model Model) openDeclaredToolComposer() (tea.Model, tea.Cmd) {
@@ -1960,7 +2599,7 @@ func (model Model) startMirrorReview() (tea.Model, tea.Cmd) {
 		model.status = "mirror is still preparing; try review again"
 		return model, nil
 	}
-	if model.responseInFlight() {
+	if model.responseInFlightFor(model.active) {
 		model.requireMirrorReview(namespace)
 		model.status = "workspace review queued until the current response event is committed"
 		return model, nil
@@ -2044,39 +2683,87 @@ func (model Model) confirmMirrorDelivery() (tea.Model, tea.Cmd) {
 		model.delivery.sessionKey != model.active.SessionKey() {
 		return model, nil
 	}
+	if model.responseInFlightFor(model.active) {
+		model.status = "delivery retained; an earlier rejected response in this task is still being finalized"
+		return model, nil
+	}
 	workspace := model.mirrors[model.delivery.namespace]
 	if workspace == nil {
 		model.delivery = deliveryReview{}
 		model.status = "delivery not sent: mirror is unavailable"
 		return model, nil
 	}
+	assignment := *model.active
+	event := completion.Event{
+		ID: model.delivery.eventID, Type: completion.EventToolCalls,
+		ToolCalls: append([]completion.ToolCall(nil), model.delivery.calls...),
+	}
+	model.pending = pendingSend{
+		kind: pendingDelivery, eventID: event.ID, assignment: assignment,
+		context: cloneAssignment(model.lastContext), event: event,
+		toolCalls:          append([]completion.ToolCall(nil), event.ToolCalls...),
+		remainingDraft:     model.remainingDraftAfterSend(pendingDelivery),
+		deliveryNamespace:  model.delivery.namespace,
+		deliveryGeneration: model.delivery.generation,
+		deliveryChanges:    cloneMirrorChanges(model.delivery.changes),
+	}
 	model.delivery.stage = deliveryConfirming
-	model.status = "checking mirror has not changed since preview…"
-	return model, confirmMirror(
-		workspace, *model.active, model.delivery.changes, model.delivery.calls,
-		model.delivery.generation, model.delivery.eventID,
-	)
+	model.status = "confirmed · saving the exact file delivery before mirror intent and outbox…"
+	return model.commitPendingEvent(event)
 }
 
 func (model Model) sendConfirmedMirrorDelivery(assignment completion.Assignment) (tea.Model, tea.Cmd) {
-	if model.delivery.stage != deliveryConfirmed || model.delivery.sessionKey != assignment.SessionKey() ||
-		model.delivery.eventID == "" || len(model.delivery.calls) == 0 {
+	if model.pending.kind != pendingDelivery || (model.stateStore != nil && !model.pending.durable) ||
+		model.pending.assignment.SessionKey() != assignment.SessionKey() ||
+		model.delivery.stage != deliveryConfirmed || model.delivery.sessionKey != assignment.SessionKey() ||
+		model.pending.event.ID == "" || len(model.pending.event.ToolCalls) == 0 {
 		return model, nil
 	}
+	model.pending.deliveryIntentRecorded = true
+	command := model.startRecordedMirrorDelivery()
+	return model, command
+}
+
+func (model *Model) startRecordedMirrorDelivery() tea.Cmd {
+	if model.pending.kind != pendingDelivery || !model.pending.deliveryIntentRecorded ||
+		(model.stateStore != nil && !model.pending.durable) ||
+		model.delivery.stage != deliveryConfirmed || model.active == nil ||
+		model.active.SessionKey() != model.pending.assignment.SessionKey() {
+		return nil
+	}
+	latestDraft, _ := model.currentPersistedDraft()
+	latestDraft = sanitizePersistedDraft(latestDraft)
+	if persistedDraftEditorDigest(latestDraft, model.pending.event.ID) !=
+		persistedDraftEditorDigest(model.pending.remainingDraft, model.pending.event.ID) {
+		// RecordDeliveryIntents and the phase=true worker-state write are
+		// asynchronous; the operator may keep editing independent panes while they
+		// run. Freeze the newest editor snapshot into the pending journal and cross
+		// one more save-ahead boundary before clearing active or touching the outbox.
+		model.pending.remainingDraft = latestDraft
+		model.pending.draftOrigins = sortedDraftOriginKeys(model.draftOrigins)
+		if model.stateStore != nil {
+			model.pending.durable = false
+			model.status = "file intent recorded · saving the latest editor snapshot before outbox handoff…"
+			return nil
+		}
+	}
+	assignment := model.pending.assignment
 	beforeContext := cloneAssignment(model.lastContext)
-	for _, call := range model.delivery.calls {
+	for _, call := range model.pending.event.ToolCalls {
 		model.appendLocalToolCall(assignment, call)
 	}
-	model.expectContinuation(assignment, model.delivery.calls)
+	model.expectContinuation(assignment, model.pending.event.ToolCalls)
 	model.delivery.stage = deliverySending
 	model.delivery.assignment = assignment
 	model.delivery.context = beforeContext
+	model.pending.outboxInFlight = true
 	model.active = nil
 	model.focus = focusTasks
-	model.status = fmt.Sprintf("confirmed · sending %d file tool call(s)…", len(model.delivery.calls))
-	return model, sendDeliveryEvent(model.client, assignment, completion.Event{
-		ID: model.delivery.eventID, Type: completion.EventToolCalls, ToolCalls: model.delivery.calls,
-	})
+	model.status = fmt.Sprintf(
+		"confirmed · %d durable file tool call(s) entering the worker outbox…",
+		len(model.pending.event.ToolCalls),
+	)
+	return sendPersistedEvent(model.client, model.stateStore, model.pending)
 }
 
 type commandTarget struct {
@@ -2322,6 +3009,16 @@ func (model *Model) removeQueuedSession(sessionKey string) {
 	}
 }
 
+func (model *Model) queueAssignmentOnce(assignment completion.Assignment) {
+	for index := range model.assignments {
+		if model.assignments[index].SessionKey() == assignment.SessionKey() {
+			model.assignments[index] = assignment
+			return
+		}
+	}
+	model.assignments = append(model.assignments, assignment)
+}
+
 func (model *Model) matchesContinuation(assignment completion.Assignment) bool {
 	if model.matchesCurrentContinuation(assignment) {
 		return true
@@ -2488,6 +3185,9 @@ func (model Model) restorePendingSend(sendErr error) Model {
 	model.invalidateChat()
 	pending := model.pending
 	replyTail := model.replyInput
+	if model.draftReplyRejected != "" {
+		replyTail = replyTailAfterRejectedPrefix(model.replyInput, model.draftReplyRejected)
+	}
 	commandTail := model.commandInput
 	assignment := pending.assignment
 	model.active = &assignment
@@ -2500,7 +3200,11 @@ func (model Model) restorePendingSend(sendErr error) Model {
 	model.clearContinuation()
 	switch pending.kind {
 	case pendingReply:
-		model.setReplyValue(joinDraftSegments(pending.reply, replyTail))
+		// pending.reply is the complete editor value captured for this new event;
+		// it may already contain older restored prefixes. The new event supersedes
+		// that boundary, so appending the old prefix would duplicate it.
+		model.draftReplyRejected = pending.reply
+		model.setReplyValue(joinDraftSegments(model.draftReplyRejected, replyTail))
 		model.focus = focusReply
 	case pendingCommand:
 		model.setCommandValue(joinDraftSegments(pending.command, commandTail))
@@ -2517,16 +3221,29 @@ func (model Model) restorePendingSend(sendErr error) Model {
 		model.toolCallIDs = append([]string(nil), pending.toolCallIDs...)
 		model.focus = focusTasks
 	}
+	model.draftAuthority = mergeDraftAuthorities(
+		eventDraftAuthority(pending.event.ID), model.draftAuthority,
+	)
+	model.draftRejectedEvents = uniqueEventIDs(append(
+		append([]string(nil), model.draftRejectedEvents...), eventIDSlice(pending.event.ID)...,
+	)...)
+	model.draftRejectedKinds = mergeEventKinds(
+		model.draftRejectedKinds, eventKindMap(pending.event.ID, pending.kind),
+	)
 	model.pending = pendingSend{}
+	model.draftOrigins = make(map[stateRecordKey]string)
 	model.status = "send failed; draft restored: " + sendErr.Error()
 	return model
 }
 
 func (model Model) rejectedDraftFromPending(pending pendingSend) (rejectedDraftState, bool) {
 	draft := rejectedDraftState{
-		assignment: pending.assignment,
-		kind:       pending.kind,
-		selected:   model.taskSelected,
+		assignment:         pending.assignment,
+		authority:          eventDraftAuthority(pending.event.ID),
+		rejectedEventIDs:   eventIDSlice(pending.event.ID),
+		rejectedEventKinds: eventKindMap(pending.event.ID, pending.kind),
+		kind:               pending.kind,
+		selected:           model.taskSelected,
 	}
 	switch pending.kind {
 	case pendingReply:
@@ -2540,18 +3257,88 @@ func (model Model) rejectedDraftFromPending(pending pendingSend) (rejectedDraftS
 	case pendingTasks:
 		draft.hasTasks = true
 		draft.tasks = append([]agentTask(nil), pending.tasks...)
+		draft.taskDirty = true
+		draft.taskEditIndex = -1
 	case pendingAdvancedTools:
 		draft.hasTools = true
 		draft.toolInput = pending.toolInput
-		draft.toolCallIDs = append([]string(nil), pending.toolCallIDs...)
+		rejectedEventID := pending.event.ID
+		if rejectedEventID == "" {
+			rejectedEventID = pending.eventID
+		}
+		ids, ok := replacementToolCallIDs(rejectedEventID, len(pending.toolCallIDs))
+		if !ok {
+			return rejectedDraftState{}, false
+		}
+		draft.toolCallIDs = ids
 	default:
 		return rejectedDraftState{}, false
 	}
 	return draft, true
 }
 
+func rejectedDraftFromPersisted(
+	assignment completion.Assignment,
+	persisted persistedDraft,
+) (rejectedDraftState, bool) {
+	draft := rejectedDraftState{
+		assignment: assignment, authority: persisted.Authority,
+		rejectedEventIDs:   append([]string(nil), persisted.RejectedEventIDs...),
+		rejectedEventKinds: cloneEventKinds(persisted.RejectedEventKinds),
+		taskEditIndex:      -1,
+	}
+	if draft.authority == "" {
+		draft.authority = assignmentDraftAuthority(assignment)
+	}
+	switch persisted.Focus {
+	case persistedFocusCommand:
+		draft.kind = pendingCommand
+	case persistedFocusTasks:
+		draft.kind = pendingTasks
+	default:
+		draft.kind = pendingReply
+	}
+	if persisted.Reply != "" {
+		draft.hasReply = true
+		draft.reply = persisted.Reply
+		if persisted.ReplyRejected != "" || persisted.ReplyTail != "" {
+			draft.replyRejected = persisted.ReplyRejected
+			draft.replyTail = persisted.ReplyTail
+		} else {
+			// An ordinary saved editor row has no rejected-prefix provenance, so a
+			// later rejected segment belongs before this unsent local text.
+			draft.replyTail = persisted.Reply
+		}
+	}
+	if persisted.Command != "" {
+		draft.hasCommand = true
+		draft.command = persisted.Command
+	}
+	if persisted.HasTasks {
+		draft.hasTasks = true
+		draft.tasks = restoreTasks(persisted.Tasks)
+		draft.selected = persisted.TaskSelected
+		draft.taskDirty = persisted.TaskDirty
+		draft.taskEditing = persisted.TaskEditing
+		draft.taskEditIndex = persisted.TaskEditIndex
+		draft.taskInput = persisted.TaskInput
+	}
+	if persisted.ToolInput != "" || len(persisted.ToolCallIDs) > 0 {
+		draft.hasTools = true
+		draft.toolInput = persisted.ToolInput
+		draft.toolCallIDs = append([]string(nil), persisted.ToolCallIDs...)
+		if persisted.Focus == persistedFocusTasks {
+			draft.kind = pendingAdvancedTools
+		}
+	}
+	return draft, draft.hasReply || draft.hasCommand || draft.hasTasks || draft.hasTools
+}
+
 func rejectedDraftFromEvent(assignment completion.Assignment, event completion.Event) (rejectedDraftState, bool) {
-	draft := rejectedDraftState{assignment: assignment}
+	draft := rejectedDraftState{
+		assignment: assignment, authority: eventDraftAuthority(event.ID),
+		rejectedEventIDs: eventIDSlice(event.ID), taskEditIndex: -1,
+	}
 	switch event.Type {
 	case completion.EventProgress, completion.EventFinal, completion.EventClarification:
 		text := localTextForEvent(event)
@@ -2562,6 +3349,7 @@ func rejectedDraftFromEvent(assignment completion.Assignment, event completion.E
 		draft.hasReply = true
 		draft.reply = text
 		draft.replyRejected = text
+		draft.rejectedEventKinds = eventKindMap(event.ID, draft.kind)
 		return draft, true
 	case completion.EventToolCalls:
 		if len(event.ToolCalls) == 0 {
@@ -2578,6 +3366,7 @@ func rejectedDraftFromEvent(assignment completion.Assignment, event completion.E
 				draft.kind = pendingCommand
 				draft.hasCommand = true
 				draft.command = ":pull " + pull
+				draft.rejectedEventKinds = eventKindMap(event.ID, draft.kind)
 				return draft, true
 			}
 		}
@@ -2589,6 +3378,9 @@ func rejectedDraftFromEvent(assignment completion.Assignment, event completion.E
 				draft.kind = pendingTasks
 				draft.hasTasks = true
 				draft.tasks = items
+				draft.taskDirty = true
+				draft.taskEditIndex = -1
+				draft.rejectedEventKinds = eventKindMap(event.ID, draft.kind)
 				return draft, true
 			}
 		}
@@ -2599,6 +3391,7 @@ func rejectedDraftFromEvent(assignment completion.Assignment, event completion.E
 				draft.kind = pendingCommand
 				draft.hasCommand = true
 				draft.command = command
+				draft.rejectedEventKinds = eventKindMap(event.ID, draft.kind)
 				return draft, true
 			}
 		}
@@ -2606,10 +3399,15 @@ func rejectedDraftFromEvent(assignment completion.Assignment, event completion.E
 		if !ok {
 			return rejectedDraftState{}, false
 		}
+		ids, ok = replacementToolCallIDs(event.ID, len(ids))
+		if !ok {
+			return rejectedDraftState{}, false
+		}
 		draft.kind = pendingAdvancedTools
 		draft.hasTools = true
 		draft.toolInput = input
 		draft.toolCallIDs = ids
+		draft.rejectedEventKinds = eventKindMap(event.ID, draft.kind)
 		return draft, true
 	default:
 		return rejectedDraftState{}, false
@@ -2679,29 +3477,32 @@ func rejectedMirrorEvent(assignment completion.Assignment, event completion.Even
 	if event.Type != completion.EventToolCalls || len(event.ToolCalls) == 0 || !mirrorEnabled(assignment) {
 		return false
 	}
-	profile := assignment.Adapter
-	mutations := make(map[string]struct{}, 4)
-	if profile.Write != nil {
-		mutations[profile.Write.Name] = struct{}{}
-	}
-	if profile.Edit != nil {
-		mutations[profile.Edit.Name] = struct{}{}
-	}
-	if profile.Delete != nil {
-		mutations[profile.Delete.Name] = struct{}{}
-	}
-	if profile.Rename != nil {
-		mutations[profile.Rename.Name] = struct{}{}
-	}
 	for _, call := range event.ToolCalls {
-		if call.Namespace != "" {
-			return false
-		}
-		if _, ok := mutations[call.Name]; !ok {
+		if !mirrorMutationCall(assignment, call) {
 			return false
 		}
 	}
 	return true
+}
+
+func mirrorMutationCall(assignment completion.Assignment, call completion.ToolCall) bool {
+	if !mirrorEnabled(assignment) || call.Namespace != "" {
+		return false
+	}
+	profile := assignment.Adapter
+	if profile.Write != nil && profile.Write.Name == call.Name {
+		return true
+	}
+	if profile.Edit != nil && profile.Edit.Name == call.Name {
+		return true
+	}
+	if profile.Delete != nil && profile.Delete.Name == call.Name {
+		return true
+	}
+	if profile.Rename != nil && profile.Rename.Name == call.Name {
+		return true
+	}
+	return false
 }
 
 func (model Model) discardIntentCommand(
@@ -2728,9 +3529,18 @@ func (model Model) discardIntentCommand(
 			DiscardToolIntents([]completion.ToolCall, *adapter.Profile) error
 		})
 		if !ok {
-			return mirrorIntentsDiscarded{reason: reason}
+			return mirrorIntentsDiscarded{
+				reason: reason,
+				err:    errors.New("mirror does not support durable delivery intent cleanup"),
+			}
 		}
 		return mirrorIntentsDiscarded{reason: reason, err: discarder.DiscardToolIntents(calls, assignment.Adapter)}
+	}
+}
+
+func unavailableIntentCleanup(reason string) tea.Cmd {
+	return func() tea.Msg {
+		return mirrorIntentsDiscarded{reason: reason, err: errors.New(reason)}
 	}
 }
 
@@ -2749,6 +3559,176 @@ func advancedDraftFromCalls(calls []completion.ToolCall) (string, []string, bool
 		ids = append(ids, call.ID)
 	}
 	return strings.Join(lines, "\n"), ids, true
+}
+
+func replacementToolCallIDs(rejectedEventID string, count int) ([]string, bool) {
+	if strings.TrimSpace(rejectedEventID) == "" || count <= 0 {
+		return nil, false
+	}
+	ids := make([]string, count)
+	for index := range ids {
+		seed := fmt.Sprintf("human/rejected-tool-retry/v1\x00%s\x00%d", rejectedEventID, index)
+		digest := sha256.Sum256([]byte(seed))
+		ids[index] = "tool_retry_" + hex.EncodeToString(digest[:16])
+	}
+	return ids, true
+}
+
+func assignmentDraftAuthority(assignment completion.Assignment) string {
+	return mergeDraftAuthorities(
+		"assignment", string(assignment.CapabilityTier), assignment.CallerID,
+		assignment.WorkspaceKey, assignment.TaskID, assignment.SessionKey(),
+	)
+}
+
+func eventDraftAuthority(eventID string) string {
+	if strings.TrimSpace(eventID) == "" {
+		return ""
+	}
+	return mergeDraftAuthorities("event", eventID)
+}
+
+func eventIDSlice(eventID string) []string {
+	if strings.TrimSpace(eventID) == "" {
+		return nil
+	}
+	return []string{eventID}
+}
+
+func eventKindMap(eventID string, kind pendingSendKind) map[string]pendingSendKind {
+	if strings.TrimSpace(eventID) == "" || kind == pendingNone {
+		return nil
+	}
+	return map[string]pendingSendKind{eventID: kind}
+}
+
+func cloneEventKinds(source map[string]pendingSendKind) map[string]pendingSendKind {
+	if len(source) == 0 {
+		return nil
+	}
+	cloned := make(map[string]pendingSendKind, len(source))
+	for eventID, kind := range source {
+		cloned[eventID] = kind
+	}
+	return cloned
+}
+
+func mergeEventKinds(left, right map[string]pendingSendKind) map[string]pendingSendKind {
+	merged := cloneEventKinds(left)
+	if merged == nil && len(right) > 0 {
+		merged = make(map[string]pendingSendKind, len(right))
+	}
+	for eventID, kind := range right {
+		if _, exists := merged[eventID]; !exists {
+			merged[eventID] = kind
+		}
+	}
+	return merged
+}
+
+func hasRejectedKind(kinds map[string]pendingSendKind, kind pendingSendKind) bool {
+	for _, candidate := range kinds {
+		if candidate == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func filterEventProvenance(
+	eventIDs []string,
+	kinds map[string]pendingSendKind,
+	removed pendingSendKind,
+) ([]string, map[string]pendingSendKind) {
+	keptIDs := make([]string, 0, len(eventIDs))
+	keptKinds := make(map[string]pendingSendKind, len(kinds))
+	for _, eventID := range eventIDs {
+		kind, classified := kinds[eventID]
+		if classified && kind == removed {
+			continue
+		}
+		keptIDs = append(keptIDs, eventID)
+		if classified {
+			keptKinds[eventID] = kind
+		}
+	}
+	if len(keptIDs) == 0 {
+		keptIDs = nil
+	}
+	if len(keptKinds) == 0 {
+		keptKinds = nil
+	}
+	return keptIDs, keptKinds
+}
+
+func removeEventProvenance(
+	eventIDs []string,
+	kinds map[string]pendingSendKind,
+	removedEventID string,
+) ([]string, map[string]pendingSendKind) {
+	if strings.TrimSpace(removedEventID) == "" {
+		return append([]string(nil), eventIDs...), cloneEventKinds(kinds)
+	}
+	keptIDs := make([]string, 0, len(eventIDs))
+	keptKinds := cloneEventKinds(kinds)
+	delete(keptKinds, removedEventID)
+	for _, eventID := range eventIDs {
+		if eventID != removedEventID {
+			keptIDs = append(keptIDs, eventID)
+		}
+	}
+	if len(keptIDs) == 0 {
+		keptIDs = nil
+	}
+	if len(keptKinds) == 0 {
+		keptKinds = nil
+	}
+	return keptIDs, keptKinds
+}
+
+func uniqueEventIDs(groups ...string) []string {
+	result := make([]string, 0, len(groups))
+	seen := make(map[string]struct{}, len(groups))
+	for _, eventID := range groups {
+		if strings.TrimSpace(eventID) == "" {
+			continue
+		}
+		if _, exists := seen[eventID]; exists {
+			continue
+		}
+		seen[eventID] = struct{}{}
+		result = append(result, eventID)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func hasEventID(eventIDs []string, eventID string) bool {
+	for _, candidate := range eventIDs {
+		if candidate == eventID {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeDraftAuthorities(authorities ...string) string {
+	hash := sha256.New()
+	written := false
+	for _, authority := range authorities {
+		if authority == "" {
+			continue
+		}
+		written = true
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(authority))
+	}
+	if !written {
+		return ""
+	}
+	return "draft_" + hex.EncodeToString(hash.Sum(nil))
 }
 
 func localTextForEvent(event completion.Event) string {
@@ -2808,13 +3788,43 @@ func removeLastLocalToolCall(messages []canonical.Message, callID string) []cano
 }
 
 func (model *Model) installRejectedDraft(draft rejectedDraftState) bool {
+	return model.recordRejectedDraft(draft, true)
+}
+
+// storeRejectedDraft retains a rejected queued recovery without replacing the
+// editor or focus owned by the currently active request.
+func (model *Model) storeRejectedDraft(draft rejectedDraftState) bool {
+	return model.recordRejectedDraft(draft, false)
+}
+
+func (model *Model) recordRejectedDraft(draft rejectedDraftState, apply bool) bool {
 	if model.rejectedDrafts == nil {
 		model.rejectedDrafts = make(map[string]rejectedDraftState)
 	}
+	stateKey := stateRecordKey{
+		scope: stateScope(draft.assignment), kind: workerStateDraftKind,
+	}
+	if saved, exists := model.stateDrafts[stateKey]; exists {
+		if local, ok := rejectedDraftFromPersisted(draft.assignment, saved.draft); ok {
+			// One durable key must have one in-memory authority. A row with event
+			// provenance already contains earlier rejected sources, so it precedes
+			// the newly rejected event (and exact inbox replay is deduplicated).
+			// Without provenance the row is only an unsent local remainder and the
+			// newly rejected source belongs before it.
+			var merged rejectedDraftState
+			if hasRejectedKind(saved.draft.RejectedEventKinds, draft.kind) {
+				merged = mergeRejectedDraft(&local, draft)
+			} else {
+				merged = mergeRejectedDraft(&draft, local)
+			}
+			draft = merged
+		}
+		delete(model.stateDrafts, stateKey)
+	}
 	key := rejectedDraftScopeKey(draft.assignment)
 	existing, exists := model.rejectedDrafts[key]
-	if draft.hasReply {
-		if draft.replyRejected == "" {
+	if apply && draft.hasReply {
+		if draft.replyRejected == "" && draft.replyTail == "" {
 			draft.replyRejected = draft.reply
 		}
 		// Once the rejected reply's local outbox write has completed, the
@@ -2829,7 +3839,17 @@ func (model *Model) installRejectedDraft(draft rejectedDraftState) bool {
 				)
 				existing.reply = joinDraftSegments(existing.replyRejected, existing.replyTail)
 			} else if model.draftSession == draft.assignment.SessionKey() {
-				draft.replyTail = model.replyInput
+				if hasRejectedKind(model.draftRejectedKinds, pendingReply) {
+					// The active editor may itself have been materialized from this
+					// durable rejected inbox before the assignment replay arrived. In
+					// that ordering, its rejected prefix is already represented in
+					// draft; only text typed after that prefix is a new local tail.
+					draft.replyTail = replyTailAfterRejectedPrefix(
+						model.replyInput, model.draftReplyRejected,
+					)
+				} else {
+					draft.replyTail = model.replyInput
+				}
 				draft.reply = joinDraftSegments(draft.replyRejected, draft.replyTail)
 			}
 		}
@@ -2852,8 +3872,10 @@ func (model *Model) installRejectedDraft(draft rejectedDraftState) bool {
 		delete(model.rejectedDrafts, oldest)
 		evicted = true
 	}
-	model.applyRejectedDraft(copy, true)
-	model.draftSession = draft.assignment.SessionKey()
+	if apply {
+		model.applyRejectedDraft(copy, true)
+		model.draftSession = draft.assignment.SessionKey()
+	}
 	return evicted
 }
 
@@ -2864,6 +3886,18 @@ func rejectedDraftScopeKey(assignment completion.Assignment) string {
 			"\x00" + assignment.WorkspaceKey + "\x00" + assignment.TaskID
 	}
 	return "session\x00" + assignment.SessionKey()
+}
+
+func rejectedDraftScopeFromStateKey(key stateRecordKey) string {
+	scope := key.scope
+	if scope.SessionKey == "" {
+		return ""
+	}
+	if scope.Tier == completion.TierRemoteTools || scope.Tier == completion.TierWorkspace {
+		return "task\x00" + string(scope.Tier) + "\x00" + scope.CallerID +
+			"\x00" + scope.WorkspaceKey + "\x00" + scope.TaskID
+	}
+	return "session\x00" + scope.SessionKey
 }
 
 func (model Model) rejectedDraftForAssignment(
@@ -2916,35 +3950,71 @@ func (model *Model) rememberHandledRejection(eventID string) bool {
 
 func mergeRejectedDraft(existing *rejectedDraftState, next rejectedDraftState) rejectedDraftState {
 	if existing == nil || !sameRejectedDraftScope(&existing.assignment, next.assignment) {
+		if next.authority == "" {
+			next.authority = assignmentDraftAuthority(next.assignment)
+		}
 		return next
 	}
 	merged := *existing
 	merged.assignment = next.assignment
+	nextAlreadyMaterialized := len(next.rejectedEventIDs) > 0
+	duplicateKinds := make(map[pendingSendKind]struct{})
+	for _, eventID := range next.rejectedEventIDs {
+		if !hasEventID(existing.rejectedEventIDs, eventID) {
+			nextAlreadyMaterialized = false
+			continue
+		}
+		if kind, classified := next.rejectedEventKinds[eventID]; classified {
+			duplicateKinds[kind] = struct{}{}
+		}
+	}
+	merged.rejectedEventIDs = uniqueEventIDs(append(
+		append([]string(nil), existing.rejectedEventIDs...), next.rejectedEventIDs...,
+	)...)
+	merged.rejectedEventKinds = mergeEventKinds(existing.rejectedEventKinds, next.rejectedEventKinds)
+	if nextAlreadyMaterialized {
+		merged.authority = existing.authority
+	} else {
+		merged.authority = mergeDraftAuthorities(existing.authority, next.authority)
+	}
+	if merged.authority == "" {
+		merged.authority = assignmentDraftAuthority(next.assignment)
+	}
 	merged.kind = next.kind
 	if next.hasReply {
 		merged.hasReply = true
-		if merged.replyRejected == "" {
+		if merged.replyRejected == "" && merged.replyTail == "" {
 			merged.replyRejected = merged.reply
 		}
-		if next.replyRejected == "" {
+		if next.replyRejected == "" && next.replyTail == "" {
 			next.replyRejected = next.reply
 		}
-		merged.replyRejected = joinDraftSegments(merged.replyRejected, next.replyRejected)
+		_, duplicateReply := duplicateKinds[pendingReply]
+		if next.replyRejected != "" && !duplicateReply {
+			merged.replyRejected = joinDraftSegments(merged.replyRejected, next.replyRejected)
+		}
 		if next.replyTail != "" {
 			merged.replyTail = joinDraftSegments(merged.replyTail, next.replyTail)
 		}
 		merged.reply = joinDraftSegments(merged.replyRejected, merged.replyTail)
 	}
-	if next.hasCommand {
+	_, duplicateCommand := duplicateKinds[pendingCommand]
+	if next.hasCommand && !duplicateCommand {
 		merged.hasCommand = true
 		merged.command = joinDraftSegments(merged.command, next.command)
 	}
-	if next.hasTasks {
+	_, duplicateTasks := duplicateKinds[pendingTasks]
+	if next.hasTasks && !duplicateTasks {
 		merged.hasTasks = true
 		merged.tasks = append([]agentTask(nil), next.tasks...)
 		merged.selected = next.selected
+		merged.taskDirty = next.taskDirty
+		merged.taskEditing = next.taskEditing
+		merged.taskEditIndex = next.taskEditIndex
+		merged.taskInput = next.taskInput
 	}
-	if next.hasTools {
+	_, duplicateTools := duplicateKinds[pendingAdvancedTools]
+	if next.hasTools && !duplicateTools {
 		merged.hasTools = true
 		if merged.toolInput == "" {
 			merged.toolInput = next.toolInput
@@ -2974,12 +4044,19 @@ func replyTailAfterRejectedPrefix(value, rejectedPrefix string) string {
 }
 
 func (model *Model) applyRejectedDraft(draft rejectedDraftState, keepPendingEditor bool) {
+	if draft.authority != "" {
+		model.draftAuthority = draft.authority
+	}
+	appliedSource := false
 	if draft.hasReply && (!keepPendingEditor || model.pending.kind != pendingReply) {
 		model.setReplyValue(draft.reply)
+		model.draftReplyRejected = draft.replyRejected
+		appliedSource = true
 	}
 	if draft.hasCommand && (!keepPendingEditor || model.pending.kind != pendingCommand) {
 		model.setCommandValue(draft.command)
 		model.commandConfirm = ""
+		appliedSource = true
 	}
 	if draft.hasTasks && (!keepPendingEditor || model.pending.kind != pendingTasks) {
 		model.agentTasks = append([]agentTask(nil), draft.tasks...)
@@ -2987,17 +4064,25 @@ func (model *Model) applyRejectedDraft(draft rejectedDraftState, keepPendingEdit
 		if model.taskSelected >= len(model.agentTasks) {
 			model.taskSelected = max(0, len(model.agentTasks)-1)
 		}
-		model.taskDirty = true
-		model.taskEditing = false
-		model.taskEditIndex = -1
-		model.taskInput = ""
+		model.taskDirty = draft.taskDirty
+		model.taskEditing = draft.taskEditing
+		model.taskEditIndex = draft.taskEditIndex
+		model.taskInput = draft.taskInput
 		model.taskSyncWait = false
 		model.taskConflict = false
+		appliedSource = true
 	}
 	if draft.hasTools && (!keepPendingEditor || model.pending.kind != pendingAdvancedTools) {
 		model.composing = true
 		model.input = draft.toolInput
 		model.toolCallIDs = append([]string(nil), draft.toolCallIDs...)
+		appliedSource = true
+	}
+	if appliedSource {
+		model.draftRejectedEvents = uniqueEventIDs(append(
+			append([]string(nil), model.draftRejectedEvents...), draft.rejectedEventIDs...,
+		)...)
+		model.draftRejectedKinds = mergeEventKinds(model.draftRejectedKinds, draft.rejectedEventKinds)
 	}
 	if keepPendingEditor && model.pending.kind != pendingNone {
 		return
@@ -3082,7 +4167,7 @@ func (model Model) sendAgentTasks() (tea.Model, tea.Cmd) {
 	if model.blockSendWhileStateUnsettled("task edits", deferredSendIntent{kind: pendingTasks}) {
 		return model, nil
 	}
-	if model.responseInFlight() {
+	if model.responseInFlightFor(model.active) {
 		model.status = "another response event is still being committed; task edits retained"
 		return model, nil
 	}
@@ -3166,7 +4251,7 @@ func (model Model) sendCommand() (tea.Model, tea.Cmd) {
 	if model.blockSendWhileStateUnsettled("command draft", deferredSendIntent{kind: pendingCommand}) {
 		return model, nil
 	}
-	if model.responseInFlight() {
+	if model.responseInFlightFor(model.active) {
 		model.status = "another response event is still being committed; command draft retained"
 		return model, nil
 	}
@@ -3311,7 +4396,7 @@ func (model Model) sendDeclaredToolCalls() (tea.Model, tea.Cmd) {
 	if model.blockSendWhileStateUnsettled("tool draft", deferredSendIntent{kind: pendingAdvancedTools}) {
 		return model, nil
 	}
-	if model.responseInFlight() {
+	if model.responseInFlightFor(model.active) {
 		model.status = "another response event is still being committed; tool draft retained"
 		return model, nil
 	}
@@ -3319,6 +4404,16 @@ func (model Model) sendDeclaredToolCalls() (tea.Model, tea.Cmd) {
 	if err != nil {
 		model.status = "tool calls not sent: " + err.Error()
 		return model, nil
+	}
+	for _, call := range calls {
+		if mirrorMutationCall(*model.active, call) {
+			// Mapped write/edit/delete/rename calls are correctness-bearing only
+			// when generated from a reviewed scratch diff with durable delivery
+			// intents. Letting the generic composer emit one would have no mirror
+			// provenance and a later rejection could not be recovered truthfully.
+			model.status = "tool calls not sent: mapped file mutations must use Live Workspace review and preview"
+			return model, nil
+		}
 	}
 	eventID, err := allocateEventID()
 	if err != nil {
@@ -3455,7 +4550,7 @@ func (model Model) sendReplyWithOptions(eventType completion.EventType, endRespo
 	}) {
 		return model, nil
 	}
-	if model.responseInFlight() {
+	if model.responseInFlightFor(model.active) {
 		model.status = "previous response event is still being committed; draft retained"
 		return model, nil
 	}
@@ -3486,6 +4581,9 @@ func (model Model) sendReplyWithOptions(eventType completion.EventType, endRespo
 		model.appendLocalText(assignment, canonical.RoleAssistant, text)
 	}
 	model.setReplyValue("")
+	model.draftReplyRejected = ""
+	model.draftRejectedEvents = nil
+	model.draftRejectedKinds = nil
 	if endResponse {
 		if eventType == completion.EventClarification {
 			model.expectHandoff(assignment)
@@ -4103,7 +5201,12 @@ func sendEvent(client Client, assignment completion.Assignment, event completion
 func (model Model) commitPendingEvent(event completion.Event) (tea.Model, tea.Cmd) {
 	model.pending.event = event
 	model.pending.eventID = event.ID
+	model.pending.draftOrigins = sortedDraftOriginKeys(model.draftOrigins)
 	if model.stateStore == nil {
+		if model.pending.kind == pendingDelivery {
+			command := model.resumePendingDelivery(model.pending)
+			return model, command
+		}
 		return model, sendEvent(model.client, model.pending.assignment, event)
 	}
 	// nextStateCommand serializes this intent through the worker-state store.
@@ -4116,19 +5219,41 @@ func sendPersistedEvent(client Client, store StateStore, pending pendingSend) te
 	return func() tea.Msg {
 		err := client.SendEvent(context.Background(), pending.assignment, pending.event)
 		message := eventSent{eventID: pending.event.ID, err: err}
-		if err == nil || errors.Is(err, workerclient.ErrEventRejectionPending) || store == nil {
+		if err == nil || errors.Is(err, workerclient.ErrEventRejectionPending) ||
+			errors.Is(err, workerclient.ErrEventPreviouslyRejected) {
 			return message
 		}
-		if errors.Is(err, workerclient.ErrWorkerIdentityUnavailable) {
-			message.intentErr = err
+		if pending.kind == pendingDelivery {
+			// A reviewed file event has no ordinary editor draft to restore. Keep
+			// its exact durable journal entry and retry the local outbox handoff;
+			// changing IDs or calls would orphan the recorded mirror provenance.
+			if store != nil {
+				message.intentErr = err
+			}
 			return message
 		}
+		if !errors.Is(err, workerclient.ErrEventNotStored) {
+			// Storage/transaction errors are commit-ambiguous. The exact ID may
+			// already be durable even though Put returned an error, so only an
+			// idempotent outbox retry may resolve this outcome.
+			return message
+		}
+		if store == nil {
+			return message
+		}
+		return persistPendingRestore(store, pending, err)()
+	}
+}
 
-		// A deterministic validation failure or local outbox failure returns the
-		// draft to the operator. Publish that decision into the already-durable
-		// intent row before telling Bubble Tea to clear pending state; a crash at
-		// any earlier instruction therefore retries the exact intended event, while
-		// a crash after this commit restores the draft and never sends it silently.
+func persistPendingRestore(store StateStore, pending pendingSend, sendErr error) tea.Cmd {
+	return func() tea.Msg {
+		message := eventSent{
+			eventID: pending.event.ID, err: sendErr, restorePending: true,
+		}
+		// Only a deterministic pre-outbox failure may return the source draft.
+		// Publish that decision into the already-durable intent row before Bubble
+		// Tea clears pending state. If Put commits but reports an error, subsequent
+		// retries repeat this state write and never cross back into SendEvent.
 		key := pendingSendStateKey(pending)
 		persisted := persistedPendingFromSend(pending, pendingSendDispositionRestore)
 		payload, marshalErr := json.Marshal(persisted)
@@ -4150,6 +5275,258 @@ func sendPersistedEvent(client Client, store StateStore, pending pendingSend) te
 
 func confirmRejectedEvent(client Client, eventID string) tea.Cmd {
 	return confirmRejectedEventAttempt(client, eventID, 0)
+}
+
+func (model *Model) beginRejectionFinalization(
+	eventID string,
+	scope string,
+	pendingKey stateRecordKey,
+	waitsForPendingDelete bool,
+	mirrorConfirmationPending bool,
+	cleanup tea.Cmd,
+	resumeRecoveries bool,
+) tea.Cmd {
+	if model.rejectionFinalizers == nil {
+		model.rejectionFinalizers = make(map[string]rejectionFinalizer)
+	}
+	model.rejectionFinalizers[eventID] = rejectionFinalizer{
+		scope: scope, pendingKey: pendingKey, waitsForPendingDelete: waitsForPendingDelete,
+		pendingDeleted:            !waitsForPendingDelete,
+		waitsForStateSync:         model.stateStore != nil && model.stateBound,
+		mirrorConfirmationPending: mirrorConfirmationPending,
+		cleanup:                   cleanup, cleanupDone: cleanup == nil,
+		resumeRecoveries: resumeRecoveries,
+	}
+	return model.advanceRejectionFinalization(eventID)
+}
+
+// rejectedPendingJournal finds the exact save-ahead row after eventSent has
+// cleared its in-memory pendingSend but before the asynchronous Delete result is
+// reduced. Matching both event ID and session prevents a late rejection from
+// waiting on (or deleting) a newer event in the same stable task scope.
+func (model Model) rejectedPendingJournal(eventID, sessionKey string) (stateRecordKey, bool) {
+	if eventID == "" || sessionKey == "" {
+		return stateRecordKey{}, false
+	}
+	for key, payload := range model.stateSynced {
+		if key.kind != workerStatePendingSendKind {
+			continue
+		}
+		var persisted persistedPendingSend
+		if err := json.Unmarshal([]byte(payload), &persisted); err != nil ||
+			validatePersistedPendingSend(key.scope, persisted) != nil {
+			continue
+		}
+		if persisted.Event.ID == eventID && persisted.Assignment.SessionKey() == sessionKey {
+			return key, true
+		}
+	}
+	return stateRecordKey{}, false
+}
+
+func (model *Model) advanceRejectionFinalization(eventID string) tea.Cmd {
+	finalizer, exists := model.rejectionFinalizers[eventID]
+	if !exists || finalizer.mirrorConfirmationPending {
+		return nil
+	}
+	if !finalizer.cleanupDone {
+		if finalizer.cleanupInFlight {
+			return nil
+		}
+		if finalizer.cleanup == nil {
+			finalizer.cleanupDone = true
+		} else {
+			finalizer.cleanupInFlight = true
+			model.rejectionFinalizers[eventID] = finalizer
+			return discardRejectedIntentsAttempt(eventID, finalizer.cleanup, 0)
+		}
+	}
+	if !finalizer.pendingDeleted ||
+		(finalizer.waitsForStateSync && !model.workerStateSynchronized()) ||
+		finalizer.confirming {
+		model.rejectionFinalizers[eventID] = finalizer
+		return nil
+	}
+	finalizer.confirming = true
+	model.rejectionFinalizers[eventID] = finalizer
+	return confirmRejectedEvent(model.client, eventID)
+}
+
+func (model *Model) settleRejectedMirrorConfirmation(eventID string) tea.Cmd {
+	finalizer, exists := model.rejectionFinalizers[eventID]
+	if !exists || !finalizer.mirrorConfirmationPending {
+		return nil
+	}
+	finalizer.mirrorConfirmationPending = false
+	// Cleanup deliberately starts only after the old RecordDeliveryIntents
+	// command has returned. It therefore removes both pre-existing intents and
+	// anything that command may just have recreated.
+	finalizer.cleanupDone = finalizer.cleanup == nil
+	finalizer.cleanupInFlight = false
+	model.rejectionFinalizers[eventID] = finalizer
+	return model.advanceRejectionFinalization(eventID)
+}
+
+func (model *Model) completeRejectedIntentCleanup(eventID string) tea.Cmd {
+	finalizer, exists := model.rejectionFinalizers[eventID]
+	if !exists {
+		return confirmRejectedEvent(model.client, eventID)
+	}
+	finalizer.cleanupDone = true
+	finalizer.cleanupInFlight = false
+	model.rejectionFinalizers[eventID] = finalizer
+	return model.advanceRejectionFinalization(eventID)
+}
+
+func (model *Model) completeRejectedPendingDelete(key stateRecordKey) tea.Cmd {
+	commands := make([]tea.Cmd, 0, 1)
+	for eventID, finalizer := range model.rejectionFinalizers {
+		if !finalizer.waitsForPendingDelete || finalizer.pendingKey != key {
+			continue
+		}
+		finalizer.pendingDeleted = true
+		model.rejectionFinalizers[eventID] = finalizer
+		if command := model.advanceRejectionFinalization(eventID); command != nil {
+			commands = append(commands, command)
+		}
+	}
+	if len(commands) == 0 {
+		return nil
+	}
+	return tea.Batch(commands...)
+}
+
+func (model *Model) advanceRejectionFinalizations() tea.Cmd {
+	commands := make([]tea.Cmd, 0, len(model.rejectionFinalizers))
+	for eventID := range model.rejectionFinalizers {
+		if command := model.advanceRejectionFinalization(eventID); command != nil {
+			commands = append(commands, command)
+		}
+	}
+	if len(commands) == 0 {
+		return nil
+	}
+	return tea.Batch(commands...)
+}
+
+func (model *Model) finishRejectionFinalization(eventID string) tea.Cmd {
+	finalizer, exists := model.rejectionFinalizers[eventID]
+	if !exists {
+		return nil
+	}
+	delete(model.rejectionFinalizers, eventID)
+	if finalizer.resumeRecoveries {
+		if model.pending.kind != pendingNone || model.active != nil {
+			// Another operator action may have entered the local outbox while mirror
+			// cleanup or rejected-inbox confirmation was retrying. Keep the drain
+			// obligation until that action reaches a stable boundary.
+			model.recoveryDrainPaused = true
+			return nil
+		}
+		model.recoveryDrainPaused = false
+		return model.resumePendingRecovery()
+	}
+	return nil
+}
+
+// finalizePreviouslyRejectedPending repairs the legacy crash window where a
+// rejected-inbox tombstone could commit before the worker-state pending row was
+// deleted. SendEvent then correctly refuses to resurrect the event. Treat that
+// refusal as the same terminal rejection barrier: preserve any operator draft,
+// remove mirror provenance, delete the stale journal, and only then perform the
+// idempotent inbox confirmation before draining later recovered events.
+func (model *Model) finalizePreviouslyRejectedPending() tea.Cmd {
+	pending := model.pending
+	if pending.kind == pendingNone || pending.event.ID == "" {
+		return nil
+	}
+	eventID := pending.event.ID
+	sessionKey := pending.assignment.SessionKey()
+	pendingKey := pendingSendStateKey(pending)
+	_, stateSynced := model.stateSynced[pendingKey]
+	_, stateManaged := model.stateManaged[pendingKey]
+	waitsForDelete := model.stateStore != nil && model.stateBound &&
+		(stateSynced || stateManaged)
+
+	var intentCleanup tea.Cmd
+	if len(pending.event.ToolCalls) > 0 {
+		intentCleanup = model.discardIntentCommand(
+			pending.assignment, pending.event.ToolCalls, "previously rejected durable event",
+		)
+	}
+	if pending.kind == pendingDelivery && intentCleanup == nil {
+		intentCleanup = unavailableIntentCleanup(
+			"durable workspace delivery intent cleanup is unavailable",
+		)
+	}
+
+	if pending.context != nil {
+		model.lastContext = cloneAssignment(pending.context)
+		model.invalidateChat()
+	}
+	var remainder persistedDraft
+	remainderPresent := false
+	if model.active != nil && model.active.SessionKey() == sessionKey {
+		remainder = model.remainingDraftAfterSend(pending.kind)
+		remainderPresent = persistedDraftHasContent(remainder)
+		delete(model.stateDrafts, stateRecordKey{
+			scope: stateScope(*model.active), kind: workerStateDraftKind,
+		})
+	} else if persistedDraftHasContent(pending.remainingDraft) {
+		remainder = pending.remainingDraft
+		remainderPresent = true
+	}
+	if model.active != nil && model.active.SessionKey() == sessionKey {
+		model.active = nil
+		model.focus = focusTasks
+		model.commandConfirm = ""
+		model.composing = false
+		model.input = ""
+		model.toolCallIDs = nil
+		model.detailMode = false
+	}
+	if model.delivery.sessionKey == sessionKey {
+		model.delivery = deliveryReview{}
+	}
+	if model.hasContinuationOrigin(sessionKey) {
+		model.removeContinuationOrigin(sessionKey)
+	}
+	if model.taskSyncWait && (pending.kind == pendingTasks || model.active == nil) {
+		model.taskSyncWait = false
+		model.taskDirty = pending.kind == pendingTasks
+	}
+
+	model.pending = pendingSend{}
+	draftEvicted := false
+	draft, hasDraft := model.rejectedDraftFromPending(pending)
+	if remainderPresent {
+		if editor, ok := rejectedDraftFromPersisted(pending.assignment, remainder); ok {
+			if hasDraft {
+				draft = mergeRejectedDraft(&draft, editor)
+			} else {
+				draft = editor
+				hasDraft = true
+			}
+		}
+	}
+	if hasDraft {
+		draftEvicted = model.installRejectedDraft(draft)
+	}
+	model.removeQueuedSession(sessionKey)
+	delete(model.recoveredSessions, sessionKey)
+	model.rememberHandledRejection(eventID)
+	if pending.kind == pendingDelivery {
+		model.status = "workspace delivery was already rejected; stale recovery journal is being removed"
+	} else {
+		model.status = "response was already rejected; draft restored and stale recovery journal is being removed"
+		if draftEvicted {
+			model.status += " · oldest saved draft evicted at the 32-scope limit"
+		}
+	}
+	return model.beginRejectionFinalization(
+		eventID, rejectedDraftScopeKey(pending.assignment), pendingKey, waitsForDelete, false, intentCleanup,
+		pending.recovered || model.recoveryDrainPaused,
+	)
 }
 
 // finalizeRejectedEvent preserves the rejected inbox as the durable recovery
@@ -4190,6 +5567,39 @@ func discardRejectedIntentsAttempt(eventID string, cleanup tea.Cmd, attempt int)
 	return tea.Tick(rejectionRetryDelay(attempt), func(time.Time) tea.Msg { return run() })
 }
 
+func discardPendingDeliveryIntentsAttempt(
+	eventID string,
+	namespace string,
+	reason string,
+	cleanup tea.Cmd,
+	attempt int,
+) tea.Cmd {
+	run := func() tea.Msg {
+		if cleanup == nil {
+			return pendingDeliveryIntentsDiscarded{
+				eventID: eventID, namespace: namespace, reason: reason, attempt: attempt,
+				err: errors.New("workspace intent cleanup is unavailable"),
+			}
+		}
+		message := cleanup()
+		result, ok := message.(mirrorIntentsDiscarded)
+		if !ok {
+			return pendingDeliveryIntentsDiscarded{
+				eventID: eventID, namespace: namespace, reason: reason, attempt: attempt,
+				retry: cleanup, err: fmt.Errorf("workspace intent cleanup returned %T", message),
+			}
+		}
+		return pendingDeliveryIntentsDiscarded{
+			eventID: eventID, namespace: namespace, reason: reason, attempt: attempt,
+			retry: cleanup, err: result.err,
+		}
+	}
+	if attempt == 0 {
+		return run
+	}
+	return tea.Tick(rejectionRetryDelay(attempt), func(time.Time) tea.Msg { return run() })
+}
+
 func confirmRejectedEventAttempt(client Client, eventID string, attempt int) tea.Cmd {
 	confirm := func() tea.Msg {
 		return rejectedEventConfirmed{
@@ -4213,22 +5623,6 @@ func rejectionRetryDelay(attempt int) time.Duration {
 		}
 	}
 	return delay
-}
-
-func sendDeliveryEvent(client Client, assignment completion.Assignment, event completion.Event) tea.Cmd {
-	if event.ID == "" {
-		id, err := canonical.NewOpaqueID("event_")
-		if err != nil {
-			return func() tea.Msg { return deliveryEventSent{sessionKey: assignment.SessionKey(), err: err} }
-		}
-		event.ID = id
-	}
-	return func() tea.Msg {
-		return deliveryEventSent{
-			sessionKey: assignment.SessionKey(),
-			err:        client.SendEvent(context.Background(), assignment, event),
-		}
-	}
 }
 
 func requestPreview(request canonical.Request) string {

@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,7 +20,7 @@ func TestLiveWorkspaceSaveDrainsAfterResponseOutbox(t *testing.T) {
 	}{
 		{name: "accept commit", kind: pendingAccept},
 		{name: "reply commit", kind: pendingReply, autoSend: true},
-		{name: "command outbox failure", kind: pendingCommand, sendError: errors.New("outbox unavailable")},
+		{name: "command outbox failure", kind: pendingCommand, sendError: definitelyNotStored("outbox unavailable")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			model, assignment, namespace, events := liveWorkspaceGenerationFixture(t, test.autoSend)
@@ -138,10 +137,12 @@ func TestLiveWorkspaceWatchDuringConfirmCannotSuppressExactSend(t *testing.T) {
 	if send == nil || model.delivery.stage != deliverySending {
 		t.Fatalf("durable confirmation result was suppressed: %+v", model.delivery)
 	}
-	client.sendErr = errors.New("outbox unavailable")
+	client.sendErr = definitelyNotStored("outbox unavailable")
 	updated, _ = model.Update(commandResult(t, send))
 	model = updated.(Model)
-	if model.delivery.stage != deliveryConfirmed || !model.mirrorDirty[namespace] || model.active == nil {
+	if model.delivery.stage != deliveryConfirmed || !model.mirrorDirty[namespace] || model.active == nil ||
+		model.pending.kind != pendingDelivery || model.pending.durable ||
+		model.pending.eventID != confirmedEventID {
 		t.Fatalf("failed outbox lost exact confirmed event or queued save: %+v", model)
 	}
 
@@ -161,6 +162,50 @@ func TestLiveWorkspaceWatchDuringConfirmCannotSuppressExactSend(t *testing.T) {
 	if got := client.events[1].ToolCalls[0].Input["content"]; got != "v1" {
 		t.Fatalf("confirmed payload changed under a newer save: %#v", got)
 	}
+}
+
+func TestRejectedScopeFinalizerBlocksManualAndAutomaticMirrorConfirmation(t *testing.T) {
+	t.Run("manual preview enter", func(t *testing.T) {
+		model, assignment, _, _ := liveWorkspaceGenerationFixture(t, false)
+		updated, review := model.startMirrorReview()
+		model = updated.(Model)
+		updated, _ = model.Update(commandResult(t, review))
+		model = updated.(Model)
+		updated, _ = model.previewMirrorDelivery()
+		model = updated.(Model)
+		if model.delivery.stage != deliveryPreviewed {
+			t.Fatalf("manual delivery was not previewed: %+v", model.delivery)
+		}
+		model.rejectionFinalizers["event-earlier-rejected"] = rejectionFinalizer{
+			scope: rejectedDraftScopeKey(assignment), cleanupInFlight: true,
+		}
+
+		updated, command := model.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+		model = updated.(Model)
+		if command != nil || model.pending.kind != pendingNone ||
+			model.delivery.stage != deliveryPreviewed {
+			t.Fatalf("manual confirmation crossed rejected-scope finalizer: %+v", model)
+		}
+	})
+
+	t.Run("automatic review callback", func(t *testing.T) {
+		model, assignment, namespace, _ := liveWorkspaceGenerationFixture(t, true)
+		generation := model.requireMirrorReview(namespace)
+		model.mirrorReviewing[namespace] = generation
+		reviewed := commandResult(t, reviewMirrorAutomatically(
+			model.mirrors[namespace], assignment, generation,
+		))
+		model.rejectionFinalizers["event-earlier-rejected"] = rejectionFinalizer{
+			scope: rejectedDraftScopeKey(assignment), cleanupInFlight: true,
+		}
+
+		updated, command := model.Update(reviewed)
+		model = updated.(Model)
+		if command != nil || model.pending.kind != pendingNone ||
+			model.delivery.stage != deliveryPreviewed {
+			t.Fatalf("automatic confirmation crossed rejected-scope finalizer: %+v", model)
+		}
+	})
 }
 
 func liveWorkspaceGenerationFixture(

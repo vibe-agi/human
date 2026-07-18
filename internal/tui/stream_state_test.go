@@ -10,6 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/completion/canonical"
+	workmirror "github.com/vibe-agi/human/internal/mirror"
 	"github.com/vibe-agi/human/internal/workerclient"
 	"github.com/vibe-agi/human/internal/workerproto"
 )
@@ -38,7 +39,7 @@ func TestAcceptAndRejectOutboxFailuresKeepInboxAssignment(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			client := newFakeClient()
-			client.sendErr = errors.New("outbox unavailable")
+			client.sendErr = definitelyNotStored("outbox unavailable")
 			assignment := testAssignment()
 			model := updateModel(t, New(client), networkMessage{Assignment: &assignment})
 
@@ -187,6 +188,7 @@ func TestGatewayEventRejectionClosesOnlyItsSession(t *testing.T) {
 		assignment := testAssignment()
 		model := receiveAndAccept(t, New(client), assignment)
 		model.composing = true
+		model.focus = focusTasks
 		model.input = "stale tool payload"
 		model.toolCallIDs = []string{"tool-stale"}
 
@@ -194,9 +196,10 @@ func TestGatewayEventRejectionClosesOnlyItsSession(t *testing.T) {
 			CallerID: assignment.CallerID, IdempotencyKey: assignment.IdempotencyKey,
 			EventID: "late-progress", Message: "completion session is already closed",
 		}})
-		if model.active != nil || model.focus != focusTasks || model.composing ||
-			model.input != "" || len(model.toolCallIDs) != 0 || model.detailMode {
-			t.Fatalf("matching rejection left an expired active session: %+v", model)
+		if model.active != nil || model.focus != focusTasks || !model.composing ||
+			model.input != "stale tool payload" ||
+			!reflect.DeepEqual(model.toolCallIDs, []string{"tool-stale"}) || model.detailMode {
+			t.Fatalf("matching rejection did not close the session and preserve its draft: %+v", model)
 		}
 	})
 
@@ -412,7 +415,8 @@ func TestDurableRejectedInboxColdStartRestoresToolDraftKinds(t *testing.T) {
 			},
 			assert: func(t *testing.T, model Model, draft rejectedDraftState) {
 				if !draft.hasTools || draft.toolInput != `custom_tool {"path":"notes.txt"}` ||
-					!reflect.DeepEqual(draft.toolCallIDs, []string{"tool-cold-custom"}) ||
+					len(draft.toolCallIDs) != 1 || draft.toolCallIDs[0] == "tool-cold-custom" ||
+					!strings.HasPrefix(draft.toolCallIDs[0], "tool_") ||
 					!model.composing || model.input != draft.toolInput || model.focus != focusTasks {
 					t.Fatalf("advanced draft = %+v, model = %+v", draft, model)
 				}
@@ -733,7 +737,8 @@ func TestRejectedAdvancedBashCallWithExtraArgumentsDoesNotLoseThemInCommandPane(
 	model = updateModel(t, model, rejectedMessage(assignment, event))
 	if model.commandInput != "" || !model.composing ||
 		model.input != `bash {"command":"sleep 1","timeout":5}` ||
-		!reflect.DeepEqual(model.toolCallIDs, []string{"tool-advanced-bash"}) ||
+		len(model.toolCallIDs) != 1 || model.toolCallIDs[0] == "tool-advanced-bash" ||
+		!strings.HasPrefix(model.toolCallIDs[0], "tool_") ||
 		len(model.lastContext.Request.Messages) != beforeMessages {
 		t.Fatalf("advanced bash rejection lost its non-command arguments: %+v", model)
 	}
@@ -760,9 +765,13 @@ func TestRejectedCommittedAdvancedToolsRestoreExactComposer(t *testing.T) {
 	model = updateModel(t, model, rejectedMessage(assignment, rejectedEvent))
 	if model.active != nil || !model.composing ||
 		model.input != "search {\"query\":\"status\"}\nlookup {\"path\":\"README.md\"}" ||
-		!reflect.DeepEqual(model.toolCallIDs, []string{"tool-search-stable", "tool-lookup-stable"}) ||
+		len(model.toolCallIDs) != 2 ||
+		model.toolCallIDs[0] == "tool-search-stable" || model.toolCallIDs[1] == "tool-lookup-stable" ||
+		!strings.HasPrefix(model.toolCallIDs[0], "tool_") ||
+		!strings.HasPrefix(model.toolCallIDs[1], "tool_") ||
+		model.toolCallIDs[0] == model.toolCallIDs[1] ||
 		len(model.lastContext.Request.Messages) != beforeMessages {
-		t.Fatalf("rejected advanced tools were not restored exactly: %+v", model)
+		t.Fatalf("rejected advanced tools were not restored with fresh call IDs: %+v", model)
 	}
 }
 
@@ -916,7 +925,9 @@ func TestRejectedDraftTrayKeepsIndependentTaskScopes(t *testing.T) {
 	model.setReplyValue("first task draft")
 	updated, send := model.sendReply(completion.EventProgress, false)
 	model = finishCommand(t, updated.(Model), send)
-	model = updateModel(t, model, rejectedMessage(first, client.events[len(client.events)-1]))
+	firstRejected := client.events[len(client.events)-1]
+	model = updateModel(t, model, rejectedMessage(first, firstRejected))
+	model = updateModel(t, model, rejectedEventConfirmed{eventID: firstRejected.ID})
 
 	second := remoteStreamAssignment()
 	second.CallerID = "second-caller"
@@ -927,7 +938,9 @@ func TestRejectedDraftTrayKeepsIndependentTaskScopes(t *testing.T) {
 	model.setReplyValue("second task draft")
 	updated, send = model.sendReply(completion.EventProgress, false)
 	model = finishCommand(t, updated.(Model), send)
-	model = updateModel(t, model, rejectedMessage(second, client.events[len(client.events)-1]))
+	secondRejected := client.events[len(client.events)-1]
+	model = updateModel(t, model, rejectedMessage(second, secondRejected))
+	model = updateModel(t, model, rejectedEventConfirmed{eventID: secondRejected.ID})
 
 	firstDraft, hasFirst := model.rejectedDraftForAssignment(first)
 	secondDraft, hasSecond := model.rejectedDraftForAssignment(second)
@@ -1245,7 +1258,7 @@ func TestCommandAndTaskSendFailuresRestorePreSendTranscript(t *testing.T) {
 		model = updateModel(t, model, tea.KeyPressMsg{Code: tea.KeyTab})
 		model = updateModel(t, model, tea.KeyPressMsg{Text: "pwd", Code: 0})
 		before := cloneAssignment(model.lastContext)
-		client.sendErr = errors.New("command outbox failed")
+		client.sendErr = definitelyNotStored("command outbox failed")
 
 		model, send := updateModelWithCommand(t, model, tea.KeyPressMsg{Code: tea.KeyEnter})
 		if send == nil || model.pending.kind != pendingCommand || model.active != nil {
@@ -1268,7 +1281,7 @@ func TestCommandAndTaskSendFailuresRestorePreSendTranscript(t *testing.T) {
 		model = updateModel(t, model, tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift})
 		model = enterTaskDraft(t, model, "keep this task")
 		before := cloneAssignment(model.lastContext)
-		client.sendErr = errors.New("task outbox failed")
+		client.sendErr = definitelyNotStored("task outbox failed")
 
 		model, send := updateModelWithCommand(t, model, tea.KeyPressMsg{Code: 's', Mod: tea.ModCtrl})
 		if send == nil || model.pending.kind != pendingTasks || model.active != nil {
@@ -1321,7 +1334,7 @@ func TestSameSessionReplayDoesNotBreakFileDeliverySending(t *testing.T) {
 
 	model = updateModel(t, model, networkMessage{Assignment: &replayed})
 	if model.delivery.stage != deliverySending || model.delivery.assignment.LeaseOwner != "replacement-lease" ||
-		model.active != nil || model.pending.kind != pendingNone || len(model.continueIDs) != 1 {
+		model.active != nil || model.pending.kind != pendingDelivery || len(model.continueIDs) != 1 {
 		t.Fatalf("same-session replay broke delivery sending: %+v", model)
 	}
 
@@ -1394,7 +1407,7 @@ func assertTranscriptEqual(t *testing.T, got, want *completion.Assignment, opera
 func stageSyntheticDelivery(
 	t *testing.T,
 	client *fakeClient,
-) (Model, completion.Assignment, completion.ToolCall, deliveryEventSent) {
+) (Model, completion.Assignment, completion.ToolCall, eventSent) {
 	t.Helper()
 	assignment := workspaceAssignment(canonical.Request{Messages: []canonical.Message{{
 		Role:   canonical.RoleUser,
@@ -1412,6 +1425,18 @@ func stageSyntheticDelivery(
 		stage: deliveryConfirming, sessionKey: assignment.SessionKey(), namespace: namespace,
 		calls: []completion.ToolCall{call}, eventID: "event-file-delivery", generation: 1,
 	}
+	model.pending = pendingSend{
+		kind: pendingDelivery, eventID: "event-file-delivery", assignment: assignment,
+		context: cloneAssignment(model.lastContext), toolCalls: []completion.ToolCall{call},
+		event: completion.Event{
+			ID: "event-file-delivery", Type: completion.EventToolCalls,
+			ToolCalls: []completion.ToolCall{call},
+		},
+		durable: true, deliveryNamespace: namespace, deliveryGeneration: 1,
+		deliveryChanges: []workmirror.Change{{
+			Kind: workmirror.ChangeWrite, Path: "new.txt", NewContent: []byte("new"),
+		}},
+	}
 
 	model, send := updateModelWithCommand(t, model, mirrorConfirmationReady{
 		sessionKey: assignment.SessionKey(), namespace: namespace, generation: 1,
@@ -1422,9 +1447,9 @@ func stageSyntheticDelivery(
 		t.Fatalf("file delivery was not staged: %+v", model)
 	}
 	message := commandResult(t, send)
-	ack, ok := message.(deliveryEventSent)
+	ack, ok := message.(eventSent)
 	if !ok {
-		t.Fatalf("file delivery command returned %T, want deliveryEventSent", message)
+		t.Fatalf("file delivery command returned %T, want eventSent", message)
 	}
 	if ack.err != nil || len(client.events) != 1 || client.events[0].Type != completion.EventToolCalls {
 		t.Fatalf("file delivery acknowledgement/events = %+v / %+v", ack, client.events)

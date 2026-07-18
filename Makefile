@@ -1,8 +1,9 @@
-.PHONY: all build test fault-test real-opencode-tui-test real-opencode-network-test release-build release-semantics-test fmt fmt-check tidy-check vet check
+.PHONY: all build test fault-test real-opencode-tui-test real-opencode-network-test release-build release-semantics-test release-build-contract-test fmt fmt-check tidy-check vet check
 
-GO_FILES := $(shell git ls-files '*.go')
+GO_FILES := $(shell git ls-files --cached --others --exclude-standard -- '*.go')
 FAULT_COUNT ?= 1
 REAL_COUNT ?= 1
+REAL_NETWORK_DROPS ?= 5
 
 all: check
 
@@ -20,14 +21,17 @@ real-opencode-tui-test:
 	HUMAN_REAL_OPENCODE_TUI_E2E=1 go test -count=$(REAL_COUNT) -timeout=2m ./local -run '^TestRealOpenCodeTUIWorkspaceLoop$$' -v
 
 real-opencode-network-test:
-	HUMAN_REAL_OPENCODE_NETWORK_E2E=1 go test -count=$(REAL_COUNT) -timeout=2m ./local -run '^TestRealOpenCodeRecoversAcrossNetworkFaultMatrix$$' -v
+	HUMAN_REAL_OPENCODE_NETWORK_E2E=1 HUMAN_REAL_OPENCODE_NETWORK_DROPS=$(REAL_NETWORK_DROPS) go test -count=$(REAL_COUNT) -timeout=8m ./local -run '^TestRealOpenCodeRecoversAcrossNetworkFaultMatrix$$' -v
 
 release-build:
 	test -n "$(VERSION)"
-	VERSION="$(VERSION)" COMMIT="$$(git rev-parse HEAD)" ./scripts/build-release.sh
+	VERSION="$(VERSION)" COMMIT="$$(git rev-parse HEAD)" BUILD_DATE="$$(git show -s --format=%cI HEAD)" ./scripts/build-release.sh
 
 release-semantics-test:
 	./scripts/github-release-flags_test.sh
+
+release-build-contract-test:
+	./scripts/build-release-contract-test.sh
 
 fmt:
 	gofmt -w $(GO_FILES)
@@ -42,4 +46,4 @@ tidy-check:
 vet:
 	go vet ./...
 
-check: fmt-check tidy-check build test vet release-semantics-test
+check: fmt-check tidy-check build test vet release-semantics-test release-build-contract-test

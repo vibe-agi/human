@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -27,9 +28,10 @@ import (
 )
 
 // TestRealOpenCodeRecoversAcrossNetworkFaultMatrix is the real-client transport
-// matrix. A controlled reverse proxy aborts the first Workspace request before
+// matrix. A controlled reverse proxy aborts the Workspace request before
 // downstream response headers, after the stream-start frame, or after a complete
-// Human progress frame. OpenCode must retry the byte-identical request, the
+// Human progress frame. Each point is repeated one to five times according to
+// HUMAN_REAL_OPENCODE_NETWORK_DROPS. OpenCode must retry the byte-identical request, the
 // gateway must replay the same durable response rather than enqueueing a second
 // assignment, and the original Human turn must finish without duplicate text.
 //
@@ -49,14 +51,24 @@ func TestRealOpenCodeRecoversAcrossNetworkFaultMatrix(t *testing.T) {
 	if err != nil || strings.TrimSpace(string(version)) != adapter.OpenCodeVersion {
 		t.Skipf("requires opencode %s; got %q (%v)", adapter.OpenCodeVersion, strings.TrimSpace(string(version)), err)
 	}
+	drops := 1
+	if raw := strings.TrimSpace(os.Getenv("HUMAN_REAL_OPENCODE_NETWORK_DROPS")); raw != "" {
+		parsed, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || parsed < 1 || parsed > 5 {
+			t.Fatalf("HUMAN_REAL_OPENCODE_NETWORK_DROPS must be an integer from 1 through 5; got %q", raw)
+		}
+		drops = parsed
+	}
 
 	scenarios := []realOpenCodeNetworkScenario{
-		{name: "before downstream response headers", point: faultBeforeResponseHeaders},
-		{name: "after stream start frame", point: faultAfterStreamStart},
-		{name: "after Human progress frame", point: faultAfterHumanProgress},
+		{name: "before downstream response headers", point: faultBeforeResponseHeaders, drops: drops},
+		{name: "after stream start frame", point: faultAfterStreamStart, drops: drops},
+		{name: "after Human progress frame", point: faultAfterHumanProgress, drops: drops},
 	}
 	for _, scenario := range scenarios {
+		scenario := scenario
 		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
 			runRealOpenCodeNetworkScenario(t, binary, scenario)
 		})
 	}
@@ -73,6 +85,7 @@ const (
 type realOpenCodeNetworkScenario struct {
 	name  string
 	point realOpenCodeNetworkFaultPoint
+	drops int
 }
 
 func runRealOpenCodeNetworkScenario(t *testing.T, binary string, scenario realOpenCodeNetworkScenario) {
@@ -82,21 +95,33 @@ func runRealOpenCodeNetworkScenario(t *testing.T, binary string, scenario realOp
 	callerWorkspace := filepath.Join(root, "caller-workspace")
 	mirrorRoot := filepath.Join(root, "human-mirrors")
 	privateRoot := filepath.Join(root, "private")
+	home := filepath.Join(root, "opencode-home")
 	configHome := filepath.Join(root, "opencode-config")
 	dataHome := filepath.Join(root, "opencode-data")
-	for _, directory := range []string{callerWorkspace, mirrorRoot, privateRoot, configHome, dataHome} {
+	stateHome := filepath.Join(root, "opencode-state")
+	cacheHome := filepath.Join(root, "opencode-cache")
+	temporaryHome := filepath.Join(root, "opencode-tmp")
+	for _, directory := range []string{
+		callerWorkspace, mirrorRoot, privateRoot, home, configHome, dataHome, stateHome, cacheHome, temporaryHome,
+	} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	runContext, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	// OpenCode backs off between transport retries. Keep the normal one-drop gate
+	// fast, but give an explicitly requested five-drop probe enough response time
+	// to test the client retry ceiling instead of accidentally testing our short
+	// fixture deadline.
+	runTimeout := 75*time.Second + time.Duration(scenario.drops-1)*30*time.Second
+	maxPending := runTimeout - 15*time.Second
+	runContext, cancel := context.WithTimeout(context.Background(), runTimeout)
 	defer cancel()
 	instance, err := Open(runContext, Config{
 		Gateway: gateway.Config{
 			DatabasePath:      filepath.Join(privateRoot, "gateway.db"),
 			HeartbeatInterval: 100 * time.Millisecond,
-			MaxPending:        60 * time.Second,
+			MaxPending:        maxPending,
 		},
 		Worker: worker.Config{
 			MirrorRoot: mirrorRoot,
@@ -155,7 +180,14 @@ func runRealOpenCodeNetworkScenario(t *testing.T, binary string, scenario realOp
 		"--model", "human-network-e2e/human", "--dir", callerWorkspace,
 		"Let the Human operator drive this turn. Wait for streamed replies and finish only when the Human ends the response.")
 	command.Dir = callerWorkspace
-	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_DATA_HOME="+dataHome)
+	command.Env = append(os.Environ(),
+		"HOME="+home,
+		"XDG_CONFIG_HOME="+configHome,
+		"XDG_DATA_HOME="+dataHome,
+		"XDG_STATE_HOME="+stateHome,
+		"XDG_CACHE_HOME="+cacheHome,
+		"TMPDIR="+temporaryHome,
+	)
 	type commandResult struct {
 		output []byte
 		err    error
@@ -303,12 +335,13 @@ type faultProxyAttempt struct {
 }
 
 type openCodeNetworkFaultState struct {
-	point  realOpenCodeNetworkFaultPoint
-	marker []byte
+	point      realOpenCodeNetworkFaultPoint
+	marker     []byte
+	dropTarget int
 
 	mu             sync.Mutex
 	attempts       []*faultProxyAttempt
-	dropped        *faultProxyAttempt
+	dropped        []*faultProxyAttempt
 	replayed       *faultProxyAttempt
 	dropObserved   chan struct{}
 	replayObserved chan struct{}
@@ -337,6 +370,7 @@ func newOpenCodeNetworkFaultProxy(
 	state := &openCodeNetworkFaultState{
 		point:          scenario.point,
 		marker:         marker,
+		dropTarget:     scenario.drops,
 		dropObserved:   make(chan struct{}),
 		replayObserved: make(chan struct{}),
 	}
@@ -453,7 +487,8 @@ func (state *openCodeNetworkFaultState) recordResponse(attempt *faultProxyAttemp
 	state.mu.Lock()
 	attempt.statusCode = status
 	attempt.idempotencyKey = idempotencyKey
-	if state.dropped != nil && state.replayed == nil && attempt != state.dropped && attempt.digest == state.dropped.digest {
+	if len(state.dropped) == state.dropTarget && state.replayed == nil &&
+		attempt.digest == state.dropped[0].digest {
 		state.replayed = attempt
 		close(state.replayObserved)
 	}
@@ -463,18 +498,25 @@ func (state *openCodeNetworkFaultState) recordResponse(attempt *faultProxyAttemp
 func (state *openCodeNetworkFaultState) markDropped(attempt *faultProxyAttempt) bool {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.dropped != nil {
+	if len(state.dropped) >= state.dropTarget {
 		return false
 	}
-	state.dropped = attempt
-	close(state.dropObserved)
+	for _, dropped := range state.dropped {
+		if dropped == attempt {
+			return false
+		}
+	}
+	state.dropped = append(state.dropped, attempt)
+	if len(state.dropped) == state.dropTarget {
+		close(state.dropObserved)
+	}
 	return true
 }
 
 func (state *openCodeNetworkFaultState) injectionAvailable() bool {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	return state.dropped == nil
+	return len(state.dropped) < state.dropTarget
 }
 
 func (proxy *openCodeNetworkFaultProxy) waitForDrop(t *testing.T, ctx context.Context) {
@@ -500,35 +542,39 @@ func (proxy *openCodeNetworkFaultProxy) assertExactReplay(t *testing.T) {
 	state := proxy.state
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.dropped == nil || state.replayed == nil {
-		t.Fatal("fault proxy did not observe both the dropped response and its replay")
+	if len(state.dropped) != state.dropTarget || state.replayed == nil {
+		t.Fatalf("fault proxy observed %d/%d dropped responses and replay=%t", len(state.dropped), state.dropTarget, state.replayed != nil)
 	}
-	if state.dropped.digest != state.replayed.digest {
-		t.Fatal("OpenCode retry body differed from the dropped request")
-	}
-	if state.dropped.sessionID == "" || state.replayed.sessionID == "" {
-		t.Fatal("OpenCode omitted X-Session-Id on the dropped request or replay")
-	}
-	if state.dropped.sessionID != state.replayed.sessionID {
-		t.Fatalf("OpenCode retry changed X-Session-Id: %q != %q", state.dropped.sessionID, state.replayed.sessionID)
-	}
-	if state.dropped.idempotencyKey == "" || state.replayed.idempotencyKey == "" {
-		t.Fatal("gateway omitted the durable idempotency key on drop or replay")
-	}
-	if state.dropped.idempotencyKey != state.replayed.idempotencyKey {
-		t.Fatalf("gateway replay changed idempotency key: %q != %q", state.dropped.idempotencyKey, state.replayed.idempotencyKey)
-	}
-	if state.dropped.statusCode != http.StatusOK || state.replayed.statusCode != http.StatusOK {
-		t.Fatalf("drop/replay statuses = %d/%d; want 200/200", state.dropped.statusCode, state.replayed.statusCode)
+	first := state.dropped[0]
+	for index, dropped := range state.dropped {
+		if dropped.digest != first.digest || dropped.digest != state.replayed.digest {
+			t.Fatalf("OpenCode retry body differed at dropped attempt %d", index+1)
+		}
+		if dropped.sessionID == "" || state.replayed.sessionID == "" {
+			t.Fatal("OpenCode omitted X-Session-Id on a dropped request or replay")
+		}
+		if dropped.sessionID != first.sessionID || dropped.sessionID != state.replayed.sessionID {
+			t.Fatalf("OpenCode retry changed X-Session-Id at dropped attempt %d", index+1)
+		}
+		if dropped.idempotencyKey == "" || state.replayed.idempotencyKey == "" {
+			t.Fatal("gateway omitted the durable idempotency key on a drop or replay")
+		}
+		if dropped.idempotencyKey != first.idempotencyKey || dropped.idempotencyKey != state.replayed.idempotencyKey {
+			t.Fatalf("gateway replay changed idempotency key at dropped attempt %d", index+1)
+		}
+		if dropped.statusCode != http.StatusOK || state.replayed.statusCode != http.StatusOK {
+			t.Fatalf("drop/replay statuses at attempt %d = %d/%d; want 200/200", index+1, dropped.statusCode, state.replayed.statusCode)
+		}
 	}
 	matchingAttempts := 0
 	for _, attempt := range state.attempts {
-		if attempt.digest == state.dropped.digest {
+		if attempt.digest == first.digest {
 			matchingAttempts++
 		}
 	}
-	if matchingAttempts != 2 {
-		t.Fatalf("OpenCode sent the dropped semantic request %d times; want initial request plus one replay", matchingAttempts)
+	wantAttempts := state.dropTarget + 1
+	if matchingAttempts != wantAttempts {
+		t.Fatalf("OpenCode sent the dropped semantic request %d times; want %d drops plus one successful replay", matchingAttempts, state.dropTarget)
 	}
 }
 

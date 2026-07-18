@@ -63,13 +63,20 @@ func DefaultConfig() (Config, error) {
 }
 
 // Worker owns the network client, durable outbox, optional TUI state store,
-// and one Bubble Tea model. A Worker supports one active Tea program at a time.
+// and one Bubble Tea model. A Worker owns exactly one Bubble Tea program
+// lifetime; open a new Worker to start another program after Run returns.
 type Worker struct {
 	client    *workerclient.Client
 	state     *workerstate.Store
 	model     tea.Model
+	lifecycle context.Context
+	cancel    context.CancelFunc
 	runMu     sync.Mutex
 	running   bool
+	ran       bool
+	closed    bool
+	runCancel context.CancelFunc
+	runDone   chan struct{}
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -107,23 +114,26 @@ func Open(ctx context.Context, config Config) (*Worker, error) {
 		return nil, errors.New("open worker: state path must be absolute")
 	}
 
+	lifecycle, cancelLifecycle := context.WithCancel(ctx)
 	var stateStore *workerstate.Store
 	var err error
 	if !config.DisableState {
-		stateStore, err = workerstate.Open(ctx, config.StatePath)
+		stateStore, err = workerstate.Open(lifecycle, config.StatePath)
 		if err != nil {
+			cancelLifecycle()
 			return nil, fmt.Errorf("open worker state: %w", err)
 		}
 	}
 	var client *workerclient.Client
 	if strings.TrimSpace(config.OutboxScope) == "" {
-		client, err = workerclient.DialWithOutbox(ctx, config.GatewayURL, config.Token, config.OutboxPath)
+		client, err = workerclient.DialWithOutbox(lifecycle, config.GatewayURL, config.Token, config.OutboxPath)
 	} else {
 		client, err = workerclient.DialWithOutboxScope(
-			ctx, config.GatewayURL, config.Token, config.OutboxPath, config.OutboxScope,
+			lifecycle, config.GatewayURL, config.Token, config.OutboxPath, config.OutboxScope,
 		)
 	}
 	if err != nil {
+		cancelLifecycle()
 		if stateStore != nil {
 			_ = stateStore.Close()
 		}
@@ -137,9 +147,11 @@ func Open(ctx context.Context, config Config) (*Worker, error) {
 		options = append(options, tui.WithStateStore(stateStore))
 	}
 	return &Worker{
-		client: client,
-		state:  stateStore,
-		model:  tui.New(client, options...),
+		client:    client,
+		state:     stateStore,
+		model:     tui.New(client, options...),
+		lifecycle: lifecycle,
+		cancel:    cancelLifecycle,
 	}, nil
 }
 
@@ -150,10 +162,16 @@ func (worker *Worker) Model() tea.Model {
 	}
 	worker.runMu.Lock()
 	defer worker.runMu.Unlock()
+	if worker.closed {
+		return nil
+	}
 	return worker.model
 }
 
-// Run starts the stock Bubble Tea program and returns its final model.
+// Run starts the stock Bubble Tea program and returns its final model. It is
+// deliberately single-use: Bubble Tea commands may still be unwinding when a
+// forced program exit returns, so reusing the same model would let callbacks
+// from the old program mutate the new one. Open a new Worker for another run.
 func (worker *Worker) Run(ctx context.Context, options ...tea.ProgramOption) (tea.Model, error) {
 	if worker == nil {
 		return nil, errors.New("run worker: worker is not open")
@@ -166,19 +184,42 @@ func (worker *Worker) Run(ctx context.Context, options ...tea.ProgramOption) (te
 		worker.runMu.Unlock()
 		return nil, errors.New("run worker: worker is not open")
 	}
+	if worker.closed {
+		worker.runMu.Unlock()
+		return nil, errors.New("run worker: worker is closed")
+	}
 	if worker.running {
 		worker.runMu.Unlock()
 		return nil, errors.New("run worker: a Bubble Tea program is already active")
 	}
+	if worker.ran {
+		worker.runMu.Unlock()
+		return nil, errors.New("run worker: Worker.Run is single-use; open a new Worker")
+	}
+	worker.ran = true
 	worker.running = true
 	model := worker.model
+	runContext, cancelRun := context.WithCancel(ctx)
+	lifecycle := worker.lifecycle
+	if lifecycle == nil {
+		lifecycle = context.Background()
+	}
+	stopLifecycle := context.AfterFunc(lifecycle, cancelRun)
+	runDone := make(chan struct{})
+	worker.runCancel = cancelRun
+	worker.runDone = runDone
 	worker.runMu.Unlock()
 	defer func() {
+		stopLifecycle()
+		cancelRun()
 		worker.runMu.Lock()
 		worker.running = false
+		worker.runCancel = nil
+		close(runDone)
+		worker.runDone = nil
 		worker.runMu.Unlock()
 	}()
-	options = append([]tea.ProgramOption{tea.WithContext(ctx)}, options...)
+	options = append([]tea.ProgramOption{tea.WithContext(runContext)}, options...)
 	final, err := tea.NewProgram(model, options...).Run()
 	if final != nil {
 		worker.runMu.Lock()
@@ -188,20 +229,36 @@ func (worker *Worker) Run(ctx context.Context, options ...tea.ProgramOption) (te
 	return final, err
 }
 
-// Close stops network recovery and closes worker-local durable stores.
+// Close cancels and waits for an active Run, then stops network recovery and
+// closes worker-local durable stores. It is safe to call more than once.
 func (worker *Worker) Close() error {
 	if worker == nil {
 		return nil
 	}
 	worker.closeOnce.Do(func() {
+		worker.runMu.Lock()
+		worker.closed = true
+		if worker.cancel != nil {
+			worker.cancel()
+		}
+		cancelRun := worker.runCancel
+		runDone := worker.runDone
+		if cancelRun != nil {
+			cancelRun()
+		}
+		worker.runMu.Unlock()
+		if runDone != nil {
+			<-runDone
+		}
+
+		var closeErrors []error
 		if worker.client != nil {
-			worker.closeErr = worker.client.Close()
+			closeErrors = append(closeErrors, worker.client.Close())
 		}
 		if worker.state != nil {
-			if err := worker.state.Close(); worker.closeErr == nil {
-				worker.closeErr = err
-			}
+			closeErrors = append(closeErrors, worker.state.Close())
 		}
+		worker.closeErr = errors.Join(closeErrors...)
 	})
 	return worker.closeErr
 }

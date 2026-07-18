@@ -37,6 +37,7 @@ func NewGatewayCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use: "gateway", Short: "run the standalone Human Agent gateway",
 		SilenceUsage: true, SilenceErrors: true,
+		Args: cobra.NoArgs,
 		PersistentPreRunE: func(command *cobra.Command, _ []string) error {
 			if configFlag := command.Flag("config"); configFlag != nil && configFlag.Value.String() != "" {
 				settings.Set("config", configFlag.Value.String())
@@ -152,6 +153,7 @@ func newTokenCommand(settings *viper.Viper) *cobra.Command {
 	command := &cobra.Command{Use: "token", Short: "issue and revoke API tokens"}
 	issue := &cobra.Command{
 		Use: "issue", Short: "issue a caller or worker token",
+		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			subject := strings.TrimSpace(settings.GetString("token.subject"))
 			if !completion.IsStableKey(subject) {
@@ -179,6 +181,7 @@ func newTokenCommand(settings *viper.Viper) *cobra.Command {
 
 	revoke := &cobra.Command{
 		Use: "revoke", Short: "revoke an API token by key id",
+		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			keyID := strings.TrimSpace(settings.GetString("token.key_id"))
 			if !completion.IsStableKey(keyID) {

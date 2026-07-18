@@ -5,9 +5,10 @@ version="${VERSION:-}"
 commit="${COMMIT:-unknown}"
 build_date="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 dist="${DIST:-dist}"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 version="${version#v}"
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+if ! "$root/scripts/github-release-flags.sh" "v$version" >/dev/null 2>&1; then
   echo "VERSION must be a release SemVer such as 0.1.0 or 0.1.0-rc.1" >&2
   exit 2
 fi
@@ -19,8 +20,18 @@ if [[ -z "$build_date" ]]; then
   echo "BUILD_DATE is required" >&2
   exit 2
 fi
+if [[ "$commit" != "unknown" ]]; then
+  actual_commit="$(git -C "$root" rev-parse HEAD 2>/dev/null || true)"
+  if [[ "$actual_commit" != "$commit" ]]; then
+    echo "COMMIT does not match the source checkout HEAD" >&2
+    exit 2
+  fi
+  if [[ -n "$(git -C "$root" status --porcelain=v1 --untracked-files=normal)" ]]; then
+    echo "release source checkout is dirty; commit or remove every source change before building" >&2
+    exit 2
+  fi
+fi
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dist="$(mkdir -p "$dist" && cd "$dist" && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -77,6 +88,11 @@ done
     sha256sum "${artifacts[@]}" > checksums.txt
   else
     shasum -a 256 "${artifacts[@]}" > checksums.txt
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum --check checksums.txt >/dev/null
+  else
+    shasum -a 256 --check checksums.txt >/dev/null
   fi
 )
 

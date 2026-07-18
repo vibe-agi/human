@@ -37,7 +37,7 @@ import (
 
 const (
 	localBackupFormat          = "human-local-backup"
-	localBackupVersion         = 1
+	localBackupVersion         = 2
 	localBackupManifestPath    = "manifest.json"
 	maxLocalBackupManifestSize = 4 << 20
 	maxLocalBackupEntries      = 100_000
@@ -284,11 +284,24 @@ func createLocalBackup(ctx context.Context, paths localBackupPaths, archivePath 
 
 	var skipped []localBackupSkipped
 	for _, tree := range []struct {
-		source, destination, logical string
+		callerRoot, source, destination, logical string
 	}{
-		{filepath.Join(paths.MirrorRoot, paths.CallerSubject), filepath.Join(stage, "mirror", "workspaces"), "mirror/workspaces"},
-		{filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject), filepath.Join(stage, "mirror", "state"), "mirror/state"},
+		{
+			filepath.Join(paths.MirrorRoot, paths.CallerSubject),
+			filepath.Join(paths.MirrorRoot, paths.CallerSubject, paths.WorkspaceKey),
+			filepath.Join(stage, "mirror", "workspace"),
+			"mirror/workspace",
+		},
+		{
+			filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject),
+			filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, paths.WorkspaceKey),
+			filepath.Join(stage, "mirror", "state"),
+			"mirror/state",
+		},
 	} {
+		if err := validateLocalMirrorCallerRoot(tree.callerRoot, true); err != nil {
+			return localBackupSummary{}, err
+		}
 		if err := copyMirrorTree(tree.source, tree.destination, tree.logical, &skipped); err != nil {
 			return localBackupSummary{}, err
 		}
@@ -713,6 +726,30 @@ func copyMirrorTree(source, destination, logical string, skipped *[]localBackupS
 	})
 }
 
+func validateLocalMirrorCallerRoot(root string, allowMissing bool) error {
+	info, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) && allowMissing {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect local mirror caller root %s: %w", root, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("local mirror caller root %s must be a directory, not a symlink or special file", root)
+	}
+	return nil
+}
+
+func ensureLocalMirrorCallerRoot(root string) error {
+	if err := os.MkdirAll(filepath.Dir(root), 0o700); err != nil {
+		return fmt.Errorf("create local mirror caller parent: %w", err)
+	}
+	if err := os.Mkdir(root, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create local mirror caller root: %w", err)
+	}
+	return validateLocalMirrorCallerRoot(root, false)
+}
+
 func buildLocalBackupManifest(stage string, paths localBackupPaths, skipped []localBackupSkipped) (localBackupManifest, int64, error) {
 	gatewayIdentity, err := localGatewayIdentity(paths.GatewayDB)
 	if err != nil {
@@ -1045,7 +1082,7 @@ func validateLocalBackupManifest(manifest localBackupManifest) error {
 	}
 	required := map[string]string{
 		"gateway": "gateway/gateway.db", "credentials": "credentials/credentials.json",
-		"outbox": "worker/worker-outbox.db", "mirror-workspaces": "mirror/workspaces",
+		"outbox": "worker/worker-outbox.db", "mirror-workspace": "mirror/workspace",
 		"mirror-state": "mirror/state",
 	}
 	if manifest.StateEnabled {
@@ -1112,7 +1149,7 @@ func validateLocalBackupManifest(manifest localBackupManifest) error {
 			if entry.Type != "file" || entry.SQLite || entry.Mode != 0o600 {
 				return errors.New("backup credentials component must be one mode-0600 non-SQLite file")
 			}
-		case "mirror-workspaces", "mirror-state":
+		case "mirror-workspace", "mirror-state":
 			if entry.Type != "directory" || entry.SQLite {
 				return fmt.Errorf("backup %s component must be a directory", component)
 			}
@@ -1129,7 +1166,7 @@ func validateLocalBackupManifest(manifest localBackupManifest) error {
 			return fmt.Errorf("invalid skipped mirror path: %w", err)
 		}
 		if len(skipped.Reason) > maxLocalBackupReasonBytes ||
-			(!strings.HasPrefix(skipped.Path, "mirror/workspaces/") && !strings.HasPrefix(skipped.Path, "mirror/state/")) ||
+			(!strings.HasPrefix(skipped.Path, "mirror/workspace/") && !strings.HasPrefix(skipped.Path, "mirror/state/")) ||
 			strings.TrimSpace(skipped.Reason) == "" {
 			return errors.New("backup skipped entries must be explained mirror paths")
 		}
@@ -1286,10 +1323,10 @@ func allowedLocalBackupPath(value string) bool {
 	switch value {
 	case "gateway", "gateway/gateway.db", "credentials", "credentials/credentials.json",
 		"worker", "worker/worker-outbox.db", "worker/worker-state.db",
-		"mirror", "mirror/workspaces", "mirror/state":
+		"mirror", "mirror/workspace", "mirror/state":
 		return true
 	default:
-		return strings.HasPrefix(value, "mirror/workspaces/") || strings.HasPrefix(value, "mirror/state/")
+		return strings.HasPrefix(value, "mirror/workspace/") || strings.HasPrefix(value, "mirror/state/")
 	}
 }
 

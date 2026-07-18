@@ -52,7 +52,7 @@ func TestLocalBackupVerifyRestoreRoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(paths.MirrorRoot, paths.CallerSubject, "workspace-one", "draft.txt"), []byte("mutated"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(paths.MirrorRoot, paths.CallerSubject, paths.WorkspaceKey, "draft.txt"), []byte("mutated"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	for _, sidecar := range []string{paths.GatewayDB + "-wal", paths.OutboxDB + "-journal", paths.StateDB + "-shm"} {
@@ -79,11 +79,11 @@ func TestLocalBackupVerifyRestoreRoundTrip(t *testing.T) {
 	if err != nil || !found || credentials.Active == nil || credentials.Active.Caller.SubjectID != "caller" {
 		t.Fatalf("restored credentials = %+v found=%v err=%v", credentials, found, err)
 	}
-	draft, err := os.ReadFile(filepath.Join(paths.MirrorRoot, paths.CallerSubject, "workspace-one", "draft.txt"))
+	draft, err := os.ReadFile(filepath.Join(paths.MirrorRoot, paths.CallerSubject, paths.WorkspaceKey, "draft.txt"))
 	if err != nil || string(draft) != "draft\n" {
 		t.Fatalf("restored draft = %q, %v", draft, err)
 	}
-	baseline, err := os.ReadFile(filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, "workspace-one", "baseline.json"))
+	baseline, err := os.ReadFile(filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, paths.WorkspaceKey, "baseline.json"))
 	if err != nil || string(baseline) != "{}\n" {
 		t.Fatalf("restored baseline = %q, %v", baseline, err)
 	}
@@ -94,6 +94,224 @@ func TestLocalBackupVerifyRestoreRoundTrip(t *testing.T) {
 		if _, err := os.Lstat(sidecar); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("stale SQLite sidecar remains at %s: %v", sidecar, err)
 		}
+	}
+}
+
+func TestLocalBackupAndForceRestoreIsolateSelectedWorkspace(t *testing.T) {
+	paths := newLocalBackupFixture(t)
+	otherWorkspace := "workspace-other"
+	otherWorktree := filepath.Join(paths.MirrorRoot, paths.CallerSubject, otherWorkspace)
+	otherState := filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, otherWorkspace)
+	if err := os.MkdirAll(otherWorktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(otherState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherWorktree, "other-only.txt"), []byte("other before backup\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherState, "other-baseline.json"), []byte("{\"other\":\"before\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	archive := filepath.Join(t.TempDir(), "local.tar.gz")
+	summary, err := createLocalBackup(context.Background(), paths, archive, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantEntries := map[string]bool{
+		"mirror/workspace":           false,
+		"mirror/workspace/draft.txt": false,
+		"mirror/state":               false,
+		"mirror/state/baseline.json": false,
+	}
+	for _, entry := range summary.Manifest.Entries {
+		if _, wanted := wantEntries[entry.Path]; wanted {
+			wantEntries[entry.Path] = true
+		}
+		if strings.Contains(entry.Path, otherWorkspace) ||
+			strings.HasSuffix(entry.Path, "/other-only.txt") ||
+			strings.HasSuffix(entry.Path, "/other-baseline.json") {
+			t.Fatalf("backup manifest leaked sibling workspace entry %q", entry.Path)
+		}
+	}
+	for entry, found := range wantEntries {
+		if !found {
+			t.Fatalf("backup manifest is missing selected workspace entry %q", entry)
+		}
+	}
+	extracted := t.TempDir()
+	if _, err := extractAndVerifyLocalBackup(context.Background(), archive, extracted); err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{
+		filepath.Join(extracted, "mirror", "workspace", "other-only.txt"),
+		filepath.Join(extracted, "mirror", "state", "other-baseline.json"),
+	} {
+		if _, err := os.Lstat(leaked); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("verified archive extracted sibling workspace path %s: %v", leaked, err)
+		}
+	}
+
+	selectedWorktree := filepath.Join(paths.MirrorRoot, paths.CallerSubject, paths.WorkspaceKey)
+	selectedState := filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, paths.WorkspaceKey)
+	if err := os.WriteFile(filepath.Join(selectedWorktree, "draft.txt"), []byte("selected mutated\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(selectedWorktree, "stale.txt"), []byte("remove on restore\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(selectedState, "baseline.json"), []byte("{\"selected\":\"mutated\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherWorktree, "other-only.txt"), []byte("other after backup\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherState, "other-baseline.json"), []byte("{\"other\":\"after\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherWorktree, "destination-only.txt"), []byte("must survive force restore\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherState, "destination-only.json"), []byte("{\"survive\":true}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantOtherWorktreeDigest, err := digestRestoreTree(otherWorktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOtherStateDigest, err := digestRestoreTree(otherState)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	locks, err := acquireStoppedLocal(paths, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, restoreErr := restoreLocalBackup(context.Background(), paths, archive, true, false)
+	closeErr := locks.Close()
+	if restoreErr != nil || closeErr != nil {
+		t.Fatalf("force restore=%v close=%v", restoreErr, closeErr)
+	}
+	if got, err := os.ReadFile(filepath.Join(selectedWorktree, "draft.txt")); err != nil || string(got) != "draft\n" {
+		t.Fatalf("selected workspace draft = %q, %v", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(selectedWorktree, "stale.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("selected workspace stale file survived replacement: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(selectedState, "baseline.json")); err != nil || string(got) != "{}\n" {
+		t.Fatalf("selected workspace state = %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(otherWorktree, "other-only.txt")); err != nil || string(got) != "other after backup\n" {
+		t.Fatalf("sibling workspace draft was disturbed = %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(otherState, "other-baseline.json")); err != nil || string(got) != "{\"other\":\"after\"}\n" {
+		t.Fatalf("sibling workspace state was disturbed = %q, %v", got, err)
+	}
+	gotOtherWorktreeDigest, err := digestRestoreTree(otherWorktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotOtherStateDigest, err := digestRestoreTree(otherState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOtherWorktreeDigest != wantOtherWorktreeDigest || gotOtherStateDigest != wantOtherStateDigest {
+		t.Fatalf("force restore disturbed sibling workspace: worktree %q -> %q, state %q -> %q",
+			wantOtherWorktreeDigest, gotOtherWorktreeDigest, wantOtherStateDigest, gotOtherStateDigest)
+	}
+}
+
+func TestLocalRestoreWithoutForceIgnoresNonemptySiblingWorkspace(t *testing.T) {
+	source := newLocalBackupFixture(t)
+	archive := filepath.Join(t.TempDir(), "local.tar.gz")
+	if _, err := createLocalBackup(context.Background(), source, archive, false); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	workspaceRoot := filepath.Join(root, "workspace")
+	if err := os.Mkdir(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(workspaceRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	destination := localBackupPaths{
+		WorkspaceRoot: workspaceRoot,
+		WorkspaceKey:  source.WorkspaceKey,
+		GatewayDB:     filepath.Join(data, "gateway.db"),
+		Credentials:   filepath.Join(data, "credentials.json"),
+		MirrorRoot:    filepath.Join(root, "mirror"),
+		OutboxDB:      filepath.Join(data, "outbox.db"),
+		StateDB:       filepath.Join(data, "state.db"),
+		CallerSubject: source.CallerSubject,
+		WorkerSubject: source.WorkerSubject,
+	}
+	otherWorkspace := "workspace-other"
+	otherWorktree := filepath.Join(destination.MirrorRoot, destination.CallerSubject, otherWorkspace)
+	otherState := filepath.Join(destination.MirrorRoot, ".human-state", destination.CallerSubject, otherWorkspace)
+	if err := os.MkdirAll(otherWorktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(otherState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherWorktree, "keep.txt"), []byte("keep sibling worktree\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherState, "keep.json"), []byte("{\"keep\":true}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantWorktreeDigest, err := digestRestoreTree(otherWorktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStateDigest, err := digestRestoreTree(otherState)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	locks, err := acquireStoppedLocal(destination, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, restoreErr := restoreLocalBackup(context.Background(), destination, archive, false, false)
+	closeErr := locks.Close()
+	if restoreErr != nil || closeErr != nil {
+		t.Fatalf("non-force restore with only sibling workspace populated=%v close=%v", restoreErr, closeErr)
+	}
+	selectedDraft := filepath.Join(destination.MirrorRoot, destination.CallerSubject, destination.WorkspaceKey, "draft.txt")
+	if got, err := os.ReadFile(selectedDraft); err != nil || string(got) != "draft\n" {
+		t.Fatalf("selected workspace draft = %q, %v", got, err)
+	}
+	gotWorktreeDigest, err := digestRestoreTree(otherWorktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotStateDigest, err := digestRestoreTree(otherState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotWorktreeDigest != wantWorktreeDigest || gotStateDigest != wantStateDigest {
+		t.Fatalf("non-force restore disturbed sibling workspace: worktree %q -> %q, state %q -> %q",
+			wantWorktreeDigest, gotWorktreeDigest, wantStateDigest, gotStateDigest)
+	}
+}
+
+func TestLocalBackupRejectsPreviousWorkspaceWideFormat(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "v1.tar.gz")
+	writeManifestOnlyBackup(t, archive, localBackupManifest{
+		Format: localBackupFormat, Version: 1, CreatedAt: time.Now().UTC(),
+		WorkspaceScope: "workspace-test", GatewayIdentity: testLocalGatewayIdentity,
+		CallerSubject: "caller", WorkerSubject: "worker",
+	})
+	if _, err := extractAndVerifyLocalBackup(context.Background(), archive, t.TempDir()); err == nil ||
+		!strings.Contains(err.Error(), "unsupported local backup") {
+		t.Fatalf("previous workspace-wide backup archive error = %v", err)
 	}
 }
 
@@ -216,7 +434,7 @@ func TestSQLiteBackupSnapshotIncludesCommittedWAL(t *testing.T) {
 
 func TestLocalBackupRecordsMirrorSymlinkWithoutFollowingIt(t *testing.T) {
 	paths := newLocalBackupFixture(t)
-	link := filepath.Join(paths.MirrorRoot, paths.CallerSubject, "workspace-one", "outside-link")
+	link := filepath.Join(paths.MirrorRoot, paths.CallerSubject, paths.WorkspaceKey, "outside-link")
 	if err := os.Symlink(filepath.Join(t.TempDir(), "outside"), link); err != nil {
 		if runtime.GOOS == "windows" {
 			t.Skip("creating symlinks requires an optional Windows privilege")
@@ -228,7 +446,7 @@ func TestLocalBackupRecordsMirrorSymlinkWithoutFollowingIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "mirror/workspaces/workspace-one/outside-link"
+	want := "mirror/workspace/outside-link"
 	if len(summary.Manifest.Skipped) != 1 || summary.Manifest.Skipped[0].Path != want {
 		t.Fatalf("skipped = %+v, want %s", summary.Manifest.Skipped, want)
 	}
@@ -239,6 +457,69 @@ func TestLocalBackupRecordsMirrorSymlinkWithoutFollowingIt(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(extracted, filepath.FromSlash(want))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("symlink was restored into verified tree: %v", err)
 	}
+}
+
+func TestLocalBackupAndRestoreRejectSymlinkedCallerRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks requires an optional Windows privilege")
+	}
+	t.Run("backup", func(t *testing.T) {
+		paths := newLocalBackupFixture(t)
+		callerRoot := filepath.Join(paths.MirrorRoot, paths.CallerSubject)
+		outside := filepath.Join(t.TempDir(), "outside-caller")
+		if err := os.MkdirAll(filepath.Join(outside, paths.WorkspaceKey), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(callerRoot); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, callerRoot); err != nil {
+			t.Fatal(err)
+		}
+		_, err := createLocalBackup(context.Background(), paths, filepath.Join(t.TempDir(), "local.tar.gz"), false)
+		if err == nil || !strings.Contains(err.Error(), "caller root") || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("backup with symlinked caller root error = %v", err)
+		}
+	})
+	t.Run("restore", func(t *testing.T) {
+		paths := newLocalBackupFixture(t)
+		archive := filepath.Join(t.TempDir(), "local.tar.gz")
+		if _, err := createLocalBackup(context.Background(), paths, archive, false); err != nil {
+			t.Fatal(err)
+		}
+		callerRoot := filepath.Join(paths.MirrorRoot, paths.CallerSubject)
+		outside := filepath.Join(t.TempDir(), "outside-caller")
+		if err := os.Mkdir(outside, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(outside, "sentinel"), []byte("outside\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(callerRoot); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, callerRoot); err != nil {
+			t.Fatal(err)
+		}
+		locks, err := acquireStoppedLocal(paths, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, restoreErr := restoreLocalBackup(context.Background(), paths, archive, true, false)
+		closeErr := locks.Close()
+		if restoreErr == nil || !strings.Contains(restoreErr.Error(), "caller root") || !strings.Contains(restoreErr.Error(), "symlink") {
+			t.Fatalf("restore with symlinked caller root error = %v", restoreErr)
+		}
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if got, err := os.ReadFile(filepath.Join(outside, "sentinel")); err != nil || string(got) != "outside\n" {
+			t.Fatalf("restore touched symlink destination = %q, %v", got, err)
+		}
+		if _, err := os.Lstat(filepath.Join(outside, paths.WorkspaceKey)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("restore created selected workspace through caller symlink: %v", err)
+		}
+	})
 }
 
 func TestLocalBackupDetectsCorruptionAndPathTraversal(t *testing.T) {
@@ -299,7 +580,7 @@ func TestLocalBackupManifestRejectsCoreSemanticSubstitution(t *testing.T) {
 			{Path: "worker", Type: "directory", Mode: 0o700},
 			{Path: "worker/worker-outbox.db", Type: "file", SHA256: strings.Repeat("0", 64), Mode: 0o600, SQLite: true},
 			{Path: "mirror", Type: "directory", Mode: 0o700},
-			{Path: "mirror/workspaces", Type: "directory", Mode: 0o700},
+			{Path: "mirror/workspace", Type: "directory", Mode: 0o700},
 			{Path: "mirror/state", Type: "directory", Mode: 0o700},
 		},
 	}
@@ -726,13 +1007,13 @@ func prepareRestoreBoundaryFixture(t *testing.T) (localBackupPaths, localRestore
 		}
 	}
 	if err := os.WriteFile(
-		filepath.Join(paths.MirrorRoot, paths.CallerSubject, "workspace-one", "draft.txt"),
+		filepath.Join(paths.MirrorRoot, paths.CallerSubject, paths.WorkspaceKey, "draft.txt"),
 		[]byte("before-resume\n"), 0o600,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(
-		filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, "workspace-one", "baseline.json"),
+		filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, paths.WorkspaceKey, "baseline.json"),
 		[]byte("{\"before\":true}\n"), 0o600,
 	); err != nil {
 		t.Fatal(err)
@@ -823,8 +1104,8 @@ func newLocalBackupFixture(t *testing.T) localBackupPaths {
 		t.Fatal(err)
 	}
 	bindFixtureCredentials(t, paths.GatewayDB, testCredentialState())
-	worktree := filepath.Join(paths.MirrorRoot, paths.CallerSubject, "workspace-one")
-	state := filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, "workspace-one")
+	worktree := filepath.Join(paths.MirrorRoot, paths.CallerSubject, paths.WorkspaceKey)
+	state := filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, paths.WorkspaceKey)
 	if err := os.MkdirAll(worktree, 0o700); err != nil {
 		t.Fatal(err)
 	}

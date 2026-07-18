@@ -90,6 +90,17 @@ func TestWorkerStateSchemaRejectsUnpublishedDatabaseShapes(t *testing.T) {
 				VALUES ('worker-state', 2, 'human-worker-state-v1-20260717');`,
 		},
 		{
+			name: "previous release candidate marker",
+			ddl: `
+				CREATE TABLE worker_state_schema (
+				  component TEXT PRIMARY KEY,
+				  version INTEGER NOT NULL,
+				  fingerprint TEXT NOT NULL
+				);
+				INSERT INTO worker_state_schema (component, version, fingerprint)
+				VALUES ('worker-state', 3, 'human-worker-state-v3-20260718');`,
+		},
+		{
 			name: "wrong fingerprint",
 			ddl: `
 				CREATE TABLE worker_state_schema (

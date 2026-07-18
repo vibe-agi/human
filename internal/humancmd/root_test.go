@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/vibe-agi/human/internal/userdata"
 )
@@ -34,6 +35,77 @@ func TestRootHasNoImplicitWorkerInvocation(t *testing.T) {
 		if command.Flags().Lookup(name) != nil {
 			t.Fatalf("removed top-level worker flag %q remains", name)
 		}
+	}
+}
+
+func TestEveryRunnableCommandRejectsPositionalArguments(t *testing.T) {
+	t.Parallel()
+	var visit func(*cobra.Command)
+	visit = func(command *cobra.Command) {
+		if command.Run != nil || command.RunE != nil {
+			if command.Args == nil {
+				t.Errorf("runnable command %q has no positional-argument gate", command.CommandPath())
+			} else if err := command.Args(command, []string{"unexpected"}); err == nil {
+				t.Errorf("runnable command %q accepts an unexpected positional argument", command.CommandPath())
+			}
+		}
+		for _, child := range command.Commands() {
+			visit(child)
+		}
+	}
+	visit(New())
+}
+
+func TestMisspelledSubcommandsAndExtraArgumentsStopBeforeRun(t *testing.T) {
+	testCases := []struct {
+		name string
+		path []string
+		arg  string
+	}{
+		{name: "gateway misspelled subcommand", path: []string{"gateway"}, arg: "backup"},
+		{name: "gateway token issue extra argument", path: []string{"gateway", "token", "issue"}, arg: "extra"},
+		{name: "gateway token revoke extra argument", path: []string{"gateway", "token", "revoke"}, arg: "extra"},
+		{name: "worker extra argument", path: []string{"worker"}, arg: "extra"},
+		{name: "local misspelled subcommand", path: []string{"local"}, arg: "restroe"},
+		{name: "local credentials extra argument", path: []string{"local", "credentials"}, arg: "extra"},
+		{name: "shim extra argument", path: []string{"shim"}, arg: "extra"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := New()
+			target, remaining, err := root.Find(testCase.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(remaining) != 0 {
+				t.Fatalf("find %v left arguments %v", testCase.path, remaining)
+			}
+
+			// Stand in for the service/database side effect at the very start of
+			// RunE. The positional-argument gate must reject before this code can
+			// be reached.
+			marker := filepath.Join(t.TempDir(), "runtime-entered.db")
+			ran := false
+			target.Run = nil
+			target.RunE = func(_ *cobra.Command, _ []string) error {
+				ran = true
+				return os.WriteFile(marker, []byte("entered"), 0o600)
+			}
+
+			root.SetOut(&bytes.Buffer{})
+			root.SetErr(&bytes.Buffer{})
+			root.SetArgs(append(append([]string(nil), testCase.path...), testCase.arg))
+			err = root.ExecuteContext(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "unknown command") {
+				t.Fatalf("unexpected argument error = %v", err)
+			}
+			if ran {
+				t.Fatal("runnable command was entered despite an unexpected positional argument")
+			}
+			if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+				t.Fatalf("runtime side-effect marker exists or could not be checked: %v", statErr)
+			}
+		})
 	}
 }
 

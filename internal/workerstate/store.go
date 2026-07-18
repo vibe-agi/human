@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	workerStateSchemaVersion     = 3
-	workerStateSchemaFingerprint = "human-worker-state-v3-20260718"
+	workerStateSchemaVersion     = 4
+	workerStateSchemaFingerprint = "human-worker-state-v4-20260718"
 )
 
 var errUnsupportedWorkerStateSchema = errors.New("unsupported worker state schema; recreate database")
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS worker_state_schema (
   fingerprint TEXT NOT NULL
 );
 INSERT INTO worker_state_schema (component, version, fingerprint)
-VALUES ('worker-state', 3, 'human-worker-state-v3-20260718')
+VALUES ('worker-state', 4, 'human-worker-state-v4-20260718')
 ON CONFLICT(component) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS worker_state_sequence (

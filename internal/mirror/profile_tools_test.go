@@ -248,6 +248,135 @@ func TestRecordedOpenCodeDeliveryAdvancesSentBaselineAndKeepsNewerHumanDraft(t *
 	if err != nil || len(pending) != 1 || string(pending[0].OldContent) != string(v1) {
 		t.Fatalf("restarted baseline = %+v, %v", pending, err)
 	}
+	ledgerID := resultLedgerID(profile, call.ID)
+	realDigest := workspace.state.Results[ledgerID]
+	if realDigest == "" || realDigest == discardedToolResultDigest {
+		t.Fatalf("reconciled result digest = %q", realDigest)
+	}
+	if err := workspace.DiscardToolIntents([]completion.ToolCall{call}, &profile); err != nil {
+		t.Fatalf("cleanup racing after an already-linearized result did not converge: %v", err)
+	}
+	if got := workspace.state.Results[ledgerID]; got != realDigest {
+		t.Fatalf("late cleanup replaced real result digest %q with %q", realDigest, got)
+	}
+}
+
+func TestDeliveryToolDigestIncludesNamespace(t *testing.T) {
+	t.Parallel()
+	plain := completion.ToolCall{
+		ID: "call-1", Name: "edit", Input: map[string]any{"path": "file.txt"},
+	}
+	namespaced := plain
+	namespaced.Namespace = "evil"
+	plainDigest, err := deliveryToolCallDigest(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespacedDigest, err := deliveryToolCallDigest(namespaced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plainDigest == namespacedDigest {
+		t.Fatalf("tool-call digest ignored namespace: %q", plainDigest)
+	}
+	useDigest, err := deliveryToolUseDigest(canonical.Block{
+		Type: canonical.BlockToolUse, ToolCallID: namespaced.ID,
+		ToolNamespace: namespaced.Namespace, ToolName: namespaced.Name, Input: namespaced.Input,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if useDigest != namespacedDigest {
+		t.Fatalf("tool-use digest = %q, want namespaced call digest %q", useDigest, namespacedDigest)
+	}
+}
+
+func TestNamespacedLookalikeCannotConfirmRecordedDelivery(t *testing.T) {
+	t.Parallel()
+	workspace, err := Open(t.TempDir(), "caller", "namespace-recorded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []byte("old\n")
+	if err := workspace.Hydrate("file.txt", baseline, callerfs.Fingerprint(baseline)); err != nil {
+		t.Fatal(err)
+	}
+	updated := []byte("reviewed\n")
+	if err := os.WriteFile(filepath.Join(workspace.Dir(), "file.txt"), updated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := workspace.Review()
+	if err != nil || len(changes) != 1 {
+		t.Fatalf("review = %+v, %v", changes, err)
+	}
+	callerRoot := t.TempDir()
+	profile := adapter.OpenCode11718Profile()
+	delivery, err := BuildToolCallsForProfile(changes, &profile, callerRoot)
+	if err != nil || len(delivery.Calls) != 1 {
+		t.Fatalf("delivery = %+v, %v", delivery, err)
+	}
+	if err := workspace.RecordDeliveryIntents(changes, delivery.Calls, &profile, callerRoot); err != nil {
+		t.Fatal(err)
+	}
+	call := delivery.Calls[0]
+	request := profileToolResultRequest(
+		call.ID, call.Name, call.Input, "Edit applied successfully.", false,
+	)
+	request.Messages[0].Blocks[0].ToolNamespace = "evil"
+	reconciled, err := workspace.ReconcileRequestForProfile(request, &profile, callerRoot)
+	if err != nil || len(reconciled.Confirmed) != 0 || len(reconciled.Failed) != 0 ||
+		len(reconciled.Warnings) != 0 {
+		t.Fatalf("namespaced result = %+v, %v", reconciled, err)
+	}
+	if got := workspace.state.Entries["file.txt"].Fingerprint; got != callerfs.Fingerprint(baseline) {
+		t.Fatalf("namespaced lookalike advanced recorded baseline to %q", got)
+	}
+	ledgerID := resultLedgerID(profile, call.ID)
+	if _, processed := workspace.state.Results[ledgerID]; processed {
+		t.Fatalf("namespaced lookalike consumed result ledger %q", ledgerID)
+	}
+	if _, pending := workspace.state.Deliveries[ledgerID]; !pending {
+		t.Fatalf("namespaced lookalike consumed recorded delivery %q", ledgerID)
+	}
+}
+
+func TestNamespacedLookalikeCannotAdvanceFallbackBaseline(t *testing.T) {
+	t.Parallel()
+	workspace, err := Open(t.TempDir(), "caller", "namespace-fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []byte("old\n")
+	if err := workspace.Hydrate("file.txt", baseline, callerfs.Fingerprint(baseline)); err != nil {
+		t.Fatal(err)
+	}
+	updated := []byte("reviewed\n")
+	if err := os.WriteFile(filepath.Join(workspace.Dir(), "file.txt"), updated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	callerRoot := t.TempDir()
+	profile := adapter.OpenCode11718Profile()
+	request := profileToolResultRequest(
+		"edit-namespace-fallback", "edit",
+		map[string]any{
+			"filePath":  filepath.Join(callerRoot, "file.txt"),
+			"oldString": "old\n", "newString": "reviewed\n",
+		},
+		"Edit applied successfully.", false,
+	)
+	request.Messages[0].Blocks[0].ToolNamespace = "evil"
+	reconciled, err := workspace.ReconcileRequestForProfile(request, &profile, callerRoot)
+	if err != nil || len(reconciled.Confirmed) != 0 || len(reconciled.Failed) != 0 ||
+		len(reconciled.Warnings) != 0 {
+		t.Fatalf("namespaced fallback result = %+v, %v", reconciled, err)
+	}
+	if got := workspace.state.Entries["file.txt"].Fingerprint; got != callerfs.Fingerprint(baseline) {
+		t.Fatalf("namespaced lookalike advanced fallback baseline to %q", got)
+	}
+	pending, err := workspace.Review()
+	if err != nil || len(pending) != 1 || string(pending[0].NewContent) != string(updated) {
+		t.Fatalf("pending mirror change after namespaced result = %+v, %v", pending, err)
+	}
 }
 
 func TestRecordDeliveryIntentsRejectsBatchAtomically(t *testing.T) {
@@ -503,12 +632,70 @@ func TestWorkspaceToolIntentsDiscardAtomically(t *testing.T) {
 	if len(workspace.state.Deliveries) != 0 || len(workspace.state.Hydrations) != 0 {
 		t.Fatalf("discarded intent state = %+v", workspace.state)
 	}
+	for _, call := range all {
+		if got := workspace.state.Results[resultLedgerID(profile, call.ID)]; got != discardedToolResultDigest {
+			t.Fatalf("discard tombstone for %s = %q", call.ID, got)
+		}
+	}
+	if err := workspace.RecordDeliveryIntents(changes, delivery.Calls, &profile, callerRoot); err == nil {
+		t.Fatal("discarded delivery call was recorded again")
+	}
+	if err := workspace.RecordHydrationIntent("pull.txt", pull, &profile, callerRoot); err == nil {
+		t.Fatal("discarded hydration call was recorded again")
+	}
 	reopened, err := Open(mirrorRoot, "caller", "discard-intents")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(reopened.state.Deliveries) != 0 || len(reopened.state.Hydrations) != 0 {
 		t.Fatalf("durable discarded intent state = %+v", reopened.state)
+	}
+	for _, call := range all {
+		if got := reopened.state.Results[resultLedgerID(profile, call.ID)]; got != discardedToolResultDigest {
+			t.Fatalf("durable discard tombstone for %s = %q", call.ID, got)
+		}
+	}
+}
+
+func TestWorkspaceToolIntentDiscardTombstonesCallWithoutRecordedIntent(t *testing.T) {
+	t.Parallel()
+	mirrorRoot := t.TempDir()
+	workspace, err := Open(mirrorRoot, "caller", "discard-absent-intent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := adapter.HumanShimProfile()
+	call := completion.ToolCall{
+		ID: "tool-never-recorded", Name: profile.Write.Name,
+		Input: map[string]any{"path": "/workspace/file.txt", "content": "content"},
+	}
+	if err := workspace.DiscardToolIntents([]completion.ToolCall{call}, &profile); err != nil {
+		t.Fatal(err)
+	}
+	if got := workspace.state.Results[resultLedgerID(profile, call.ID)]; got != discardedToolResultDigest {
+		t.Fatalf("absent-intent discard tombstone = %q", got)
+	}
+	reopened, err := Open(mirrorRoot, "caller", "discard-absent-intent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.state.Results[resultLedgerID(profile, call.ID)]; got != discardedToolResultDigest {
+		t.Fatalf("durable absent-intent discard tombstone = %q", got)
+	}
+	late := profileToolResultRequest(
+		call.ID, call.Name, call.Input,
+		map[string]any{"ok": true, "path": "/workspace/file.txt"}, false,
+	)
+	report, err := reopened.ReconcileRequestForProfile(late, &profile, "/workspace")
+	if err != nil || len(report.Confirmed) != 0 ||
+		!strings.Contains(report.Failed[call.ID], "discarded before outbox") {
+		t.Fatalf("late result for discarded call = %+v, %v", report, err)
+	}
+	if got := reopened.state.Results[resultLedgerID(profile, call.ID)]; got != discardedToolResultDigest {
+		t.Fatalf("late result replaced discard tombstone with %q", got)
+	}
+	if len(reopened.state.Entries) != 0 {
+		t.Fatalf("late discarded result advanced baseline: %+v", reopened.state.Entries)
 	}
 }
 

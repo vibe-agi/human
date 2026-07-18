@@ -53,6 +53,7 @@ type localCredentialAuthority interface {
 func newLocalCommand(settings *viper.Viper) *cobra.Command {
 	command := &cobra.Command{
 		Use: "local", Short: "run gateway, SQLite, and Human TUI in one process",
+		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			return runLocal(command.Context(), command.OutOrStdout(), settings)
 		},
@@ -93,6 +94,7 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 	}
 	credentialsCommand := &cobra.Command{
 		Use: "credentials", Short: "print the local caller credential as JSON",
+		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			workspaceRoot, err := resolveLocalWorkspace(settings.GetString("local.workspace"))
 			if err != nil {

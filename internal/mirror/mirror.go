@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -114,10 +115,10 @@ func Open(root, callerID, workspaceKey string) (*Workspace, error) {
 	}
 	dir := filepath.Join(absolute, callerID, workspaceKey)
 	stateDir := filepath.Join(absolute, ".human-state", callerID, workspaceKey)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := makeDirectoryDurable(dir, 0o700); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Join(stateDir, "blobs"), 0o700); err != nil {
+	if err := makeDirectoryDurable(filepath.Join(stateDir, "blobs"), 0o700); err != nil {
 		return nil, err
 	}
 	workspace := &Workspace{
@@ -302,14 +303,14 @@ func (workspace *Workspace) ConfirmRename(from, to, fingerprint string) error {
 			}
 			return ErrBaselineDrift
 		}
-		if err := os.Remove(fromTarget); err != nil {
+		if err := removeDurable(fromTarget); err != nil {
 			return err
 		}
 	case fromExists && toExists:
 		// Both paths can legitimately remain after a crash between publishing
 		// the destination and removing the source. They are distinct inodes and
 		// both hashes are confirmed, so removing only the source is safe.
-		if err := os.Remove(fromTarget); err != nil {
+		if err := removeDurable(fromTarget); err != nil {
 			return err
 		}
 	}
@@ -618,7 +619,7 @@ func (workspace *Workspace) save() error {
 }
 
 func atomicWrite(path string, content []byte, mode fs.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := makeDirectoryDurable(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".human-mirror-*")
@@ -642,7 +643,10 @@ func atomicWrite(path string, content []byte, mode fs.FileMode) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
 }
 
 // atomicWriteExclusive publishes complete content without replacing an
@@ -650,7 +654,7 @@ func atomicWrite(path string, content []byte, mode fs.FileMode) error {
 // a different inode from any source file so crash recovery can distinguish a
 // duplicate copy from a case-insensitive path alias.
 func atomicWriteExclusive(path string, content []byte, mode fs.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := makeDirectoryDurable(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".human-mirror-rename-*")
@@ -674,7 +678,73 @@ func atomicWriteExclusive(path string, content []byte, mode fs.FileMode) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Link(name, path)
+	if err := os.Link(name, path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
+}
+
+func removeDurable(path string) error {
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
+}
+
+// syncDirectory makes the publication of a renamed or linked file durable.
+// Windows does not support opening directories for fsync through os.File.
+func syncDirectory(directory string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	handle, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	return errors.Join(handle.Sync(), handle.Close())
+}
+
+// makeDirectoryDurable is MkdirAll with a persistence barrier for every new
+// directory entry. Syncing only the final directory is insufficient: after a
+// power loss, an unsynced ancestor entry can disappear together with the
+// otherwise-synced mirror state below it.
+func makeDirectoryDurable(path string, mode fs.FileMode) error {
+	path = filepath.Clean(path)
+	missing := make([]string, 0, 4)
+	for current := path; ; current = filepath.Dir(current) {
+		info, err := os.Stat(current)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("mirror directory %s is not a directory", current)
+			}
+			break
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return err
+		}
+		missing = append(missing, current)
+	}
+	for index := len(missing) - 1; index >= 0; index-- {
+		directory := missing[index]
+		if err := os.Mkdir(directory, mode); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		info, err := os.Stat(directory)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("mirror directory %s is not a directory", directory)
+		}
+		if err := syncDirectory(filepath.Dir(directory)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (workspace *Workspace) changeWithWarning(change Change) Change {

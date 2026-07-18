@@ -20,6 +20,8 @@ import (
 	"github.com/vibe-agi/human/internal/completion/safety"
 )
 
+const discardedToolResultDigest = "discarded-before-outbox"
+
 type capabilityKind string
 
 const (
@@ -161,10 +163,11 @@ func (workspace *Workspace) RecordDeliveryIntents(
 
 func deliveryToolCallDigest(call completion.ToolCall) (string, error) {
 	payload, err := json.Marshal(struct {
-		ID    string         `json:"id"`
-		Name  string         `json:"name"`
-		Input map[string]any `json:"input"`
-	}{ID: call.ID, Name: call.Name, Input: call.Input})
+		ID        string         `json:"id"`
+		Namespace string         `json:"namespace"`
+		Name      string         `json:"name"`
+		Input     map[string]any `json:"input"`
+	}{ID: call.ID, Namespace: call.Namespace, Name: call.Name, Input: call.Input})
 	if err != nil {
 		return "", err
 	}
@@ -174,7 +177,7 @@ func deliveryToolCallDigest(call completion.ToolCall) (string, error) {
 
 func deliveryToolUseDigest(use canonical.Block) (string, error) {
 	return deliveryToolCallDigest(completion.ToolCall{
-		ID: use.ToolCallID, Name: use.ToolName, Input: use.Input,
+		ID: use.ToolCallID, Namespace: use.ToolNamespace, Name: use.ToolName, Input: use.Input,
 	})
 }
 
@@ -340,8 +343,12 @@ func (workspace *Workspace) RecordHydrationIntent(
 
 // DiscardToolIntents removes local provenance only after an event is known not
 // to have entered (or to have been permanently removed from) the durable
-// worker outbox. Digests prevent a stale UI callback from deleting a newer
-// intent that reused the same tool-call ID with different input.
+// worker outbox. It also writes a terminal ledger tombstone for every exact
+// call, including calls whose intent was never created. That tombstone closes
+// the cross-store crash window where mirror cleanup commits before the worker
+// pending-send row is deleted: a restart can never record and send that old
+// call again. Digests prevent a stale UI callback from deleting a newer intent
+// that reused the same tool-call ID with different input.
 func (workspace *Workspace) DiscardToolIntents(
 	calls []completion.ToolCall,
 	profile *adapter.Profile,
@@ -350,6 +357,12 @@ func (workspace *Workspace) DiscardToolIntents(
 		strings.TrimSpace(profile.HarnessVersion) == "" {
 		return errors.New("discard tool intents requires an exact adapter profile")
 	}
+	// Reconciliation holds this lock across its processed check, baseline
+	// mutation and result mark. Taking it first gives discard a single linear
+	// order with a late caller result; a sentinel can never be overwritten after
+	// cleanup has reported success.
+	workspace.reconcileMu.Lock()
+	defer workspace.reconcileMu.Unlock()
 	workspace.mu.Lock()
 	defer workspace.mu.Unlock()
 	deliveries := make(map[string]deliveryIntent, len(workspace.state.Deliveries))
@@ -360,6 +373,10 @@ func (workspace *Workspace) DiscardToolIntents(
 	for key, intent := range workspace.state.Hydrations {
 		hydrations[key] = intent
 	}
+	results := make(map[string]string, len(workspace.state.Results)+len(calls))
+	for key, digest := range workspace.state.Results {
+		results[key] = digest
+	}
 	changed := false
 	for _, call := range calls {
 		digest, err := deliveryToolCallDigest(call)
@@ -367,6 +384,7 @@ func (workspace *Workspace) DiscardToolIntents(
 			return err
 		}
 		ledgerID := resultLedgerID(*profile, call.ID)
+		_, processed := results[ledgerID]
 		if intent, exists := deliveries[ledgerID]; exists {
 			if intent.ProfileKey != profile.Key() || intent.ToolName != call.Name || intent.CallDigest != digest {
 				return errors.New("delivery intent changed before discard")
@@ -381,14 +399,26 @@ func (workspace *Workspace) DiscardToolIntents(
 			delete(hydrations, ledgerID)
 			changed = true
 		}
+		if processed {
+			// A real result that linearized before cleanup is already terminal and
+			// markResult normally removed both intents. Keep that digest rather than
+			// pretending the observed caller result was never delivered. A prior
+			// discard sentinel is simply idempotent.
+			continue
+		}
+		results[ledgerID] = discardedToolResultDigest
+		changed = true
 	}
 	if !changed {
 		return nil
 	}
-	originalDeliveries, originalHydrations := workspace.state.Deliveries, workspace.state.Hydrations
-	workspace.state.Deliveries, workspace.state.Hydrations = deliveries, hydrations
+	originalDeliveries, originalHydrations, originalResults :=
+		workspace.state.Deliveries, workspace.state.Hydrations, workspace.state.Results
+	workspace.state.Deliveries, workspace.state.Hydrations, workspace.state.Results =
+		deliveries, hydrations, results
 	if err := workspace.save(); err != nil {
-		workspace.state.Deliveries, workspace.state.Hydrations = originalDeliveries, originalHydrations
+		workspace.state.Deliveries, workspace.state.Hydrations, workspace.state.Results =
+			originalDeliveries, originalHydrations, originalResults
 		return err
 	}
 	return nil
@@ -686,6 +716,13 @@ func (workspace *Workspace) ReconcileRequestForProfile(
 			if !known {
 				continue
 			}
+			// Exact adapter profile capabilities are ordinary top-level functions.
+			// A namespaced function with the same leaf name is a distinct tool and
+			// must not confirm a recorded delivery or enter the local-content
+			// fallback reconciliation path.
+			if use.ToolNamespace != "" {
+				continue
+			}
 			capability, mapped := mappedCapability(*profile, use.ToolName)
 			if !mapped {
 				continue
@@ -699,6 +736,11 @@ func (workspace *Workspace) ReconcileRequestForProfile(
 			previous, processed := workspace.state.Results[ledgerID]
 			workspace.mu.Unlock()
 			if processed {
+				if previous == discardedToolResultDigest {
+					report.Failed[block.ToolCallID] =
+						"tool result arrived after its delivery was discarded before outbox; baseline was not advanced"
+					continue
+				}
 				if previous != digest {
 					return report, fmt.Errorf("tool result %s changed after reconciliation", block.ToolCallID)
 				}

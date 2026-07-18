@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"errors"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -107,7 +106,7 @@ func TestActivateAssignmentKeepsMalformedTaskHistoryDiagnostic(t *testing.T) {
 func TestNonTaskSendFailurePreservesPreviouslyPendingTaskHistory(t *testing.T) {
 	t.Parallel()
 	client := newFakeClient()
-	client.sendErr = errors.New("outbox failed")
+	client.sendErr = definitelyNotStored("outbox failed")
 	assignment := testAssignment()
 	assignment.Request.Tools = []canonical.Tool{{
 		Name: "bash", InputSchema: []byte(`{
