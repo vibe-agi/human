@@ -175,8 +175,14 @@ func (view memoryLLMView) FindOpenTask(affinity llm.StoreTaskAffinity) (llm.Stor
 	if err := view.unit.ensureActive(); err != nil {
 		return llm.StoreTaskRecord{}, err
 	}
+	if affinity.Caller == "" || affinity.WorkspaceKey == "" || affinity.HarnessID == "" ||
+		affinity.HarnessVersion == "" || affinity.HarnessSessionID == "" {
+		return llm.StoreTaskRecord{}, llm.ErrStoreInvalidArgument
+	}
 	for _, record := range view.unit.state.tasks {
-		if !record.State.Terminal() && memoryLLMAffinity(record) == affinity {
+		if !record.State.Terminal() &&
+			(record.CapabilityTier == llm.TierRemoteTools || record.CapabilityTier == llm.TierWorkspace) &&
+			memoryLLMAffinity(record) == affinity {
 			return cloneMemoryLLMTask(record), nil
 		}
 	}
@@ -441,7 +447,8 @@ func (tx memoryLLMTx) InsertTask(record llm.StoreTaskRecord) error {
 	if _, exists := tx.unit.state.tasks[record.Key]; exists {
 		return memoryLLMConflict(llm.StoreConstraintTaskKey, record.Key)
 	}
-	if !record.State.Terminal() {
+	if !record.State.Terminal() &&
+		(record.CapabilityTier == llm.TierRemoteTools || record.CapabilityTier == llm.TierWorkspace) {
 		for _, existing := range tx.unit.state.tasks {
 			if !existing.State.Terminal() && memoryLLMAffinity(existing) == memoryLLMAffinity(record) {
 				return memoryLLMConflict(llm.StoreConstraintOpenAffinity, record.Key)
