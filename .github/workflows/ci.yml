@@ -32,6 +32,13 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
+      - name: Core storage adapter boundary
+        run: |
+          sqlite_dependency="$(go list -deps -f '{{if eq .ImportPath "modernc.org/sqlite"}}{{.ImportPath}}{{end}}' . ./agent ./llm ./workspace ./a2a)"
+          if [ -n "$sqlite_dependency" ]; then
+            echo "core packages must not depend on the SQLite adapter" >&2
+            exit 1
+          fi
       - name: Build
         run: go build ./...
       - name: Unit and integration tests
