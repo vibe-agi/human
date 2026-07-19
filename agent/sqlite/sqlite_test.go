@@ -44,6 +44,26 @@ func TestStoreConformance(t *testing.T) {
 	})
 }
 
+func TestStoreCommitUnknownReconciliation(t *testing.T) {
+	humantest.TestAgentCommitUnknownReconciliation(t, func(
+		ctx context.Context,
+		test testing.TB,
+	) (agent.Store, framework.ReleaseFunc, error) {
+		resource, err := agentsqlite.Open(ctx, agentsqlite.Config{
+			Path: filepath.Join(test.TempDir(), "agent.db"),
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		store, err := resource.Value()
+		if err != nil {
+			_ = resource.Release(context.Background())
+			return nil, nil, err
+		}
+		return store, resource.Release, nil
+	})
+}
+
 func TestOwnedResourceReleaseAndReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agent.db")
 	resource, err := agentsqlite.Open(t.Context(), agentsqlite.Config{Path: path})

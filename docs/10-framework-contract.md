@@ -194,13 +194,17 @@ record；允许读取旧明文只能由显式 migration policy 开启。
 `humantest` 已公开 Agent Store、LLM Store、Workspace Store 以及两个 worker Journal 的
 conformance kit；两个 Journal 另有可由第三方直接调用的
 `TestAgentWorkerJournalRecovery` / `TestLLMWorkerJournalRecovery`。针对 Store 合同中
-最危险的 `ErrStoreCommitUnknown` 路径，`humantest.CommitUnknownLLMStore` 提供可组合的
-歧义提交注入（commit 已落但应答丢失 / commit 前连接丢失两种模式），
-`humantest.TestLLMServiceCommitUnknownReconciliation` 则用真实 HumanLLM core 驱动
-factory 提供的 Store，验证 admission 与 worker event 两个提交点都能按 durable identity
-对账：可疑但已提交的 admission 收敛为精确 replay 且只有一个 assignment；真丢失的
-commit 失败后同 key 精确重试成功；可疑 worker event 收敛为幂等 ACK。官方
-`llm/sqlite` 与示例 custom Store 都运行该套件。官方 SQLite adapters
+最危险的 `ErrStoreCommitUnknown` 路径，两个领域各有可组合的歧义提交注入器
+（commit 已落但应答丢失 / commit 前连接丢失两种模式）与对应的 core 级对账套件：
+`humantest.CommitUnknownLLMStore` + `TestLLMServiceCommitUnknownReconciliation` 用真实
+HumanLLM core 驱动 factory 提供的 Store，验证 admission 与 worker event 两个提交点都
+按 durable identity 对账（可疑已提交 → 精确 replay 且只有一个 assignment；真丢失 →
+同 key 精确重试成功；可疑 worker event → 幂等 ACK）；
+`humantest.CommitUnknownAgentStore` + `TestAgentCommitUnknownReconciliation` 用真实
+Agent 领域验证 command receipt 的对账语义（可疑已提交的 caller 命令精确重试重放
+receipt、不产生第二个 Task,异输入同 ID 仍冲突；真丢失后重试恰好执行一次；可疑的
+fenced worker mutation 重试不二次推进 revision/event）。官方 `llm/sqlite`、
+`agent/sqlite` 与示例 custom Store 都运行对应套件。官方 SQLite adapters
 与可用的 Memory model 运行相同的领域套件，覆盖
 callback exactly-once、rollback、strict serialization、byte ownership、limits、CAS、binding、
 receipt、release/reopen recovery 与 retention。Journal recovery kit 会跨 reopen 验证完整
