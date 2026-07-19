@@ -60,6 +60,9 @@ func newRegressionService(
 	if options.authorizer == nil {
 		options.authorizer = llm.ToolAuthorizerFunc(func(context.Context, llm.ToolAuthorization) error { return nil })
 	}
+	if options.admission == nil {
+		options.admission = llm.AdmitAll()
+	}
 	service, err := llm.NewService(t.Context(), llm.Config{
 		DeploymentID: "regression-deployment", Store: resource,
 		Codecs: options.codecs, Clock: options.clock, IDs: options.ids, Seeds: options.seeds,
@@ -304,6 +307,7 @@ func TestServiceStaticConfigurationFailureDoesNotBindStore(t *testing.T) {
 	t.Cleanup(func() { _ = release(context.Background()) })
 	_, err := llm.NewService(t.Context(), llm.Config{
 		DeploymentID: "failed-deployment", Store: framework.Borrow[llm.Store](store),
+		Admission: llm.AdmitAll(),
 		// Missing Codecs is deliberately invalid before the durable binding point.
 	})
 	if !errors.Is(err, llm.ErrInvalidServiceConfig) {
@@ -328,6 +332,7 @@ func TestServiceRejectsAndReleasesOwnedNilProtector(t *testing.T) {
 	}
 	_, err = llm.NewService(t.Context(), llm.Config{
 		DeploymentID: "owned-nil-protector", Store: framework.Borrow[llm.Store](store), Protector: resource,
+		Admission: llm.AdmitAll(),
 		Codecs: []llm.CodecRegistration{{
 			Codec: testCodec{}, StreamContentType: "text/event-stream", AggregateContentType: "application/json",
 		}},
@@ -614,6 +619,7 @@ func TestServiceRejectsBodySuppressingSuccessStatuses(t *testing.T) {
 		t.Run(fmt.Sprint(test.status), func(t *testing.T) {
 			service, err := llm.NewService(t.Context(), llm.Config{
 				DeploymentID: "status-test", Store: borrowed,
+				Admission: llm.AdmitAll(),
 				Codecs: []llm.CodecRegistration{{
 					Codec: testCodec{}, StreamContentType: "text/event-stream",
 					AggregateContentType: "application/json", SuccessStatus: test.status,

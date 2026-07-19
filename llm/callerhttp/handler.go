@@ -138,6 +138,7 @@ func (running *runtime) serveHTTP(response http.ResponseWriter, request *http.Re
 	admission, err := running.endpoint.Admit(handlerCtx, llm.AdmissionRequest{
 		CallerID: identity.CallerID, IdempotencyKey: resolution.IdempotencyKey,
 		CodecID: route.CodecID, Body: body, Task: resolution.Task,
+		CallerAttributes: identity.Attributes,
 	})
 	if err != nil {
 		if handlerCtx.Err() != nil {

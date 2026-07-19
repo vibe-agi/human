@@ -127,23 +127,22 @@ func (service *Service) Admit(ctx context.Context, input AdmissionRequest) (Admi
 	if replay, found, replayErr := service.replayAdmission(ctx, key, digest); found || replayErr != nil {
 		return replay, replayErr
 	}
-	if service.admission != nil {
-		decision, policyErr := service.admission.Admit(ctx, AdmissionContext{
-			CallerID: input.CallerID, IdempotencyKey: input.IdempotencyKey,
-			Codec:   cloneCodecDescription(registration.description),
-			Request: cloneTransportRequest(request), Task: input.Task,
-		})
-		if policyErr != nil {
-			return AdmissionResult{}, service.admissionFailure(input.CodecID, AdmissionFailure{
-				Status: 500, Code: "policy_failed", Message: "admission policy failed",
-			}, 0, policyErr)
+	policyDecision, policyErr := service.admission.Admit(ctx, AdmissionContext{
+		CallerID: input.CallerID, IdempotencyKey: input.IdempotencyKey,
+		Codec:   cloneCodecDescription(registration.description),
+		Request: cloneTransportRequest(request), Task: input.Task,
+		CallerAttributes: cloneCallerAttributes(input.CallerAttributes),
+	})
+	if policyErr != nil {
+		return AdmissionResult{}, service.admissionFailure(input.CodecID, AdmissionFailure{
+			Status: 500, Code: "policy_failed", Message: "admission policy failed",
+		}, 0, policyErr)
+	}
+	if !policyDecision.Allowed {
+		if err := policyDecision.Failure.Validate(); err != nil {
+			return AdmissionResult{}, fmt.Errorf("%w: AdmissionPolicy returned invalid denial: %v", ErrInvalidServiceConfig, err)
 		}
-		if !decision.Allowed {
-			if err := decision.Failure.Validate(); err != nil {
-				return AdmissionResult{}, fmt.Errorf("%w: AdmissionPolicy returned invalid denial: %v", ErrInvalidServiceConfig, err)
-			}
-			return AdmissionResult{}, service.admissionFailure(input.CodecID, decision.Failure, decision.RetryAfter, ErrWorkerRouteDenied)
-		}
+		return AdmissionResult{}, service.admissionFailure(input.CodecID, policyDecision.Failure, policyDecision.RetryAfter, ErrWorkerRouteDenied)
 	}
 
 	taskID := input.Task.TaskID
@@ -189,13 +188,19 @@ func (service *Service) Admit(ctx context.Context, input AdmissionRequest) (Admi
 	if err != nil {
 		status := registration.description.OverloadedStatus
 		code := "worker_unavailable"
+		message := "no Human worker can accept this request"
 		retry := 5 * time.Second
 		if errors.Is(err, ErrWorkerRouteDenied) {
 			status, code = 403, "worker_route_denied"
 			retry = 0
 		}
+		if errors.Is(err, ErrWorkerRouterRequired) {
+			status, code = 500, "worker_router_required"
+			message = "multiple Human workers are connected; the deployment must configure a WorkerRouter"
+			retry = 0
+		}
 		return AdmissionResult{}, service.admissionFailure(input.CodecID, AdmissionFailure{
-			Status: status, Code: code, Message: "no Human worker can accept this request",
+			Status: status, Code: code, Message: message,
 		}, retry, err)
 	}
 
@@ -495,15 +500,22 @@ func (service *Service) routeAdmission(
 	}
 	candidates := service.connectedWorkers()
 	if service.router == nil {
-		if len(candidates) != 1 {
+		switch len(candidates) {
+		case 0:
 			return "", ErrWorkerUnavailable
+		case 1:
+			return candidates[0], nil
+		default:
+			// A silent ErrWorkerUnavailable here would disguise a deployment
+			// configuration error as a retryable capacity condition.
+			return "", ErrWorkerRouterRequired
 		}
-		return candidates[0], nil
 	}
 	worker, err := service.router.RouteWorker(ctx, WorkerRouteRequest{
 		CallerID: input.CallerID, IdempotencyKey: input.IdempotencyKey,
 		TaskID: taskID, Request: cloneTransportRequest(request), Task: input.Task,
-		Candidates: append([]WorkerID(nil), candidates...),
+		Candidates:       append([]WorkerID(nil), candidates...),
+		CallerAttributes: cloneCallerAttributes(input.CallerAttributes),
 	})
 	if err != nil {
 		return "", err

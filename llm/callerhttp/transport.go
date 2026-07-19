@@ -61,8 +61,15 @@ var codecIDPattern = regexp.MustCompile(`^[a-z][a-z0-9._/-]{0,127}$`)
 // Identity is the authenticated caller identity. It is the sole source of the
 // llm.CallerID passed to the core; headers and RequestResolver cannot override
 // it.
+//
+// Attributes carries advisory claims of the authenticated principal (for
+// example JWT claims, mTLS SANs, or upstream-context roles) for the core's
+// AdmissionPolicy and WorkerRouter. Attributes never participate in request
+// identity, digests, or persistence and must not be treated as a second
+// identity channel: authorization decisions bind to CallerID.
 type Identity struct {
-	CallerID llm.CallerID
+	CallerID   llm.CallerID
+	Attributes map[string]any
 }
 
 // Authenticator lets an embedding host bind its own JWT, cookie, mTLS, or

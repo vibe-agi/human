@@ -172,6 +172,7 @@ func openNetworkFaultService(t *testing.T, path string) *llm.Service {
 		Router: llm.WorkerRouterFunc(func(context.Context, llm.WorkerRouteRequest) (llm.WorkerID, error) {
 			return "worker-a", nil
 		}),
+		Admission: llm.AdmitAll(),
 	})
 	if err != nil {
 		t.Fatal(err)

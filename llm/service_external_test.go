@@ -697,6 +697,7 @@ func TestServiceRejectsOversizeAssignmentBeforePersistence(t *testing.T) {
 		Router: llm.WorkerRouterFunc(func(context.Context, llm.WorkerRouteRequest) (llm.WorkerID, error) {
 			return "worker-a", nil
 		}),
+		Admission:               llm.AdmitAll(),
 		WorkerPayloadLimitBytes: 8 << 10,
 	})
 	if err != nil {
@@ -978,6 +979,9 @@ func newTestServiceWithOptions(
 	limit int64,
 	clock llm.Clock,
 ) *llm.Service {
+	if policy == nil {
+		policy = llm.AdmitAll()
+	}
 	service, err := llm.NewService(t.Context(), llm.Config{
 		DeploymentID: "test-deployment", Store: resource,
 		Codecs: []llm.CodecRegistration{{

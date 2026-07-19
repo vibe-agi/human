@@ -20,6 +20,10 @@ var (
 	ErrTaskConflict         = errors.New("llm: task state conflicts with the request")
 	ErrWorkerUnavailable    = errors.New("llm: no worker is available")
 	ErrWorkerRouteDenied    = errors.New("llm: worker routing was denied")
+	// ErrWorkerRouterRequired is a deployment configuration error, not a
+	// temporary capacity condition: more than one worker is connected and no
+	// WorkerRouter was configured to make the selection explicit.
+	ErrWorkerRouterRequired = errors.New("llm: multiple workers are connected and no WorkerRouter is configured")
 	ErrResponseNotFound     = errors.New("llm: response is not found")
 	ErrResponseDigest       = errors.New("llm: response digest does not match")
 )
@@ -108,12 +112,21 @@ type TaskContext struct {
 
 // AdmissionRequest is the transport-neutral caller boundary. CallerID must
 // come from authentication; Body is borrowed only for Admit's duration.
+//
+// CallerAttributes carries advisory claims of the authenticated principal
+// (organization, roles, entitlements) for AdmissionPolicy and WorkerRouter.
+// They never enter correctness identity: the request digest, idempotency
+// comparison, persistence records, and worker assignments ignore them, so an
+// exact retry may carry different attributes and still replay byte-for-byte.
+// The map is borrowed only for Admit's duration; the core copies the top-level
+// map before each policy call and never retains the values.
 type AdmissionRequest struct {
-	CallerID       CallerID
-	IdempotencyKey IdempotencyKey
-	CodecID        CodecID
-	Body           []byte
-	Task           TaskContext
+	CallerID         CallerID
+	IdempotencyKey   IdempotencyKey
+	CodecID          CodecID
+	Body             []byte
+	Task             TaskContext
+	CallerAttributes map[string]any
 }
 
 type AdmissionContext struct {
@@ -122,6 +135,9 @@ type AdmissionContext struct {
 	Codec          CodecDescription
 	Request        Request
 	Task           TaskContext
+	// CallerAttributes is an independent top-level copy per policy call; the
+	// attribute values themselves are borrowed and must not be mutated.
+	CallerAttributes map[string]any
 }
 
 type AdmissionPolicyDecision struct {
@@ -133,10 +149,23 @@ type AdmissionPolicyDecision struct {
 // AdmissionPolicy runs before durable admission and assignment. Input is
 // borrowed for the call; implementations must not retain or mutate its maps,
 // slices, or RawMessage values. Implementations must be concurrency-safe and
-// honor cancellation; any error fails admission without durable effects. A nil
-// policy allows every structurally valid request.
+// honor cancellation; any error fails admission without durable effects.
+//
+// Admission is a required deployment choice: NewService rejects a nil policy
+// instead of silently allowing every request. AdmitAll is the explicit,
+// auditable allow-everything policy for deployments where transport
+// authentication is the only gate.
 type AdmissionPolicy interface {
 	Admit(context.Context, AdmissionContext) (AdmissionPolicyDecision, error)
+}
+
+// AdmitAll returns the explicit allow-everything AdmissionPolicy. It admits
+// every structurally valid, authenticated request; use it only when transport
+// authentication and the ToolAuthorizer are the deployment's real gates.
+func AdmitAll() AdmissionPolicy {
+	return AdmissionPolicyFunc(func(context.Context, AdmissionContext) (AdmissionPolicyDecision, error) {
+		return AdmissionPolicyDecision{Allowed: true}, nil
+	})
 }
 
 type AdmissionPolicyFunc func(context.Context, AdmissionContext) (AdmissionPolicyDecision, error)
@@ -152,6 +181,11 @@ type WorkerRouteRequest struct {
 	Request        Request
 	Task           TaskContext
 	Candidates     []WorkerID
+	// CallerAttributes is an independent top-level copy per route call carrying
+	// the authenticated principal's advisory claims; the attribute values are
+	// borrowed and must not be mutated. Attributes never enter routing
+	// correctness state: the selected WorkerID alone is persisted.
+	CallerAttributes map[string]any
 }
 
 // WorkerRouter selects a stable authenticated WorkerID. Returning an empty ID
@@ -159,6 +193,10 @@ type WorkerRouteRequest struct {
 // but currently disconnected worker so durable work waits for reconnection.
 // The borrowed implementation must be concurrency-safe until Service.Done,
 // honor context cancellation, and not retain/mutate WorkerRouteRequest values.
+//
+// A Router is optional only for single-worker deployments: with a nil Router
+// the core routes to the sole connected worker and fails closed with
+// ErrWorkerRouterRequired as soon as a second worker connects.
 type WorkerRouter interface {
 	RouteWorker(context.Context, WorkerRouteRequest) (WorkerID, error)
 }

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"reflect"
 	"sort"
 	"strconv"
@@ -213,8 +214,11 @@ func NewService(ctx context.Context, config Config) (_ *Service, resultErr error
 	if nilInterface(config.Router) && config.Router != nil {
 		return nil, fmt.Errorf("%w: Router is a typed nil", ErrInvalidServiceConfig)
 	}
-	if nilInterface(config.Admission) && config.Admission != nil {
-		return nil, fmt.Errorf("%w: Admission is a typed nil", ErrInvalidServiceConfig)
+	if nilInterface(config.Admission) {
+		return nil, fmt.Errorf(
+			"%w: Admission policy is a required deployment choice; use llm.AdmitAll() to explicitly allow every request",
+			ErrInvalidServiceConfig,
+		)
 	}
 	if nilInterface(config.ToolAuthorizer) && config.ToolAuthorizer != nil {
 		return nil, fmt.Errorf("%w: ToolAuthorizer is a typed nil", ErrInvalidServiceConfig)
@@ -562,6 +566,13 @@ func cloneContractFeatures(input map[framework.Feature]uint16) map[framework.Fea
 		cloned[feature] = version
 	}
 	return cloned
+}
+
+// cloneCallerAttributes copies the top-level attribute map so one policy or
+// router call cannot alias another caller-visible map. Attribute values remain
+// borrowed by contract and are never persisted or digested.
+func cloneCallerAttributes(input map[string]any) map[string]any {
+	return maps.Clone(input)
 }
 
 func cloneCodecDescription(input CodecDescription) CodecDescription {

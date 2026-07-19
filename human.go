@@ -27,11 +27,14 @@ type LLMConfig = llm.Config
 type LLM = llm.Service
 
 // DefaultLLMConfig returns the built-in OpenAI Chat Completions, OpenAI
-// Responses, and Anthropic Messages codecs. It intentionally leaves Store and
-// DeploymentID unset so an embedder must choose a durable identity explicitly.
-// The returned codecs are fresh values and may be replaced or extended.
+// Responses, and Anthropic Messages codecs together with the explicit
+// llm.AdmitAll admission policy. It intentionally leaves Store and
+// DeploymentID unset so an embedder must choose a durable identity explicitly;
+// replace Admission when the deployment needs policy beyond transport
+// authentication. The returned values are fresh and may be replaced or
+// extended.
 func DefaultLLMConfig() LLMConfig {
-	return LLMConfig{Codecs: builtin.Registrations()}
+	return LLMConfig{Codecs: builtin.Registrations(), Admission: llm.AdmitAll()}
 }
 
 // NewLLM validates the injected contracts, recovers durable in-flight work,
