@@ -37,6 +37,7 @@ var (
 	ErrStaleLease          = errors.New("agent task lease is stale")
 	ErrLeaseFenceExhausted = errors.New("agent task lease fence exhausted")
 	ErrCorruptStore        = errors.New("corrupt agent store")
+	ErrProtectionDowngrade = errors.New("agent protected record was replaced by plaintext")
 	ErrDatabaseInUse       = errors.New("agent database is already held by another running instance")
 	ErrClosed              = errors.New("agent is closed")
 )

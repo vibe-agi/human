@@ -20,7 +20,7 @@ const StoreContractID framework.ContractID = "human.agent.store"
 // StoreContractMajor changes when an implementation must change its base
 // transaction, query, or record semantics to remain correct. Minor revisions
 // may add behavior without weakening the major contract.
-const StoreContractMajor uint16 = 1
+const StoreContractMajor uint16 = 2
 
 var (
 	// ErrStoreContractMismatch aliases the framework-wide construction error for
@@ -288,8 +288,9 @@ type StoreTaskRecord struct {
 	ArtifactState *ArtifactState
 }
 
-// StoreMessageRecord keeps canonical encoded Parts and their digest alongside
-// message metadata. Agent decodes and verifies both on every read.
+// StoreMessageRecord keeps a versioned opaque StoredValue containing canonical
+// encoded Parts and their plaintext digest alongside message metadata. Store
+// implementations preserve EncodedParts byte-for-byte and never decrypt it.
 type StoreMessageRecord struct {
 	ID           MessageID
 	Task         TaskRef
@@ -313,14 +314,20 @@ type StoreLeaseGrantRecord struct {
 	GrantedAt time.Time
 }
 
-// StoreArtifactRecord contains immutable payload identity and its mutable
-// publication state. State transitions may not change payload bytes or any
-// digest/revision identity field.
+// StoreArtifactRecord contains immutable plaintext payload identity, its
+// mutable publication state, and a versioned opaque StoredValue. Artifact
+// PayloadSize and PayloadDigest always describe canonical plaintext;
+// EncodedPayload has an independent physical size and is preserved byte-for-byte.
+// State transitions may not change EncodedPayload or any identity field.
 type StoreArtifactRecord struct {
-	Content ArtifactContent
+	Artifact       Artifact
+	EncodedPayload []byte
 }
 
-// StoreSubmissionRecord is written once, in the same transaction that publishes
+// StoreSubmissionRecord contains only durable identity, routing, and timestamp
+// metadata. Final user content lives in its referenced protected Message and
+// optional Artifact; Store implementations must not duplicate that payload here.
+// It is written once, in the same transaction that publishes
 // an optional Artifact and moves its Task to completed.
 type StoreSubmissionRecord struct {
 	Submission Submission

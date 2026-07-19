@@ -170,7 +170,7 @@ func (view memoryAgentView) LoadArtifact(
 	if !ok {
 		return agent.StoreArtifactRecord{}, notFound(agent.StoreRecordArtifact, string(ref.ID))
 	}
-	if err := enforceLimit(agent.StoreRecordArtifact, len(record.Content.Payload.Data), limit); err != nil {
+	if err := enforceLimit(agent.StoreRecordArtifact, len(record.EncodedPayload), limit); err != nil {
 		return agent.StoreArtifactRecord{}, err
 	}
 	return cloneArtifact(record), nil
@@ -273,7 +273,7 @@ func (memoryAgentTx) InsertLeaseGrant(agent.StoreLeaseGrantRecord) error {
 }
 
 func (tx memoryAgentTx) InsertArtifact(record agent.StoreArtifactRecord) error {
-	ref := record.Content.Artifact.Ref
+	ref := record.Artifact.Ref
 	if _, exists := tx.state.artifacts[ref]; exists {
 		return conflict(agent.StoreConstraintArtifactID, string(ref.ID))
 	}
@@ -347,14 +347,14 @@ func cloneMessage(record agent.StoreMessageRecord) agent.StoreMessageRecord {
 }
 
 func cloneArtifact(record agent.StoreArtifactRecord) agent.StoreArtifactRecord {
-	record.Content.Payload.Data = append([]byte(nil), record.Content.Payload.Data...)
-	if record.Content.Artifact.PublishedAt != nil {
-		value := *record.Content.Artifact.PublishedAt
-		record.Content.Artifact.PublishedAt = &value
+	record.EncodedPayload = append([]byte(nil), record.EncodedPayload...)
+	if record.Artifact.PublishedAt != nil {
+		value := *record.Artifact.PublishedAt
+		record.Artifact.PublishedAt = &value
 	}
-	if record.Content.Artifact.DiscardedAt != nil {
-		value := *record.Content.Artifact.DiscardedAt
-		record.Content.Artifact.DiscardedAt = &value
+	if record.Artifact.DiscardedAt != nil {
+		value := *record.Artifact.DiscardedAt
+		record.Artifact.DiscardedAt = &value
 	}
 	return record
 }

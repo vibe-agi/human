@@ -16,7 +16,6 @@ import (
 
 	"github.com/vibe-agi/human/agent"
 	"github.com/vibe-agi/human/framework"
-	"github.com/vibe-agi/human/workspace"
 )
 
 // AgentStoreFactory opens a new, empty Agent Store for one conformance
@@ -550,6 +549,8 @@ func testAgentStoreMessageBytes(ctx context.Context, t *testing.T, store agent.S
 		Author: agent.AuthorCaller, EncodedParts: originalBytes,
 		PartsDigest: "sha256:message", CreatedAt: conformanceTime(2),
 	}
+	want := record
+	want.EncodedParts = append([]byte(nil), record.EncodedParts...)
 	if err := store.Update(ctx, func(tx agent.StoreTx) error {
 		if err := tx.InsertTask(task); err != nil {
 			return err
@@ -571,12 +572,12 @@ func testAgentStoreMessageBytes(ctx context.Context, t *testing.T, store agent.S
 		return stored, err
 	}
 	stored, err := load(int64(len("message-canonical-parts")))
-	if err != nil || string(stored.EncodedParts) != "message-canonical-parts" {
+	if err != nil || !reflect.DeepEqual(stored, want) {
 		t.Fatalf("message bytes at exact limit: record=%#v error=%v", stored, err)
 	}
 	mutateBytes(stored.EncodedParts)
 	again, err := load(generousReadLimit().MaxBytes)
-	if err != nil || string(again.EncodedParts) != "message-canonical-parts" {
+	if err != nil || !reflect.DeepEqual(again, want) {
 		t.Fatalf("message read alias changed persisted bytes: record=%#v error=%v", again, err)
 	}
 	assertOversizedRead(t, "message zero limit", func() error { _, err := load(0); return err })
@@ -599,16 +600,21 @@ func testAgentStoreArtifactBytes(ctx context.Context, t *testing.T, store agent.
 	linkedTask.Task.Artifact = &ref
 	linkedTask.ArtifactState = &state
 	originalBytes := []byte("artifact-canonical-payload")
-	record := agent.StoreArtifactRecord{Content: agent.ArtifactContent{
+	record := agent.StoreArtifactRecord{
 		Artifact: agent.Artifact{
 			Ref: ref, Task: task.Task.Ref, State: state,
 			BaseRevision: "revision-base", ResultRevision: "revision-result",
 			Digest: "sha256:artifact", PayloadDigest: "sha256:payload",
-			PayloadSize: int64(len(originalBytes)), MediaType: "application/octet-stream",
+			// Plaintext size is deliberately unrelated to EncodedPayload length.
+			// Store adapters must apply read limits to physical encoded bytes while
+			// preserving the core-owned plaintext metadata exactly.
+			PayloadSize: 7, MediaType: "application/octet-stream",
 			FrozenAt: conformanceTime(3),
 		},
-		Payload: workspace.Payload{MediaType: "application/octet-stream", Data: originalBytes},
-	}}
+		EncodedPayload: originalBytes,
+	}
+	want := record
+	want.EncodedPayload = append([]byte(nil), record.EncodedPayload...)
 	if err := store.Update(ctx, func(tx agent.StoreTx) error { return tx.InsertTask(task) }); err != nil {
 		t.Fatalf("insert Artifact task: %v", err)
 	}
@@ -643,12 +649,12 @@ func testAgentStoreArtifactBytes(ctx context.Context, t *testing.T, store agent.
 		return stored, err
 	}
 	stored, err := load(int64(len("artifact-canonical-payload")))
-	if err != nil || string(stored.Content.Payload.Data) != "artifact-canonical-payload" {
+	if err != nil || !reflect.DeepEqual(stored, want) {
 		t.Fatalf("Artifact bytes at exact limit: record=%#v error=%v", stored, err)
 	}
-	mutateBytes(stored.Content.Payload.Data)
+	mutateBytes(stored.EncodedPayload)
 	again, err := load(generousReadLimit().MaxBytes)
-	if err != nil || string(again.Content.Payload.Data) != "artifact-canonical-payload" {
+	if err != nil || !reflect.DeepEqual(again, want) {
 		t.Fatalf("Artifact read alias changed persisted bytes: record=%#v error=%v", again, err)
 	}
 	assertOversizedRead(t, "Artifact zero limit", func() error { _, err := load(0); return err })

@@ -362,25 +362,24 @@ func (view *sqliteStoreView) LoadArtifact(
 	if err := validateSQLiteReadLimit(StoreRecordArtifact, limit); err != nil {
 		return StoreArtifactRecord{}, err
 	}
-	var content ArtifactContent
-	var size int64
+	var record StoreArtifactRecord
+	var encodedSize, payloadSize int64
 	var frozen int64
 	var published, discarded sql.NullInt64
-	content.Artifact.Ref = ref
+	record.Artifact.Ref = ref
 	err := view.unit.tx.QueryRowContext(view.unit.ctx, `
 		SELECT task_id, state, base_revision, result_revision, artifact_digest,
 		       payload_digest, media_type,
-		       CASE WHEN payload_size <= ? AND length(payload) = payload_size
-		            THEN payload ELSE NULL END,
-		       payload_size, frozen_at, published_at, discarded_at
+		       CASE WHEN length(payload) <= ? THEN payload ELSE NULL END,
+		       length(payload), payload_size, frozen_at, published_at, discarded_at
 		FROM agent_artifacts
 		WHERE authority_id = ? AND workspace_id = ? AND artifact_id = ?`,
 		limit.MaxBytes, ref.Workspace.Authority, ref.Workspace.ID, ref.ID,
 	).Scan(
-		&content.Artifact.Task.ID, &content.Artifact.State,
-		&content.Artifact.BaseRevision, &content.Artifact.ResultRevision,
-		&content.Artifact.Digest, &content.Artifact.PayloadDigest,
-		&content.Artifact.MediaType, &content.Payload.Data, &size,
+		&record.Artifact.Task.ID, &record.Artifact.State,
+		&record.Artifact.BaseRevision, &record.Artifact.ResultRevision,
+		&record.Artifact.Digest, &record.Artifact.PayloadDigest,
+		&record.Artifact.MediaType, &record.EncodedPayload, &encodedSize, &payloadSize,
 		&frozen, &published, &discarded,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -389,22 +388,21 @@ func (view *sqliteStoreView) LoadArtifact(
 	if err != nil {
 		return StoreArtifactRecord{}, fmt.Errorf("load Agent Store Artifact: %w", err)
 	}
-	if size > limit.MaxBytes || content.Payload.Data == nil {
+	if encodedSize > limit.MaxBytes || record.EncodedPayload == nil {
 		return StoreArtifactRecord{}, &StoreLimitError{Record: StoreRecordArtifact, Limit: limit.MaxBytes}
 	}
-	content.Artifact.Task.Workspace = ref.Workspace
-	content.Artifact.PayloadSize = size
-	content.Payload.MediaType = content.Artifact.MediaType
-	content.Artifact.FrozenAt = fromUnixNano(frozen)
+	record.Artifact.Task.Workspace = ref.Workspace
+	record.Artifact.PayloadSize = payloadSize
+	record.Artifact.FrozenAt = fromUnixNano(frozen)
 	if published.Valid {
 		value := fromUnixNano(published.Int64)
-		content.Artifact.PublishedAt = &value
+		record.Artifact.PublishedAt = &value
 	}
 	if discarded.Valid {
 		value := fromUnixNano(discarded.Int64)
-		content.Artifact.DiscardedAt = &value
+		record.Artifact.DiscardedAt = &value
 	}
-	return cloneStoreArtifactRecord(StoreArtifactRecord{Content: content}), nil
+	return cloneStoreArtifactRecord(record), nil
 }
 
 func (view *sqliteStoreView) LoadApplyReceipt(ref ArtifactRef) (StoreApplyReceiptRecord, error) {
@@ -1104,8 +1102,8 @@ func (unit *sqliteStoreTx) InsertArtifact(record StoreArtifactRecord) error {
 		return err
 	}
 	record = cloneStoreArtifactRecord(record)
-	artifact := record.Content.Artifact
-	payload := record.Content.Payload
+	artifact := record.Artifact
+	payload := bytes.Clone(record.EncodedPayload)
 	_, err := unit.unit.tx.ExecContext(unit.unit.ctx, `
 		INSERT INTO agent_artifacts (
 		  authority_id, workspace_id, artifact_id, task_id, state,
@@ -1114,7 +1112,7 @@ func (unit *sqliteStoreTx) InsertArtifact(record StoreArtifactRecord) error {
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		artifact.Ref.Workspace.Authority, artifact.Ref.Workspace.ID, artifact.Ref.ID,
 		artifact.Task.ID, artifact.State, artifact.BaseRevision, artifact.ResultRevision,
-		artifact.Digest, artifact.PayloadDigest, artifact.MediaType, payload.Data,
+		artifact.Digest, artifact.PayloadDigest, artifact.MediaType, payload,
 		artifact.PayloadSize, unixNano(artifact.FrozenAt.UTC()),
 		nullableUnixNano(artifact.PublishedAt), nullableUnixNano(artifact.DiscardedAt),
 	)
@@ -1312,7 +1310,15 @@ func cloneStoreMessageRecords(records []StoreMessageRecord) []StoreMessageRecord
 }
 
 func cloneStoreArtifactRecord(record StoreArtifactRecord) StoreArtifactRecord {
-	record.Content = cloneArtifactContent(record.Content)
+	record.EncodedPayload = bytes.Clone(record.EncodedPayload)
+	if record.Artifact.PublishedAt != nil {
+		value := *record.Artifact.PublishedAt
+		record.Artifact.PublishedAt = &value
+	}
+	if record.Artifact.DiscardedAt != nil {
+		value := *record.Artifact.DiscardedAt
+		record.Artifact.DiscardedAt = &value
+	}
 	return record
 }
 

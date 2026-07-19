@@ -25,9 +25,9 @@ func (agent *Agent) GetMessage(ctx context.Context, authority AuthorityID, id Me
 		return Message{}, err
 	}
 	defer release()
-	var message Message
+	var record StoreMessageRecord
 	err = store.View(ctx, func(view StoreView) error {
-		record, err := view.LoadMessage(
+		loaded, err := view.LoadMessage(
 			StoreMessageKey{Authority: authority, ID: id},
 			StoreReadLimit{MaxBytes: maxPageBytes},
 		)
@@ -40,15 +40,19 @@ func (agent *Agent) GetMessage(ctx context.Context, authority AuthorityID, id Me
 		if err != nil {
 			return fmt.Errorf("get Agent message: %w", err)
 		}
-		if record.ID != id || record.Task.Workspace.Authority != authority {
+		if loaded.ID != id || loaded.Task.Workspace.Authority != authority {
 			return fmt.Errorf("%w: Store returned a different Agent message identity", ErrCorruptStore)
 		}
-		if len(record.EncodedParts) == 0 || len(record.EncodedParts) > maxPageBytes {
+		if len(loaded.EncodedParts) == 0 || len(loaded.EncodedParts) > maxPageBytes {
 			return fmt.Errorf("%w: Agent message exceeds storage read budget", ErrCorruptStore)
 		}
-		message, err = messageFromStoreRecord(record)
-		return err
+		record = loaded
+		return nil
 	})
+	if err != nil {
+		return Message{}, err
+	}
+	message, err := agent.messageFromStoreRecord(ctx, record)
 	if err != nil {
 		return Message{}, err
 	}

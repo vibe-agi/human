@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/vibe-agi/human/framework"
+	"github.com/vibe-agi/human/protect"
+	protectaead "github.com/vibe-agi/human/protect/aead"
 )
 
 func TestCustomStoreOwnership(t *testing.T) {
@@ -125,6 +127,62 @@ func TestShutdownDeadlineLeavesDrainingRuntimeFinishable(t *testing.T) {
 	valid := TaskRef{Workspace: WorkspaceRef{Authority: "authority", ID: "workspace"}, ID: "task"}
 	if _, err := service.GetTask(t.Context(), valid); !errors.Is(err, ErrClosed) {
 		t.Fatalf("operation after Shutdown = %v, want ErrClosed", err)
+	}
+}
+
+func TestShutdownUsesIndependentBoundedDependencyReleaseContexts(t *testing.T) {
+	base, _ := openTestAgent(t)
+	protectorResource, err := protectaead.Open(t.Context(), keyringConfig("v1", testKey('z')))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = protectorResource.Release(context.Background()) })
+	protector, err := protectorResource.Value()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedProtector, err := framework.Own[protect.Protector](protector, func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var storeReleases atomic.Int32
+	ownedStore, err := framework.Own[Store](base.store, func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		storeReleases.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultConfig()
+	config.Store = ownedStore
+	config.Protector = ownedProtector
+	config.ReleaseTimeout = 20 * time.Millisecond
+	service, err := New(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(t.Context(), 5*time.Millisecond)
+	defer cancel()
+	if err := service.Shutdown(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded Shutdown wait = %v, want deadline", err)
+	}
+	select {
+	case <-service.Done():
+	case <-time.After(time.Second):
+		t.Fatal("background dependency release did not reach Done")
+	}
+	if got := storeReleases.Load(); got != 1 {
+		t.Fatalf("Store releases after Protector timeout = %d, want 1", got)
+	}
+	if err := service.Err(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("terminal release error = %v, want Protector deadline", err)
 	}
 }
 

@@ -54,8 +54,68 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 		return FreezeArtifactResult{}, err
 	}
 	defer release()
+	ref := ArtifactRef{Workspace: command.Task.Workspace, ID: command.Artifact}
+	payloadDigest := digestPayload(command.Payload)
+	resultRevision := nextRevision(command.ExpectedBaseRevision, ref, payloadDigest)
+	artifactIdentity := Artifact{
+		Ref: ref, Task: command.Task, State: ArtifactFrozen,
+		BaseRevision: command.ExpectedBaseRevision, ResultRevision: resultRevision,
+		Digest: digestArtifact(
+			ref, command.Task, command.ExpectedBaseRevision, resultRevision,
+			payloadDigest, command.Payload.MediaType,
+		),
+		PayloadDigest: payloadDigest, PayloadSize: int64(len(command.Payload.Data)),
+		MediaType: command.Payload.MediaType,
+	}
 
 	var frozen FreezeArtifactResult
+	var replayed bool
+	var replayRecord StoreArtifactRecord
+	err = store.View(ctx, func(view StoreView) error {
+		var replay FreezeArtifactResult
+		found, err := replayJSONCommandFromStore(
+			view, command.Task.Workspace.Authority, command.Meta.ID,
+			"freeze_artifact", digest, "freeze_artifact", &replay,
+		)
+		if err != nil || !found {
+			return err
+		}
+		if err := validateFreezeResult(replay); err != nil {
+			return err
+		}
+		if replay.Task.Ref != command.Task || replay.Artifact.Ref != ref {
+			return fmt.Errorf("%w: frozen command result identity mismatch", ErrCorruptStore)
+		}
+		if _, err := verifyArtifactLeaseGrantHistory(view, command.Meta.Grant); err != nil {
+			return err
+		}
+		stored, err := loadArtifactRecord(view, replay.Artifact.Ref)
+		if err != nil || !sameArtifactIdentity(stored.Artifact, replay.Artifact) {
+			return fmt.Errorf("%w: frozen command result does not match Artifact", ErrCorruptStore)
+		}
+		replayRecord = stored
+		frozen, replayed = cloneFreezeResult(replay), true
+		return nil
+	})
+	if err != nil {
+		return FreezeArtifactResult{}, fmt.Errorf("preflight freeze Agent Artifact: %w", err)
+	}
+	if replayed {
+		if _, err := agent.validateStoredValueShape(replayRecord.EncodedPayload, maxStoredArtifactBytes); err != nil {
+			return FreezeArtifactResult{}, err
+		}
+		return cloneFreezeResult(frozen), nil
+	}
+	if int64(len(command.Payload.Data)) > agent.maxArtifactBytes {
+		return FreezeArtifactResult{}, fmt.Errorf(
+			"%w: Artifact payload must be 1..%d bytes", ErrInvalidArgument, agent.maxArtifactBytes,
+		)
+	}
+	preparedPayload, err := agent.prepareArtifactPayload(ctx, artifactIdentity, command.Payload)
+	if err != nil {
+		return FreezeArtifactResult{}, err
+	}
+	var updateReplayed bool
 	err = store.Update(ctx, func(tx StoreTx) error {
 		var replay FreezeArtifactResult
 		if found, err := replayJSONCommandFromStore(
@@ -74,19 +134,15 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 			if _, err := verifyArtifactLeaseGrantHistory(tx, command.Meta.Grant); err != nil {
 				return err
 			}
-			stored, err := loadArtifactContent(tx, replay.Artifact.Ref)
+			stored, err := loadArtifactRecord(tx, replay.Artifact.Ref)
 			if err != nil || !sameArtifactIdentity(stored.Artifact, replay.Artifact) {
 				return fmt.Errorf("%w: frozen command result does not match Artifact", ErrCorruptStore)
 			}
+			replayRecord = stored
 			frozen = cloneFreezeResult(replay)
+			updateReplayed = true
 			return nil
 		}
-		if int64(len(command.Payload.Data)) > agent.maxArtifactBytes {
-			return fmt.Errorf(
-				"%w: Artifact payload must be 1..%d bytes", ErrInvalidArgument, agent.maxArtifactBytes,
-			)
-		}
-
 		currentRecord, err := loadTaskRecordFromStore(tx, command.Task)
 		if err != nil {
 			return err
@@ -131,22 +187,11 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 			)
 		}
 
-		ref := ArtifactRef{Workspace: workspaceRef, ID: command.Artifact}
-		payloadDigest := digestPayload(command.Payload)
-		resultRevision := nextRevision(command.ExpectedBaseRevision, ref, payloadDigest)
-		artifactDigest := digestArtifact(
-			ref, command.Task, command.ExpectedBaseRevision, resultRevision,
-			payloadDigest, command.Payload.MediaType,
-		)
-		artifact := Artifact{
-			Ref: ref, Task: command.Task, State: ArtifactFrozen,
-			BaseRevision: command.ExpectedBaseRevision, ResultRevision: resultRevision,
-			Digest: artifactDigest, PayloadDigest: payloadDigest,
-			PayloadSize: int64(len(command.Payload.Data)), MediaType: command.Payload.MediaType,
-			FrozenAt: now,
-		}
-		content := ArtifactContent{Artifact: artifact, Payload: command.Payload}
-		if err := tx.InsertArtifact(StoreArtifactRecord{Content: cloneArtifactContent(content)}); err != nil {
+		artifact := artifactIdentity
+		artifact.FrozenAt = now
+		if err := tx.InsertArtifact(StoreArtifactRecord{
+			Artifact: artifact, EncodedPayload: appendExactAgentBytes(preparedPayload),
+		}); err != nil {
 			if errors.Is(err, ErrStoreConflict) {
 				return ErrArtifactConflict
 			}
@@ -202,6 +247,11 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 	if err != nil {
 		return FreezeArtifactResult{}, err
 	}
+	if updateReplayed {
+		if _, err := agent.validateStoredValueShape(replayRecord.EncodedPayload, maxStoredArtifactBytes); err != nil {
+			return FreezeArtifactResult{}, err
+		}
+	}
 	return cloneFreezeResult(frozen), nil
 }
 
@@ -217,15 +267,19 @@ func (agent *Agent) GetArtifact(ctx context.Context, ref ArtifactRef) (ArtifactC
 		return ArtifactContent{}, err
 	}
 	defer release()
-	var content ArtifactContent
+	var record StoreArtifactRecord
 	err = store.View(ctx, func(view StoreView) error {
-		loaded, err := loadArtifactContent(view, ref)
+		loaded, err := loadArtifactRecord(view, ref)
 		if err != nil {
 			return err
 		}
-		content = loaded
+		record = loaded
 		return nil
 	})
+	if err != nil {
+		return ArtifactContent{}, err
+	}
+	content, err := agent.artifactContentFromStoreRecord(ctx, record)
 	if err != nil {
 		return ArtifactContent{}, err
 	}
@@ -278,11 +332,11 @@ func (agent *Agent) RecordApplyReceipt(ctx context.Context, command RecordApplyR
 			return nil
 		}
 
-		content, err := loadArtifactContent(tx, command.Artifact)
+		record, err := loadArtifactRecord(tx, command.Artifact)
 		if err != nil {
 			return err
 		}
-		artifact := content.Artifact
+		artifact := record.Artifact
 		if artifact.State != ArtifactPublished {
 			return fmt.Errorf("%w: receipt requires a published Artifact", ErrArtifactState)
 		}
@@ -393,25 +447,26 @@ func (agent *Agent) GetWorkspaceHead(ctx context.Context, ref WorkspaceRef) (Wor
 	return head, nil
 }
 
-func loadArtifactContent(view StoreView, ref ArtifactRef) (ArtifactContent, error) {
-	record, err := view.LoadArtifact(ref, StoreReadLimit{MaxBytes: absoluteArtifactMax})
+func loadArtifactRecord(view StoreView, ref ArtifactRef) (StoreArtifactRecord, error) {
+	record, err := view.LoadArtifact(ref, StoreReadLimit{MaxBytes: maxStoredArtifactBytes})
 	if errors.Is(err, ErrStoreRecordNotFound) {
-		return ArtifactContent{}, ErrArtifactNotFound
+		return StoreArtifactRecord{}, ErrArtifactNotFound
 	}
 	if errors.Is(err, ErrStoreRecordTooLarge) {
-		return ArtifactContent{}, fmt.Errorf("%w: Agent Artifact exceeds the absolute read limit", ErrCorruptStore)
+		return StoreArtifactRecord{}, fmt.Errorf("%w: Agent Artifact exceeds the encoded read limit", ErrCorruptStore)
 	}
 	if err != nil {
-		return ArtifactContent{}, fmt.Errorf("load Agent Artifact: %w", err)
+		return StoreArtifactRecord{}, fmt.Errorf("load Agent Artifact: %w", err)
 	}
-	content := cloneArtifactContent(record.Content)
-	if content.Artifact.Ref != ref {
-		return ArtifactContent{}, fmt.Errorf("%w: loaded Artifact identity mismatch", ErrCorruptStore)
+	record = cloneStoreArtifactRecord(record)
+	if record.Artifact.Ref != ref {
+		return StoreArtifactRecord{}, fmt.Errorf("%w: loaded Artifact identity mismatch", ErrCorruptStore)
 	}
-	if err := validateStoredArtifact(content); err != nil {
-		return ArtifactContent{}, err
+	if err := validateStoredArtifactMetadata(record.Artifact); err != nil ||
+		len(record.EncodedPayload) == 0 || int64(len(record.EncodedPayload)) > maxStoredArtifactBytes {
+		return StoreArtifactRecord{}, fmt.Errorf("%w: invalid encoded Artifact", ErrCorruptStore)
 	}
-	return content, nil
+	return record, nil
 }
 
 func loadApplyReceipt(view StoreView, ref ArtifactRef) (ApplyReceipt, bool, error) {
@@ -437,11 +492,11 @@ func loadVerifiedApplyReceipt(view StoreView, ref ArtifactRef) (ApplyReceipt, bo
 	if err != nil || !found {
 		return receipt, found, err
 	}
-	content, err := loadArtifactContent(view, ref)
+	record, err := loadArtifactRecord(view, ref)
 	if err != nil {
 		return ApplyReceipt{}, false, err
 	}
-	artifact := content.Artifact
+	artifact := record.Artifact
 	if artifact.State != ArtifactPublished || artifact.PublishedAt == nil ||
 		receipt.ArtifactDigest != artifact.Digest || receipt.BaseRevision != artifact.BaseRevision ||
 		receipt.ResultRevision != artifact.ResultRevision || receipt.RecordedAt.Before(*artifact.PublishedAt) {
@@ -616,10 +671,21 @@ func validateReceiptCommand(command RecordApplyReceiptCommand) error {
 
 func validateStoredArtifact(content ArtifactContent) error {
 	artifact := content.Artifact
+	if err := validateStoredArtifactMetadata(artifact); err != nil ||
+		artifact.PayloadSize != int64(len(content.Payload.Data)) || artifact.MediaType != content.Payload.MediaType ||
+		len(content.Payload.Data) == 0 {
+		return fmt.Errorf("%w: invalid Artifact %q", ErrCorruptStore, artifact.Ref.ID)
+	}
+	if digestPayload(content.Payload) != artifact.PayloadDigest {
+		return fmt.Errorf("%w: Artifact payload digest mismatch for %q", ErrCorruptStore, artifact.Ref.ID)
+	}
+	return nil
+}
+
+func validateStoredArtifactMetadata(artifact Artifact) error {
 	if err := validateArtifactRef(artifact.Ref); err != nil || validateTaskRef(artifact.Task) != nil ||
 		artifact.Task.Workspace != artifact.Ref.Workspace || artifact.PayloadSize <= 0 ||
-		artifact.PayloadSize != int64(len(content.Payload.Data)) || artifact.MediaType != content.Payload.MediaType ||
-		artifact.FrozenAt.IsZero() {
+		artifact.PayloadSize > absoluteArtifactMax || artifact.FrozenAt.IsZero() {
 		return fmt.Errorf("%w: invalid Artifact %q", ErrCorruptStore, artifact.Ref.ID)
 	}
 	if validateRevision("base revision", artifact.BaseRevision) != nil ||
@@ -645,8 +711,7 @@ func validateStoredArtifact(content ArtifactContent) error {
 	default:
 		return fmt.Errorf("%w: invalid Artifact state", ErrCorruptStore)
 	}
-	if digestPayload(content.Payload) != artifact.PayloadDigest ||
-		nextRevision(artifact.BaseRevision, artifact.Ref, artifact.PayloadDigest) != artifact.ResultRevision ||
+	if nextRevision(artifact.BaseRevision, artifact.Ref, artifact.PayloadDigest) != artifact.ResultRevision ||
 		digestArtifact(
 			artifact.Ref, artifact.Task, artifact.BaseRevision, artifact.ResultRevision,
 			artifact.PayloadDigest, artifact.MediaType,

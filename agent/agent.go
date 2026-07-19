@@ -18,13 +18,17 @@ import (
 	"unicode/utf8"
 
 	"github.com/vibe-agi/human/framework"
+	"github.com/vibe-agi/human/protect"
 )
 
 const (
-	maxPartBytes        = 2 << 20
-	maxPageBytes        = 4 << 20
-	defaultArtifactMax  = 16 << 20
-	absoluteArtifactMax = 64 << 20
+	maxPartBytes          = 2 << 20
+	maxPageBytes          = 4 << 20
+	defaultArtifactMax    = 16 << 20
+	absoluteArtifactMax   = 64 << 20
+	defaultReleaseTimeout = 10 * time.Second
+	minimumReleaseTimeout = time.Millisecond
+	maximumReleaseTimeout = 5 * time.Minute
 )
 
 var stableID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
@@ -37,6 +41,15 @@ type Config struct {
 	// Store injects a complete Agent persistence consistency domain. Borrowed
 	// resources remain caller-owned; owned resources are released by Shutdown.
 	Store framework.Resource[Store]
+	// Protector optionally seals static message and Artifact payloads before they
+	// enter Store callbacks. Borrowed Protectors remain caller-owned; owned
+	// Protectors are released before the Store during Shutdown.
+	Protector protect.Resource
+	// AllowPlaintextReads is an explicit migration policy. With a configured
+	// Protector the default rejects plain StoredValues, preventing a database
+	// attacker from downgrading authenticated ciphertext to plaintext. Enable it
+	// only while reading records written by a deliberately unprotected runtime.
+	AllowPlaintextReads bool
 	// DatabasePath selects the dedicated HumanAgent SQLite identity. Missing
 	// parent directories are created privately; do not share this file with LLM.
 	// It is mutually exclusive with Store.
@@ -44,11 +57,16 @@ type Config struct {
 	// MaxArtifactBytes limits newly frozen payloads. Reads continue to accept
 	// already committed payloads up to the schema hard limit of 64 MiB.
 	MaxArtifactBytes int64
+	// ReleaseTimeout bounds each owned Protector and Store release independently.
+	// Shutdown's context only bounds the caller's wait; cleanup continues after a
+	// caller timeout and a broken adapter cannot prevent the next dependency's
+	// release attempt.
+	ReleaseTimeout time.Duration
 }
 
 // DefaultConfig returns Agent defaults without selecting a database identity.
 func DefaultConfig() Config {
-	return Config{MaxArtifactBytes: defaultArtifactMax}
+	return Config{MaxArtifactBytes: defaultArtifactMax, ReleaseTimeout: defaultReleaseTimeout}
 }
 
 func (config Config) withDefaults() (Config, error) {
@@ -69,6 +87,12 @@ func (config Config) withDefaults() (Config, error) {
 	if config.MaxArtifactBytes < 1 || config.MaxArtifactBytes > absoluteArtifactMax {
 		return Config{}, fmt.Errorf("%w: artifact byte limit must be 1..%d", ErrInvalidArgument, absoluteArtifactMax)
 	}
+	if config.ReleaseTimeout == 0 {
+		config.ReleaseTimeout = defaultReleaseTimeout
+	}
+	if config.ReleaseTimeout < minimumReleaseTimeout || config.ReleaseTimeout > maximumReleaseTimeout {
+		return Config{}, fmt.Errorf("%w: release timeout must be 1ms..5m", ErrInvalidArgument)
+	}
 	return config, nil
 }
 
@@ -77,11 +101,16 @@ func (config Config) withDefaults() (Config, error) {
 type Agent struct {
 	// database remains only as a package-test corruption hook while the SQLite
 	// bridge moves to agent/sqlite. Core operations never read it.
-	database         *sql.DB
-	storeResource    framework.Resource[Store]
-	store            Store
-	now              func() time.Time
-	maxArtifactBytes int64
+	database             *sql.DB
+	storeResource        framework.Resource[Store]
+	store                Store
+	protectorResource    protect.Resource
+	protector            protect.Protector
+	protectorDescription protect.Description
+	allowPlaintext       bool
+	now                  func() time.Time
+	maxArtifactBytes     int64
+	releaseTimeout       time.Duration
 
 	lifecycle sync.Mutex
 	closed    bool
@@ -89,7 +118,7 @@ type Agent struct {
 	drained   chan struct{}
 	drainOnce sync.Once
 	done      chan struct{}
-	finish    sync.Once
+	shutdown  sync.Once
 	closeErr  error
 }
 
@@ -98,20 +127,28 @@ type Agent struct {
 // the Agent lifetime.
 func Open(ctx context.Context, config Config) (*Agent, error) {
 	if ctx == nil {
-		return nil, fmt.Errorf("%w: context is required", ErrInvalidArgument)
+		err := fmt.Errorf("%w: context is required", ErrInvalidArgument)
+		return nil, errors.Join(err, releaseAgentConfigResources(config))
 	}
+	original := config
 	config, err := config.withDefaults()
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, releaseAgentConfigResources(original))
 	}
 	if config.DatabasePath == "" {
-		return newAgent(ctx, config.Store, config.MaxArtifactBytes)
+		return newAgent(
+			ctx, config.Store, config.Protector, config.AllowPlaintextReads,
+			config.MaxArtifactBytes, config.ReleaseTimeout,
+		)
 	}
 	resource, err := OpenSQLiteStore(ctx, config.DatabasePath)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, releaseAgentResource(config.ReleaseTimeout, config.Protector.Release))
 	}
-	result, err := newAgent(ctx, resource, config.MaxArtifactBytes)
+	result, err := newAgent(
+		ctx, resource, config.Protector, config.AllowPlaintextReads,
+		config.MaxArtifactBytes, config.ReleaseTimeout,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -128,29 +165,106 @@ func New(ctx context.Context, config Config) (*Agent, error) { return Open(ctx, 
 func newAgent(
 	ctx context.Context,
 	resource framework.Resource[Store],
+	protectorResource protect.Resource,
+	allowPlaintext bool,
 	maxArtifactBytes int64,
+	releaseTimeout time.Duration,
 ) (*Agent, error) {
 	store, err := resource.Value()
 	if err != nil {
-		return nil, fmt.Errorf("acquire Agent Store resource: %w", err)
+		return nil, errors.Join(
+			fmt.Errorf("acquire Agent Store resource: %w", err),
+			releaseAgentResources(releaseTimeout, protectorResource, resource),
+		)
 	}
 	if nilAgentStore(store) {
 		err = fmt.Errorf("%w: Agent Store is required", ErrInvalidArgument)
 	} else if descriptionErr := store.Description().Validate(); descriptionErr != nil {
 		err = fmt.Errorf("validate Agent Store: %w", descriptionErr)
 	}
+	var protector protect.Protector
+	var protectorDescription protect.Description
+	if err == nil {
+		protector, err = protectorResource.Value()
+		if err != nil {
+			err = fmt.Errorf("acquire Agent Protector resource: %w", err)
+		} else if nilProtector(protector) {
+			protector = nil
+			if protectorResource.Owned() {
+				err = fmt.Errorf("%w: owned Agent Protector is nil", ErrInvalidArgument)
+			}
+		} else {
+			description, descriptionErr := protector.Describe(ctx)
+			if descriptionErr != nil {
+				err = fmt.Errorf("describe Agent Protector: %w", descriptionErr)
+			} else if descriptionErr = protect.ValidateDescription(description); descriptionErr != nil {
+				err = fmt.Errorf("validate Agent Protector: %w", descriptionErr)
+			} else {
+				protectorDescription = description
+			}
+		}
+	}
 	if err != nil {
-		releaseErr := resource.Release(context.WithoutCancel(ctx))
-		return nil, errors.Join(err, releaseErr)
+		return nil, errors.Join(err, releaseAgentResources(releaseTimeout, protectorResource, resource))
 	}
 	return &Agent{
-		storeResource:    resource,
-		store:            store,
-		now:              time.Now,
-		maxArtifactBytes: maxArtifactBytes,
-		drained:          make(chan struct{}),
-		done:             make(chan struct{}),
+		storeResource:        resource,
+		store:                store,
+		protectorResource:    protectorResource,
+		protector:            protector,
+		protectorDescription: protectorDescription,
+		allowPlaintext:       allowPlaintext,
+		now:                  time.Now,
+		maxArtifactBytes:     maxArtifactBytes,
+		releaseTimeout:       releaseTimeout,
+		drained:              make(chan struct{}),
+		done:                 make(chan struct{}),
 	}, nil
+}
+
+func releaseAgentConfigResources(config Config) error {
+	timeout := config.ReleaseTimeout
+	if timeout < minimumReleaseTimeout || timeout > maximumReleaseTimeout {
+		timeout = defaultReleaseTimeout
+	}
+	return releaseAgentResources(timeout, config.Protector, config.Store)
+}
+
+func releaseAgentResources(
+	timeout time.Duration,
+	protectorResource protect.Resource,
+	storeResource framework.Resource[Store],
+) error {
+	return errors.Join(
+		releaseAgentResource(timeout, protectorResource.Release),
+		releaseAgentResource(timeout, storeResource.Release),
+	)
+}
+
+func releaseAgentResource(timeout time.Duration, release framework.ReleaseFunc) error {
+	releaseCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- release(releaseCtx) }()
+	select {
+	case err := <-result:
+		return err
+	case <-releaseCtx.Done():
+		return releaseCtx.Err()
+	}
+}
+
+func nilProtector(protector protect.Protector) bool {
+	if protector == nil {
+		return true
+	}
+	value := reflect.ValueOf(protector)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func nilAgentStore(store Store) bool {
@@ -195,9 +309,10 @@ func (agent *Agent) acquireStore() (Store, func(), error) {
 }
 
 // Shutdown stops admission, waits for already admitted method calls, then
-// releases an explicitly owned Store. A borrowed Store is never closed. If ctx
-// expires while calls are draining, shutdown remains initiated and a later
-// call may finish it.
+// releases explicitly owned dependencies in reverse construction order:
+// Protector, then Store. Borrowed dependencies are never closed. ctx bounds
+// only this caller's wait; once initiated, draining and cleanup continue in the
+// background and Done closes after both bounded release attempts finish.
 func (agent *Agent) Shutdown(ctx context.Context) error {
 	if agent == nil {
 		return nil
@@ -205,27 +320,29 @@ func (agent *Agent) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: context is required", ErrInvalidArgument)
 	}
-	agent.lifecycle.Lock()
-	agent.closed = true
-	if agent.active == 0 {
-		agent.drainOnce.Do(func() { close(agent.drained) })
-	}
-	drained := agent.drained
-	agent.lifecycle.Unlock()
-
+	agent.shutdown.Do(func() {
+		agent.lifecycle.Lock()
+		agent.closed = true
+		if agent.active == 0 {
+			agent.drainOnce.Do(func() { close(agent.drained) })
+		}
+		agent.lifecycle.Unlock()
+		go agent.finishShutdown()
+	})
 	select {
-	case <-drained:
+	case <-agent.done:
+		return agent.closeErr
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	agent.finish.Do(func() {
-		agent.closeErr = agent.storeResource.Release(ctx)
-		close(agent.done)
-	})
-	return agent.closeErr
+}
+
+func (agent *Agent) finishShutdown() {
+	<-agent.drained
+	agent.closeErr = releaseAgentResources(
+		agent.releaseTimeout, agent.protectorResource, agent.storeResource,
+	)
+	close(agent.done)
 }
 
 // Done closes after Shutdown has drained calls and released owned resources.
@@ -275,6 +392,30 @@ func (agent *Agent) CreateTask(ctx context.Context, command CreateTaskCommand) (
 	}
 	defer release()
 	var result Task
+	var replayed bool
+	err = store.View(ctx, func(view StoreView) error {
+		replay, found, err := replayTaskCommandFromStore(
+			view, command.Task.Workspace.Authority, command.Meta.ID, "create_task", digest,
+		)
+		if err != nil || !found {
+			return err
+		}
+		if replay.Ref != command.Task || replay.Context != command.Context {
+			return fmt.Errorf("%w: create command result identity mismatch", ErrCorruptStore)
+		}
+		result, replayed = replay, true
+		return nil
+	})
+	if err != nil {
+		return Task{}, fmt.Errorf("preflight create Agent task: %w", err)
+	}
+	if replayed {
+		return cloneTask(result), nil
+	}
+	preparedMessage, err := agent.prepareMessageContent(ctx, command.Task, command.Message)
+	if err != nil {
+		return Task{}, err
+	}
 	err = store.Update(ctx, func(tx StoreTx) error {
 		if replay, found, err := replayTaskCommandFromStore(
 			tx, command.Task.Workspace.Authority, command.Meta.ID, "create_task", digest,
@@ -304,7 +445,7 @@ func (agent *Agent) CreateTask(ctx context.Context, command CreateTaskCommand) (
 			ID: command.Message.ID, Task: command.Task, Sequence: 1,
 			Author: AuthorCaller, Parts: cloneParts(command.Message.Parts), CreatedAt: now,
 		}
-		if err := insertMessageToStore(tx, message); err != nil {
+		if err := insertMessageToStore(tx, message, preparedMessage); err != nil {
 			return err
 		}
 		event := Event{
@@ -462,6 +603,38 @@ func (agent *Agent) transition(
 	}
 	defer release()
 	var result Task
+	var preparedMessage preparedMessageContent
+	if change.message != nil {
+		var replayed bool
+		err = store.View(ctx, func(view StoreView) error {
+			replay, found, err := replayTaskCommandFromStore(
+				view, ref.Workspace.Authority, meta.ID, kind, digest,
+			)
+			if err != nil || !found {
+				return err
+			}
+			if replay.Ref != ref {
+				return fmt.Errorf("%w: transition command result identity mismatch", ErrCorruptStore)
+			}
+			if grant != nil {
+				if _, err := verifyLeaseGrantHistoryFromStore(view, *grant); err != nil {
+					return err
+				}
+			}
+			result, replayed = replay, true
+			return nil
+		})
+		if err != nil {
+			return Task{}, fmt.Errorf("preflight %s: %w", kind, err)
+		}
+		if replayed {
+			return cloneTask(result), nil
+		}
+		preparedMessage, err = agent.prepareMessageContent(ctx, ref, *change.message)
+		if err != nil {
+			return Task{}, err
+		}
+	}
 	err = store.Update(ctx, func(tx StoreTx) error {
 		if replay, found, err := replayTaskCommandFromStore(
 			tx, ref.Workspace.Authority, meta.ID, kind, digest,
@@ -570,7 +743,7 @@ func (agent *Agent) transition(
 			return &RevisionConflictError{Expected: meta.ExpectedRevision, Actual: latest.Revision}
 		}
 		if change.message != nil {
-			if err := insertMessageToStore(tx, message); err != nil {
+			if err := insertMessageToStore(tx, message, preparedMessage); err != nil {
 				return err
 			}
 		}
@@ -738,6 +911,7 @@ func (agent *Agent) ListMessages(ctx context.Context, ref TaskRef, request PageR
 	}
 	defer release()
 	page := MessagePage{}
+	var selected []StoreMessageRecord
 	err = store.View(ctx, func(view StoreView) error {
 		task, err := loadTaskFromStore(view, ref)
 		if err != nil {
@@ -756,7 +930,7 @@ func (agent *Agent) ListMessages(ctx context.Context, ref TaskRef, request PageR
 		if err != nil {
 			return fmt.Errorf("list Agent messages: %w", err)
 		}
-		page.Items = make([]Message, 0, min(len(records), limit))
+		selected = make([]StoreMessageRecord, 0, min(len(records), limit))
 		expected := request.After + 1
 		for index, record := range records {
 			if index == limit {
@@ -766,22 +940,18 @@ func (agent *Agent) ListMessages(ctx context.Context, ref TaskRef, request PageR
 			if record.Task != ref || record.Sequence != expected {
 				return fmt.Errorf("%w: Agent message history has a sequence gap", ErrCorruptStore)
 			}
-			message, err := messageFromStoreRecord(record)
-			if err != nil {
-				return err
-			}
-			page.Items = append(page.Items, message)
+			selected = append(selected, record)
 			expected++
 		}
 		page.Next = request.After
-		if len(page.Items) > 0 {
-			page.Next = page.Items[len(page.Items)-1].Sequence
+		if len(selected) > 0 {
+			page.Next = selected[len(selected)-1].Sequence
 		}
 		if page.Next > task.MessageCount {
 			return fmt.Errorf("%w: Agent message history exceeds Task count", ErrCorruptStore)
 		}
 		if page.Next < task.MessageCount {
-			if len(page.Items) == 0 {
+			if len(selected) == 0 {
 				return fmt.Errorf("%w: Agent message history does not match Task count", ErrCorruptStore)
 			}
 			page.HasMore = true
@@ -790,6 +960,14 @@ func (agent *Agent) ListMessages(ctx context.Context, ref TaskRef, request PageR
 	})
 	if err != nil {
 		return MessagePage{}, err
+	}
+	page.Items = make([]Message, 0, len(selected))
+	for _, record := range selected {
+		message, err := agent.messageFromStoreRecord(ctx, record)
+		if err != nil {
+			return MessagePage{}, err
+		}
+		page.Items = append(page.Items, message)
 	}
 	return page, nil
 }

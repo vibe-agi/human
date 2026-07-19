@@ -165,18 +165,10 @@ func recordJSONCommandToStore(
 	return nil
 }
 
-func insertMessageToStore(tx StoreTx, message Message) error {
-	parts, err := json.Marshal(message.Parts)
-	if err != nil {
-		return fmt.Errorf("encode Agent message: %w", err)
-	}
-	digest, err := contentDigest(message.Parts)
-	if err != nil {
-		return err
-	}
+func insertMessageToStore(tx StoreTx, message Message, prepared preparedMessageContent) error {
 	if err := tx.InsertMessage(StoreMessageRecord{
 		ID: message.ID, Task: message.Task, Sequence: message.Sequence,
-		Author: message.Author, EncodedParts: parts, PartsDigest: StoreDigest(digest),
+		Author: message.Author, EncodedParts: appendExactAgentBytes(prepared.encoded), PartsDigest: prepared.digest,
 		CreatedAt: message.CreatedAt,
 	}); err != nil {
 		if errors.Is(err, ErrStoreConflict) {
@@ -185,31 +177,6 @@ func insertMessageToStore(tx StoreTx, message Message) error {
 		return fmt.Errorf("insert Agent message: %w", err)
 	}
 	return nil
-}
-
-func messageFromStoreRecord(record StoreMessageRecord) (Message, error) {
-	message := Message{
-		ID: record.ID, Task: record.Task, Sequence: record.Sequence,
-		Author: record.Author, CreatedAt: record.CreatedAt,
-	}
-	if len(record.EncodedParts) == 0 {
-		return Message{}, fmt.Errorf("%w: Agent message %q has empty encoded content", ErrCorruptStore, record.ID)
-	}
-	if err := json.Unmarshal(record.EncodedParts, &message.Parts); err != nil {
-		return Message{}, fmt.Errorf(
-			"%w: decode Agent message %q: %v", ErrCorruptStore, record.ID, err,
-		)
-	}
-	actual, err := contentDigest(message.Parts)
-	if err != nil || StoreDigest(actual) != record.PartsDigest {
-		return Message{}, fmt.Errorf(
-			"%w: Agent message %q content digest mismatch", ErrCorruptStore, record.ID,
-		)
-	}
-	if err := validateStoredMessage(message); err != nil {
-		return Message{}, err
-	}
-	return cloneMessage(message), nil
 }
 
 func insertEventToStore(tx StoreTx, event Event) error {

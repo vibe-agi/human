@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	agentSchemaVersion     = 1
-	agentSchemaFingerprint = "human-agent-v1-20260718g"
+	agentSchemaVersion     = 2
+	agentSchemaFingerprint = "human-agent-v2-20260719a"
 )
 
 var errUnsupportedSchema = errors.New("unsupported HumanAgent sqlite schema; use a dedicated database")
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS human_schema (
   fingerprint TEXT NOT NULL
 );
 INSERT INTO human_schema (component, version, fingerprint)
-VALUES ('agent', 1, 'human-agent-v1-20260718g')
+VALUES ('agent', 2, 'human-agent-v2-20260719a')
 ON CONFLICT(component) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS agent_tasks (
@@ -126,7 +126,6 @@ CREATE TABLE IF NOT EXISTS agent_artifacts (
     REFERENCES agent_tasks(authority_id, workspace_id, task_id)
     ON DELETE CASCADE,
   CHECK(base_revision <> result_revision),
-  CHECK(length(payload) = payload_size),
   CHECK(
     (state = 'frozen' AND published_at IS NULL AND discarded_at IS NULL) OR
     (state = 'published' AND published_at IS NOT NULL AND published_at >= frozen_at AND discarded_at IS NULL) OR
