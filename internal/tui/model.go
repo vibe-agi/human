@@ -1,4 +1,8 @@
 // Package tui contains the Bubble Tea worker interface.
+//
+// FROZEN (docs/11-human-side.md M0): bug fixes only. New human-side features
+// land in the public workerkit domain layer and the web UI; this package is
+// deleted once the web-driven real-OpenCode door reaches TUI door coverage.
 package tui
 
 import (

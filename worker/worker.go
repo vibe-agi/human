@@ -1,6 +1,10 @@
 // Package worker embeds a Human worker and its Bubble Tea interface in another
 // Go application. Applications that only need the stock terminal program can
 // use `human worker`; embedders keep control of the program lifecycle.
+//
+// FROZEN (docs/11-human-side.md M0): bug fixes only. The terminal interface is
+// replaced by the web UI over the public workerkit domain layer and will be
+// deleted once the web-driven real-OpenCode door reaches TUI door coverage.
 package worker
 
 import (

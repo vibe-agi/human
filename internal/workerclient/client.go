@@ -1,4 +1,8 @@
 // Package workerclient implements the human TUI side of the private worker WS.
+//
+// FROZEN (docs/11-human-side.md M0): bug fixes only. This legacy dialect is
+// deleted with the TUI once the web door reaches TUI door coverage; the
+// public replacement is llm/workerws.Client under the workerkit domain layer.
 package workerclient
 
 import (
