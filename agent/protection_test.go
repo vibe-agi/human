@@ -598,6 +598,22 @@ func newAgentWithTestProtector(t *testing.T, protector protect.Protector) *Agent
 	return service
 }
 
+func TestAgentRejectsBorrowedTypedNilProtector(t *testing.T) {
+	base, _ := openTestAgent(t)
+	var typedNil *contractTestProtector
+	config := DefaultConfig()
+	config.Store = framework.Borrow[Store](base.store)
+	config.Protector = framework.Borrow[protect.Protector](typedNil)
+	service, err := New(t.Context(), config)
+	if service != nil {
+		_ = service.Close()
+		t.Fatal("New returned a service for a borrowed typed-nil Protector")
+	}
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("New error = %v, want ErrInvalidArgument", err)
+	}
+}
+
 func (protector *countingProtector) Seal(ctx context.Context, binding protect.Binding, plaintext []byte) (protect.Envelope, error) {
 	protector.seals.Add(1)
 	return protector.Protector.Seal(ctx, binding, plaintext)

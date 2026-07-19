@@ -188,11 +188,15 @@ func newAgent(
 		protector, err = protectorResource.Value()
 		if err != nil {
 			err = fmt.Errorf("acquire Agent Protector resource: %w", err)
-		} else if nilProtector(protector) {
-			protector = nil
+		} else if protector == nil {
 			if protectorResource.Owned() {
 				err = fmt.Errorf("%w: owned Agent Protector is nil", ErrInvalidArgument)
 			}
+		} else if nilProtector(protector) {
+			// A typed-nil interface is an explicit, broken adapter value rather than
+			// the zero Resource's intentional "Protector not configured" state. Never
+			// turn this common Go wiring mistake into silent plaintext persistence.
+			err = fmt.Errorf("%w: Agent Protector is typed nil", ErrInvalidArgument)
 		} else {
 			description, descriptionErr := protector.Describe(ctx)
 			if descriptionErr != nil {
