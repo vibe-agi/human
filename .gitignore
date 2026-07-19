@@ -19,3 +19,4 @@
 # Locally installed formal-method tooling
 /formal/tla2tools.jar
 /formal/states/
+web/e2e/node_modules/

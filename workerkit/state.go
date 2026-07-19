@@ -85,8 +85,11 @@ type Conversation struct {
 	Assignment  llm.WorkerAssignmentDelivery `json:"assignment"`
 	Transcript  []TranscriptEntry            `json:"transcript"`
 	ParkedCalls []llm.ToolCall               `json:"parked_calls,omitempty"`
-	Draft       string                       `json:"draft,omitempty"`
-	UpdatedAt   time.Time                    `json:"updated_at"`
+	// Delivery is the in-flight reviewed batch, settled when every call of the
+	// batch returns a successful result.
+	Delivery  *PendingDelivery `json:"delivery,omitempty"`
+	Draft     string           `json:"draft,omitempty"`
+	UpdatedAt time.Time        `json:"updated_at"`
 }
 
 // StateStore persists accepted conversations across worker restarts. It is
@@ -124,6 +127,9 @@ type InboxItem struct {
 type State struct {
 	Inbox         []InboxItem
 	Conversations []Conversation
+	// Review is the latest complete Live Workspace review, or nil without a
+	// configured Mirror (or before its first publication).
+	Review *Review
 }
 
 func cloneConversation(conversation Conversation) Conversation {

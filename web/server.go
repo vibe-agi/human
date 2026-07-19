@@ -95,6 +95,8 @@ func New(config Config) (*Server, error) {
 	mux.HandleFunc("POST /api/final", server.withAuth(server.conversationText(server.worker.Final)))
 	mux.HandleFunc("POST /api/draft", server.withAuth(server.conversationText(server.worker.SaveDraft)))
 	mux.HandleFunc("POST /api/tool-calls", server.withAuth(server.handleToolCalls))
+	mux.HandleFunc("POST /api/review/deliver", server.withAuth(server.handleDeliverChanges))
+	mux.HandleFunc("POST /api/review/discard", server.withAuth(server.handleDiscardChanges))
 	server.mux = mux
 	go server.pump()
 	return server, nil
@@ -333,6 +335,37 @@ func (server *Server) handleToolCalls(response http.ResponseWriter, request *htt
 	writeJSON(response, http.StatusOK, map[string]any{"ok": true})
 }
 
+type reviewRequest struct {
+	Caller    string   `json:"caller,omitempty"`
+	TaskID    string   `json:"task_id,omitempty"`
+	ChangeIDs []string `json:"change_ids"`
+}
+
+func (server *Server) handleDeliverChanges(response http.ResponseWriter, request *http.Request) {
+	var body reviewRequest
+	if !decodeBody(response, request, &body) {
+		return
+	}
+	key := workerkit.ConversationKey{Caller: llm.CallerID(body.Caller), TaskID: llm.TaskID(body.TaskID)}
+	if err := server.worker.DeliverChanges(request.Context(), key, body.ChangeIDs); err != nil {
+		writeCommandError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (server *Server) handleDiscardChanges(response http.ResponseWriter, request *http.Request) {
+	var body reviewRequest
+	if !decodeBody(response, request, &body) {
+		return
+	}
+	if err := server.worker.DiscardChanges(request.Context(), body.ChangeIDs); err != nil {
+		writeCommandError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"ok": true})
+}
+
 func decodeBody(response http.ResponseWriter, request *http.Request, target any) bool {
 	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, 1<<20))
 	decoder.DisallowUnknownFields()
@@ -345,11 +378,13 @@ func decodeBody(response http.ResponseWriter, request *http.Request, target any)
 
 func writeCommandError(response http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, workerkit.ErrUnknownDelivery), errors.Is(err, workerkit.ErrUnknownConversation):
+	case errors.Is(err, workerkit.ErrUnknownDelivery), errors.Is(err, workerkit.ErrUnknownConversation),
+		errors.Is(err, workerkit.ErrUnknownChange):
 		writeError(response, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, workerkit.ErrConversationTerminal),
 		errors.Is(err, workerkit.ErrConversationNotActive),
-		errors.Is(err, workerkit.ErrTooManyContinuations):
+		errors.Is(err, workerkit.ErrTooManyContinuations),
+		errors.Is(err, workerkit.ErrNoMirror):
 		writeError(response, http.StatusConflict, "conflict", err.Error())
 	case errors.Is(err, workerkit.ErrInvalidCommand):
 		writeError(response, http.StatusBadRequest, "invalid_command", err.Error())
@@ -388,5 +423,9 @@ func stateView(state workerkit.State) map[string]any {
 	}
 	conversations := make([]workerkit.Conversation, 0, len(state.Conversations))
 	conversations = append(conversations, state.Conversations...)
-	return map[string]any{"inbox": inbox, "conversations": conversations}
+	view := map[string]any{"inbox": inbox, "conversations": conversations}
+	if state.Review != nil {
+		view["review"] = state.Review
+	}
+	return view
 }

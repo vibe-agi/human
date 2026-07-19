@@ -1,0 +1,9 @@
+{
+  "name": "human-web-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Browser driver for the Human web real door; launched by the gated Go test, not standalone.",
+  "dependencies": {
+    "playwright": "^1.55.0"
+  }
+}

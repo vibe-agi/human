@@ -44,6 +44,8 @@ var (
 	ErrConversationTerminal  = errors.New("workerkit: conversation is terminal")
 	ErrConversationNotActive = errors.New("workerkit: conversation is not active")
 	ErrTooManyContinuations  = errors.New("workerkit: too many parked continuations")
+	ErrNoMirror              = errors.New("workerkit: no Mirror is configured")
+	ErrUnknownChange         = errors.New("workerkit: unknown review change")
 )
 
 // Config composes one Worker. Wire and State are required borrowed
@@ -51,6 +53,9 @@ var (
 type Config struct {
 	Wire  Wire
 	State StateStore
+	// Mirror optionally enables the Live Workspace review/delivery surface.
+	// Without it, DeliverChanges and DiscardChanges fail with ErrNoMirror.
+	Mirror Mirror
 	// Clock supplies transcript timestamps. Nil uses time.Now.
 	Clock func() time.Time
 	// IDs allocates event and delivery identifiers. Nil uses crypto/rand. The
@@ -61,16 +66,18 @@ type Config struct {
 // Worker is the headless human-side domain object. All methods are safe for
 // concurrent use; commands are serialized internally.
 type Worker struct {
-	wire  Wire
-	state StateStore
-	now   func() time.Time
-	ids   func(kind string) (string, error)
+	wire   Wire
+	state  StateStore
+	mirror Mirror
+	now    func() time.Time
+	ids    func(kind string) (string, error)
 
 	mu            sync.Mutex
 	inbox         []InboxItem
 	inboxRequests map[llm.WorkerDeliveryID]llm.Request
 	pending       map[llm.WorkerDeliveryID]llm.WorkerAssignmentDelivery
 	conversations map[ConversationKey]*Conversation
+	review        *Review
 	closed        bool
 
 	notifications chan struct{}
@@ -108,7 +115,7 @@ func Open(ctx context.Context, config Config) (*Worker, error) {
 	}
 	loopCtx, loopCancel := context.WithCancel(context.Background())
 	worker := &Worker{
-		wire: config.Wire, state: config.State, now: now, ids: ids,
+		wire: config.Wire, state: config.State, mirror: config.Mirror, now: now, ids: ids,
 		inboxRequests: make(map[llm.WorkerDeliveryID]llm.Request),
 		conversations: make(map[ConversationKey]*Conversation, len(restored)),
 		notifications: make(chan struct{}, 1),
@@ -153,6 +160,11 @@ func (worker *Worker) Snapshot() State {
 		}
 		return a.TaskID < b.TaskID
 	})
+	if worker.review != nil {
+		review := *worker.review
+		review.Changes = append([]Change(nil), worker.review.Changes...)
+		state.Review = &review
+	}
 	return state
 }
 
@@ -185,6 +197,10 @@ func (worker *Worker) run() {
 	defer close(worker.loopDone)
 	assignments := worker.wire.Assignments()
 	rejections := worker.wire.Rejections()
+	var reviews <-chan Review
+	if worker.mirror != nil {
+		reviews = worker.mirror.Reviews()
+	}
 	for {
 		select {
 		case assignment, open := <-assignments:
@@ -199,6 +215,17 @@ func (worker *Worker) run() {
 				continue
 			}
 			worker.handleRejection(rejection)
+		case review, open := <-reviews:
+			if !open {
+				reviews = nil
+				continue
+			}
+			worker.mu.Lock()
+			cloned := review
+			cloned.Changes = append([]Change(nil), review.Changes...)
+			worker.review = &cloned
+			worker.mu.Unlock()
+			worker.notify()
 		case <-worker.wire.Done():
 			return
 		case <-worker.loopCtx.Done():
@@ -239,7 +266,7 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 			return
 		}
 		// Caller continuation for a live conversation: resume it.
-		worker.resumeLocked(conversation, delivery)
+		settlement := worker.resumeLocked(conversation, delivery)
 		saved := *conversation
 		worker.mu.Unlock()
 		if err := worker.state.SaveConversation(worker.loopCtx, cloneConversation(saved)); err != nil {
@@ -258,6 +285,12 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 			return
 		}
 		_ = worker.wire.ConfirmAssignment(worker.loopCtx, delivery.ID)
+		if settlement != nil && worker.mirror != nil {
+			// Settlement follows the durable resume; Settle is idempotent, so a
+			// crash between save and this call re-settles on the next result
+			// replay rather than losing or double-advancing the baseline.
+			_ = worker.mirror.Settle(worker.loopCtx, *settlement)
+		}
 		worker.notify()
 		return
 	}
@@ -284,17 +317,43 @@ func (worker *Worker) pendingAssignments() map[llm.WorkerDeliveryID]llm.WorkerAs
 	return worker.pending
 }
 
-func (worker *Worker) resumeLocked(conversation *Conversation, delivery llm.WorkerAssignmentDelivery) {
+// resumeLocked folds a caller continuation into the conversation and returns
+// the mirror settlement earned by a fully successful delivered batch, if any.
+func (worker *Worker) resumeLocked(conversation *Conversation, delivery llm.WorkerAssignmentDelivery) *MirrorSettlement {
 	now := worker.now().UTC()
+	var settlement *MirrorSettlement
 	if len(conversation.ParkedCalls) > 0 {
 		results := extractToolResults(delivery.Assignment.Request)
 		for _, call := range conversation.ParkedCalls {
-			if text, found := results[call.ID]; found {
-				conversation.Transcript = append(conversation.Transcript, TranscriptEntry{
+			if result, found := results[call.ID]; found {
+				entry := TranscriptEntry{
 					At: now, Author: AuthorCaller, Kind: EntryToolResult,
-					ToolCallID: call.ID, Text: text,
-				})
+					ToolCallID: call.ID, Text: result.text,
+				}
+				if result.isError {
+					entry.Code = "tool_error"
+				}
+				conversation.Transcript = append(conversation.Transcript, entry)
 			}
+		}
+		if pending := conversation.Delivery; pending != nil {
+			allSucceeded := true
+			for _, callID := range pending.CallIDs {
+				result, found := results[callID]
+				if !found || result.isError {
+					allSucceeded = false
+					break
+				}
+			}
+			if allSucceeded {
+				settlement = &MirrorSettlement{
+					ChangeIDs: append([]string(nil), pending.ChangeIDs...),
+					Outcome:   MirrorDelivered,
+				}
+			}
+			// Whether it settles or failed, this batch is finished; failed
+			// changes stay pending inside the mirror and reappear in review.
+			conversation.Delivery = nil
 		}
 		conversation.ParkedCalls = nil
 	} else if text := latestUserText(delivery.Assignment.Request); text != "" {
@@ -305,6 +364,7 @@ func (worker *Worker) resumeLocked(conversation *Conversation, delivery llm.Work
 	conversation.Assignment = delivery
 	conversation.Phase = PhaseActive
 	conversation.UpdatedAt = now
+	return settlement
 }
 
 func (worker *Worker) handleRejection(rejection Rejection) {
@@ -428,6 +488,15 @@ func (worker *Worker) Final(ctx context.Context, key ConversationKey, text strin
 // SubmitToolCalls asks the caller agent to execute tools and parks the
 // conversation until the caller continues with their results.
 func (worker *Worker) SubmitToolCalls(ctx context.Context, key ConversationKey, calls []llm.ToolCall) error {
+	return worker.sendToolCallBatch(ctx, key, calls, nil)
+}
+
+func (worker *Worker) sendToolCallBatch(
+	ctx context.Context,
+	key ConversationKey,
+	calls []llm.ToolCall,
+	delivery *PendingDelivery,
+) error {
 	if len(calls) == 0 {
 		return fmt.Errorf("%w: at least one tool call is required", ErrInvalidCommand)
 	}
@@ -444,7 +513,94 @@ func (worker *Worker) SubmitToolCalls(ctx context.Context, key ConversationKey, 
 	}
 	cloned := make([]llm.ToolCall, len(calls))
 	copy(cloned, calls)
-	return worker.sendConversationEventWith(ctx, key, llm.Event{Type: llm.EventToolCalls, ToolCalls: cloned}, PhaseAwaitingResults, cloned)
+	return worker.sendConversationEventWith(
+		ctx, key, llm.Event{Type: llm.EventToolCalls, ToolCalls: cloned},
+		PhaseAwaitingResults, cloned, delivery,
+	)
+}
+
+// DeliverChanges projects reviewed workspace changes onto the caller's
+// declared native tools and sends them as one tool-call batch. The mirror
+// baseline advances only when the caller returns successful results for every
+// call; a failed send or a failed result leaves the changes pending in review.
+func (worker *Worker) DeliverChanges(ctx context.Context, key ConversationKey, changeIDs []string) error {
+	if err := worker.checkCommand(ctx); err != nil {
+		return err
+	}
+	if worker.mirror == nil {
+		return ErrNoMirror
+	}
+	if len(changeIDs) == 0 {
+		return fmt.Errorf("%w: at least one change is required", ErrInvalidCommand)
+	}
+	worker.mu.Lock()
+	if worker.review == nil {
+		worker.mu.Unlock()
+		return fmt.Errorf("%w: no review is available", ErrUnknownChange)
+	}
+	known := make(map[string]struct{}, len(worker.review.Changes))
+	for _, change := range worker.review.Changes {
+		known[change.ID] = struct{}{}
+	}
+	for _, changeID := range changeIDs {
+		if _, exists := known[changeID]; !exists {
+			worker.mu.Unlock()
+			return fmt.Errorf("%w: %s", ErrUnknownChange, changeID)
+		}
+	}
+	conversation, exists := worker.conversations[key]
+	if !exists {
+		worker.mu.Unlock()
+		return fmt.Errorf("%w: %v", ErrUnknownConversation, key)
+	}
+	if conversation.Phase != PhaseActive {
+		phase := conversation.Phase
+		worker.mu.Unlock()
+		if phase == PhaseTerminal {
+			return fmt.Errorf("%w: %v", ErrConversationTerminal, key)
+		}
+		return fmt.Errorf("%w: %v is %s", ErrConversationNotActive, key, phase)
+	}
+	tools := append([]llm.Tool(nil), conversation.Assignment.Assignment.Request.Tools...)
+	worker.mu.Unlock()
+
+	calls, err := worker.mirror.Resolve(ctx, MirrorResolve{
+		ChangeIDs: append([]string(nil), changeIDs...), Tools: tools,
+	})
+	if err != nil {
+		return fmt.Errorf("workerkit: resolve reviewed changes: %w", err)
+	}
+	if len(calls) == 0 {
+		return fmt.Errorf("%w: mirror produced no tool calls", ErrInvalidCommand)
+	}
+	callIDs := make([]string, 0, len(calls))
+	for _, call := range calls {
+		callIDs = append(callIDs, call.ID)
+	}
+	delivery := &PendingDelivery{
+		ChangeIDs: append([]string(nil), changeIDs...), CallIDs: callIDs,
+	}
+	return worker.sendToolCallBatch(ctx, key, calls, delivery)
+}
+
+// DiscardChanges settles reviewed changes as discarded without delivery.
+func (worker *Worker) DiscardChanges(ctx context.Context, changeIDs []string) error {
+	if err := worker.checkCommand(ctx); err != nil {
+		return err
+	}
+	if worker.mirror == nil {
+		return ErrNoMirror
+	}
+	if len(changeIDs) == 0 {
+		return fmt.Errorf("%w: at least one change is required", ErrInvalidCommand)
+	}
+	if err := worker.mirror.Settle(ctx, MirrorSettlement{
+		ChangeIDs: append([]string(nil), changeIDs...), Outcome: MirrorDiscarded,
+	}); err != nil {
+		return fmt.Errorf("workerkit: discard reviewed changes: %w", err)
+	}
+	worker.notify()
+	return nil
 }
 
 // SaveDraft persists an unsent reply for a conversation.
@@ -470,7 +626,7 @@ func (worker *Worker) SaveDraft(ctx context.Context, key ConversationKey, draft 
 }
 
 func (worker *Worker) sendConversationEvent(ctx context.Context, key ConversationKey, event llm.Event, next Phase) error {
-	return worker.sendConversationEventWith(ctx, key, event, next, nil)
+	return worker.sendConversationEventWith(ctx, key, event, next, nil, nil)
 }
 
 func (worker *Worker) sendConversationEventWith(
@@ -479,6 +635,7 @@ func (worker *Worker) sendConversationEventWith(
 	event llm.Event,
 	next Phase,
 	parked []llm.ToolCall,
+	delivery *PendingDelivery,
 ) error {
 	if err := worker.checkCommand(ctx); err != nil {
 		return err
@@ -504,11 +661,11 @@ func (worker *Worker) sendConversationEventWith(
 	assignment := conversation.Assignment
 	worker.mu.Unlock()
 
-	delivery, err := worker.buildEvent(assignment, event)
+	wireEvent, err := worker.buildEvent(assignment, event)
 	if err != nil {
 		return err
 	}
-	if err := worker.wire.SendEvent(ctx, delivery); err != nil {
+	if err := worker.wire.SendEvent(ctx, wireEvent); err != nil {
 		return fmt.Errorf("workerkit: send %s event: %w", event.Type, err)
 	}
 
@@ -526,6 +683,7 @@ func (worker *Worker) sendConversationEventWith(
 	conversation.Transcript = append(conversation.Transcript, entry)
 	conversation.Phase = next
 	conversation.ParkedCalls = parked
+	conversation.Delivery = delivery
 	conversation.Draft = ""
 	conversation.UpdatedAt = now
 	saved := cloneConversation(*conversation)
@@ -645,14 +803,21 @@ func latestUserText(request llm.Request) string {
 	return ""
 }
 
-func extractToolResults(request llm.Request) map[string]string {
-	results := make(map[string]string)
+type toolResult struct {
+	text    string
+	isError bool
+}
+
+func extractToolResults(request llm.Request) map[string]toolResult {
+	results := make(map[string]toolResult)
 	for _, message := range request.Messages {
 		for _, block := range message.Blocks {
 			if block.Type != llm.BlockToolResult || block.ToolCallID == "" {
 				continue
 			}
-			results[block.ToolCallID] = formatToolOutput(block.Output)
+			results[block.ToolCallID] = toolResult{
+				text: formatToolOutput(block.Output), isError: block.IsError,
+			}
 		}
 	}
 	return results
