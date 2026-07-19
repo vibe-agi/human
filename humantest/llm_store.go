@@ -50,6 +50,8 @@ func TestLLMStore(t *testing.T, factory LLMStoreFactory) {
 		{"read_your_writes", testLLMStoreReadYourWrites},
 		{"stable_view_snapshot", testLLMStoreSnapshot},
 		{"concurrent_updates_are_serializable", testLLMStoreConcurrentUpdates},
+		{"malformed_public_primitives_fail_closed", testLLMStoreMalformedPrimitives},
+		{"cas_preserves_cross_record_uniqueness", testLLMStoreCASUniqueness},
 		{"task_affinity_compare_and_swap_and_identity", testLLMStoreTasks},
 		{"request_activity_compare_and_swap_bytes_and_identity", testLLMStoreRequests},
 		{"response_event_order_filters_and_budgets", testLLMStoreResponseEvents},
@@ -92,6 +94,352 @@ func TestLLMStore(t *testing.T, factory LLMStoreFactory) {
 			}
 			test.run(ctx, t, store)
 		})
+	}
+}
+
+func testLLMStoreMalformedPrimitives(ctx context.Context, t *testing.T, store llm.Store) {
+	t.Helper()
+	task := llmConformanceTask("malformed", 1, llm.TaskAwaitingCaller)
+	request := llmConformanceRequest(task, "malformed", []byte("canonical"))
+	tool := llmConformanceTool(task, "tool-malformed", llm.ToolExecutionPending, nil)
+	if err := store.Update(ctx, func(tx llm.StoreTx) error {
+		if err := tx.InsertTask(task); err != nil {
+			return err
+		}
+		if err := tx.InsertRequest(request); err != nil {
+			return err
+		}
+		return tx.InsertToolExecution(tool)
+	}); err != nil {
+		t.Fatalf("seed malformed primitive fixtures: %v", err)
+	}
+
+	invalidViews := []struct {
+		name string
+		call func(llm.StoreView) error
+	}{
+		{"load_task_key", func(view llm.StoreView) error { _, err := view.LoadTask(llm.StoreTaskKey{}); return err }},
+		{"find_open_task_affinity", func(view llm.StoreView) error {
+			_, err := view.FindOpenTask(llm.StoreTaskAffinity{Caller: task.Key.Caller})
+			return err
+		}},
+		{"find_active_request_task", func(view llm.StoreView) error { _, err := view.FindActiveRequest(llm.StoreTaskKey{}); return err }},
+		{"load_request_head_key", func(view llm.StoreView) error { _, err := view.LoadRequestHead(llm.StoreRequestKey{}); return err }},
+		{"load_request_key", func(view llm.StoreView) error {
+			_, err := view.LoadRequest(llm.StoreRequestKey{}, llmGenerousReadLimit())
+			return err
+		}},
+		{"load_decision_key", func(view llm.StoreView) error {
+			_, err := view.LoadResponseDecision(llm.StoreRequestKey{}, llmGenerousReadLimit())
+			return err
+		}},
+		{"load_receipt_key", func(view llm.StoreView) error {
+			_, err := view.LoadWorkerReceipt(llm.StoreRequestKey{}, "event")
+			return err
+		}},
+		{"load_receipt_event", func(view llm.StoreView) error { _, err := view.LoadWorkerReceipt(request.Key, ""); return err }},
+		{"load_tool_key", func(view llm.StoreView) error {
+			_, err := view.LoadToolExecution(llm.StoreToolExecutionKey{}, llmGenerousReadLimit())
+			return err
+		}},
+		{"response_scan_key", func(view llm.StoreView) error {
+			_, err := view.ScanResponseEvents(llm.StoreResponseEventScan{Limit: 1, ReadLimit: llmGenerousReadLimit()})
+			return err
+		}},
+		{"response_scan_kind", func(view llm.StoreView) error {
+			_, err := view.ScanResponseEvents(llm.StoreResponseEventScan{
+				Request: request.Key, Kinds: []llm.StoreResponseEventKind{"invalid"}, Limit: 1, ReadLimit: llmGenerousReadLimit(),
+			})
+			return err
+		}},
+		{"response_scan_duplicate_kind", func(view llm.StoreView) error {
+			_, err := view.ScanResponseEvents(llm.StoreResponseEventScan{
+				Request: request.Key, Kinds: []llm.StoreResponseEventKind{llm.StoreEventWire, llm.StoreEventWire},
+				Limit: 1, ReadLimit: llmGenerousReadLimit(),
+			})
+			return err
+		}},
+		{"response_scan_limit", func(view llm.StoreView) error {
+			_, err := view.ScanResponseEvents(llm.StoreResponseEventScan{Request: request.Key, Limit: 0, ReadLimit: llmGenerousReadLimit()})
+			return err
+		}},
+		{"tool_scan_task", func(view llm.StoreView) error {
+			_, err := view.ScanToolExecutions(llm.StoreToolExecutionScan{Limit: 1, ReadLimit: llmGenerousReadLimit()})
+			return err
+		}},
+		{"tool_scan_state", func(view llm.StoreView) error {
+			_, err := view.ScanToolExecutions(llm.StoreToolExecutionScan{
+				Task: task.Key, State: "invalid", Limit: 1, ReadLimit: llmGenerousReadLimit(),
+			})
+			return err
+		}},
+		{"recovery_scan_cursor", func(view llm.StoreView) error {
+			_, err := view.ScanRecovery(llm.StoreRecoveryScan{
+				After: &llm.StoreRecoveryCursor{Caller: task.Key.Caller}, Limit: 1, ReadLimit: llmGenerousReadLimit(),
+			})
+			return err
+		}},
+		{"retention_scan_boundary", func(view llm.StoreView) error {
+			_, err := view.ScanRetention(llm.StoreRetentionScan{Limit: 1})
+			return err
+		}},
+		{"retention_scan_cursor", func(view llm.StoreView) error {
+			_, err := view.ScanRetention(llm.StoreRetentionScan{
+				CompletedBefore: llmConformanceTime(100), After: &llm.StoreRetentionCursor{Caller: task.Key.Caller}, Limit: 1,
+			})
+			return err
+		}},
+		{"retention_scan_limit", func(view llm.StoreView) error {
+			_, err := view.ScanRetention(llm.StoreRetentionScan{CompletedBefore: llmConformanceTime(100), Limit: 4097})
+			return err
+		}},
+	}
+	for _, test := range invalidViews {
+		t.Run("view/"+test.name, func(t *testing.T) {
+			err := store.View(ctx, test.call)
+			if !errors.Is(err, llm.ErrStoreInvalidArgument) {
+				t.Fatalf("error = %v, want ErrStoreInvalidArgument", err)
+			}
+		})
+	}
+
+	limitedViews := []struct {
+		name string
+		call func(llm.StoreView) error
+	}{
+		{"load_request", func(view llm.StoreView) error {
+			_, err := view.LoadRequest(request.Key, llm.StoreReadLimit{})
+			return err
+		}},
+		{"load_decision", func(view llm.StoreView) error {
+			_, err := view.LoadResponseDecision(request.Key, llm.StoreReadLimit{})
+			return err
+		}},
+		{"load_tool", func(view llm.StoreView) error {
+			_, err := view.LoadToolExecution(tool.Key, llm.StoreReadLimit{})
+			return err
+		}},
+		{"response_scan", func(view llm.StoreView) error {
+			_, err := view.ScanResponseEvents(llm.StoreResponseEventScan{Request: request.Key, Limit: 1})
+			return err
+		}},
+		{"tool_scan", func(view llm.StoreView) error {
+			_, err := view.ScanToolExecutions(llm.StoreToolExecutionScan{Task: task.Key, Limit: 1})
+			return err
+		}},
+		{"recovery_scan", func(view llm.StoreView) error {
+			_, err := view.ScanRecovery(llm.StoreRecoveryScan{Limit: 1})
+			return err
+		}},
+	}
+	for _, test := range limitedViews {
+		t.Run("read_limit/"+test.name, func(t *testing.T) {
+			err := store.View(ctx, test.call)
+			if !errors.Is(err, llm.ErrStoreRecordTooLarge) {
+				t.Fatalf("error = %v, want ErrStoreRecordTooLarge", err)
+			}
+		})
+	}
+
+	invalidTasks := []struct {
+		name   string
+		mutate func(*llm.StoreTaskRecord)
+	}{
+		{"key", func(record *llm.StoreTaskRecord) { record.Key = llm.StoreTaskKey{} }},
+		{"revision", func(record *llm.StoreTaskRecord) { record.Revision = 0 }},
+		{"created_at", func(record *llm.StoreTaskRecord) { record.CreatedAt = time.Time{} }},
+		{"updated_at", func(record *llm.StoreTaskRecord) { record.UpdatedAt = time.Time{} }},
+		{"state", func(record *llm.StoreTaskRecord) { record.State = "invalid" }},
+		{"codec", func(record *llm.StoreTaskRecord) { record.Codec = llm.CodecSnapshot{} }},
+		{"capability", func(record *llm.StoreTaskRecord) { record.CapabilityTier = "invalid" }},
+		{"affinity", func(record *llm.StoreTaskRecord) { record.HarnessSessionID = "" }},
+	}
+	for _, test := range invalidTasks {
+		t.Run("insert_task/"+test.name, func(t *testing.T) {
+			record := llmConformanceTask("invalid-task-"+test.name, 1, llm.TaskAwaitingCaller)
+			test.mutate(&record)
+			llmAssertInvalidUpdate(ctx, t, store, func(tx llm.StoreTx) error { return tx.InsertTask(record) })
+		})
+	}
+
+	invalidRequests := []struct {
+		name   string
+		mutate func(*llm.StoreRequestRecord)
+	}{
+		{"key", func(record *llm.StoreRequestRecord) { record.Key = llm.StoreRequestKey{} }},
+		{"task", func(record *llm.StoreRequestRecord) { record.Task = llm.StoreTaskKey{} }},
+		{"request_id", func(record *llm.StoreRequestRecord) { record.RequestID = "" }},
+		{"response_id", func(record *llm.StoreRequestRecord) { record.ResponseID = "" }},
+		{"digest", func(record *llm.StoreRequestRecord) { record.RequestDigest = "" }},
+		{"revision", func(record *llm.StoreRequestRecord) { record.Revision = 0 }},
+		{"created_at", func(record *llm.StoreRequestRecord) { record.CreatedAt = time.Time{} }},
+		{"mode", func(record *llm.StoreRequestRecord) { record.Mode = "invalid" }},
+		{"codec", func(record *llm.StoreRequestRecord) { record.Codec = llm.CodecSnapshot{} }},
+		{"tombstone_payload", func(record *llm.StoreRequestRecord) {
+			pruned := llmConformanceTime(10)
+			record.PayloadPrunedAt = &pruned
+		}},
+	}
+	for _, test := range invalidRequests {
+		t.Run("insert_request/"+test.name, func(t *testing.T) {
+			record := llmConformanceRequest(task, "invalid-request-"+test.name, []byte("payload"))
+			test.mutate(&record)
+			llmAssertInvalidUpdate(ctx, t, store, func(tx llm.StoreTx) error { return tx.InsertRequest(record) })
+		})
+	}
+
+	invalidEvents := []struct {
+		name   string
+		mutate func(*llm.StoreResponseEventRecord)
+	}{
+		{"request", func(record *llm.StoreResponseEventRecord) { record.Request = llm.StoreRequestKey{} }},
+		{"sequence", func(record *llm.StoreResponseEventRecord) { record.Sequence = 0 }},
+		{"kind", func(record *llm.StoreResponseEventRecord) { record.Kind = "invalid" }},
+		{"created_at", func(record *llm.StoreResponseEventRecord) { record.CreatedAt = time.Time{} }},
+		{"worker", func(record *llm.StoreResponseEventRecord) { record.Worker = "" }},
+		{"event_id", func(record *llm.StoreResponseEventRecord) { record.WorkerEventID = "" }},
+		{"digest", func(record *llm.StoreResponseEventRecord) { record.WorkerEventDigest = "" }},
+	}
+	for _, test := range invalidEvents {
+		t.Run("insert_event/"+test.name, func(t *testing.T) {
+			record := llmConformanceEvent(request.Key, 1, llm.StoreEventWire, "event-malformed", llmDigest('m'), nil)
+			test.mutate(&record)
+			llmAssertInvalidUpdate(ctx, t, store, func(tx llm.StoreTx) error { return tx.InsertResponseEvent(record) })
+		})
+	}
+
+	invalidReceipts := []struct {
+		name   string
+		mutate func(*llm.StoreWorkerReceiptRecord)
+	}{
+		{"request", func(record *llm.StoreWorkerReceiptRecord) { record.Request = llm.StoreRequestKey{} }},
+		{"event_id", func(record *llm.StoreWorkerReceiptRecord) { record.EventID = "" }},
+		{"worker", func(record *llm.StoreWorkerReceiptRecord) { record.Worker = "" }},
+		{"digest", func(record *llm.StoreWorkerReceiptRecord) { record.Digest = "" }},
+		{"created_at", func(record *llm.StoreWorkerReceiptRecord) { record.CreatedAt = time.Time{} }},
+	}
+	for _, test := range invalidReceipts {
+		t.Run("insert_receipt/"+test.name, func(t *testing.T) {
+			record := llm.StoreWorkerReceiptRecord{
+				Request: request.Key, EventID: "event-malformed", Worker: "worker-a",
+				Digest: llmDigest('m'), CreatedAt: llmConformanceTime(5),
+			}
+			test.mutate(&record)
+			llmAssertInvalidUpdate(ctx, t, store, func(tx llm.StoreTx) error { return tx.InsertWorkerReceipt(record) })
+		})
+	}
+
+	invalidTools := []struct {
+		name   string
+		mutate func(*llm.StoreToolExecutionRecord)
+	}{
+		{"key", func(record *llm.StoreToolExecutionRecord) { record.Key = llm.StoreToolExecutionKey{} }},
+		{"digest", func(record *llm.StoreToolExecutionRecord) { record.InputDigest = "" }},
+		{"state", func(record *llm.StoreToolExecutionRecord) { record.State = "invalid" }},
+		{"revision", func(record *llm.StoreToolExecutionRecord) { record.Revision = 0 }},
+		{"created_at", func(record *llm.StoreToolExecutionRecord) { record.CreatedAt = time.Time{} }},
+	}
+	for _, test := range invalidTools {
+		t.Run("insert_tool/"+test.name, func(t *testing.T) {
+			record := llmConformanceTool(task, "invalid-tool-"+test.name, llm.ToolExecutionPending, nil)
+			test.mutate(&record)
+			llmAssertInvalidUpdate(ctx, t, store, func(tx llm.StoreTx) error { return tx.InsertToolExecution(record) })
+		})
+	}
+
+	taskNext := task
+	taskNext.Revision = 0
+	requestNext := request
+	requestNext.Revision = 0
+	toolNext := tool
+	toolNext.Revision = 0
+	invalidMutations := []struct {
+		name string
+		call func(llm.StoreTx) error
+	}{
+		{"task_key", func(tx llm.StoreTx) error { _, err := tx.CompareAndSwapTask(llm.StoreTaskMutation{}); return err }},
+		{"task_next", func(tx llm.StoreTx) error {
+			_, err := tx.CompareAndSwapTask(llm.StoreTaskMutation{Key: task.Key, ExpectedRevision: 1, Next: taskNext})
+			return err
+		}},
+		{"request_key", func(tx llm.StoreTx) error { _, err := tx.CompareAndSwapRequest(llm.StoreRequestMutation{}); return err }},
+		{"request_next", func(tx llm.StoreTx) error {
+			_, err := tx.CompareAndSwapRequest(llm.StoreRequestMutation{Key: request.Key, ExpectedRevision: 1, Next: requestNext})
+			return err
+		}},
+		{"tool_key", func(tx llm.StoreTx) error {
+			_, err := tx.CompareAndSwapToolExecution(llm.StoreToolExecutionMutation{})
+			return err
+		}},
+		{"tool_next", func(tx llm.StoreTx) error {
+			_, err := tx.CompareAndSwapToolExecution(llm.StoreToolExecutionMutation{Key: tool.Key, ExpectedRevision: 1, Next: toolNext})
+			return err
+		}},
+		{"delete_key", func(tx llm.StoreTx) error {
+			_, err := tx.DeleteTombstonedResponseEvents(llm.StoreRequestKey{})
+			return err
+		}},
+	}
+	for _, test := range invalidMutations {
+		t.Run("mutation/"+test.name, func(t *testing.T) { llmAssertInvalidUpdate(ctx, t, store, test.call) })
+	}
+}
+
+func testLLMStoreCASUniqueness(ctx context.Context, t *testing.T, store llm.Store) {
+	t.Helper()
+	terminal := llmConformanceTask("cas-affinity-terminal", 1, llm.TaskCompleted)
+	open := llmConformanceTask("cas-affinity-open", 1, llm.TaskAwaitingCaller)
+	open.WorkspaceKey = terminal.WorkspaceKey
+	open.HarnessID = terminal.HarnessID
+	open.HarnessVersion = terminal.HarnessVersion
+	open.HarnessSessionID = terminal.HarnessSessionID
+
+	requestTask := llmConformanceTask("cas-active-task", 1, llm.TaskAwaitingCaller)
+	completedRequest := llmConformanceRequest(requestTask, "cas-active-completed", []byte("completed"))
+	completedRequest.ResponseComplete = true
+	completedAt := llmConformanceTime(4)
+	completedRequest.CompletedAt = &completedAt
+	activeRequest := llmConformanceRequest(requestTask, "cas-active-open", []byte("open"))
+	if err := store.Update(ctx, func(tx llm.StoreTx) error {
+		for _, record := range []llm.StoreTaskRecord{terminal, open, requestTask} {
+			if err := tx.InsertTask(record); err != nil {
+				return err
+			}
+		}
+		if err := tx.InsertRequest(completedRequest); err != nil {
+			return err
+		}
+		return tx.InsertRequest(activeRequest)
+	}); err != nil {
+		t.Fatalf("seed CAS uniqueness fixtures: %v", err)
+	}
+
+	reopened := terminal
+	reopened.State = llm.TaskAwaitingHuman
+	reopened.Revision = 2
+	reopened.UpdatedAt = llmConformanceTime(2)
+	err := store.Update(ctx, func(tx llm.StoreTx) error {
+		_, err := tx.CompareAndSwapTask(llm.StoreTaskMutation{Key: terminal.Key, ExpectedRevision: 1, Next: reopened})
+		return err
+	})
+	llmAssertConflict(t, err, llm.StoreConstraintOpenAffinity)
+	if got := llmLoadTask(ctx, t, store, terminal.Key); got.State != llm.TaskCompleted || got.Revision != 1 {
+		t.Fatalf("failed open-affinity CAS mutated Task: %#v", got)
+	}
+
+	reactivated := completedRequest
+	reactivated.ResponseComplete = false
+	reactivated.CompletedAt = nil
+	reactivated.Revision = 2
+	err = store.Update(ctx, func(tx llm.StoreTx) error {
+		_, err := tx.CompareAndSwapRequest(llm.StoreRequestMutation{
+			Key: completedRequest.Key, ExpectedRevision: 1, Next: reactivated,
+		})
+		return err
+	})
+	llmAssertConflict(t, err, llm.StoreConstraintActiveRequest)
+	if got := llmLoadRequest(ctx, t, store, completedRequest.Key, llmGenerousReadLimit().MaxBytes); !got.ResponseComplete || got.Revision != 1 {
+		t.Fatalf("failed active-request CAS mutated Request: %#v", got)
 	}
 }
 
@@ -1526,6 +1874,26 @@ func llmAssertOversized(t *testing.T, label string, operation func() error) {
 	t.Helper()
 	if err := operation(); !errors.Is(err, llm.ErrStoreRecordTooLarge) {
 		t.Fatalf("%s error = %v, want ErrStoreRecordTooLarge", label, err)
+	}
+}
+
+func llmAssertInvalidUpdate(
+	ctx context.Context,
+	t *testing.T,
+	store llm.Store,
+	operation func(llm.StoreTx) error,
+) {
+	t.Helper()
+	if err := store.Update(ctx, operation); !errors.Is(err, llm.ErrStoreInvalidArgument) {
+		t.Fatalf("error = %v, want ErrStoreInvalidArgument", err)
+	}
+}
+
+func llmAssertConflict(t *testing.T, err error, constraint llm.StoreConstraint) {
+	t.Helper()
+	var conflict *llm.StoreConflictError
+	if !errors.As(err, &conflict) || conflict.Constraint != constraint {
+		t.Fatalf("error = %v, want StoreConflictError constraint %q", err, constraint)
 	}
 }
 

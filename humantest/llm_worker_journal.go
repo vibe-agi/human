@@ -159,16 +159,35 @@ func TestLLMWorkerJournal(t *testing.T, factory LLMWorkerJournalFactory) {
 	}
 }
 
-// MemoryLLMWorkerJournal is a concurrency-safe semantic Journal model for
-// tests and embedders which do not need process durability. It deliberately
-// follows the same binding, FIFO, exact-replay, compaction, and byte-ownership
-// rules as durable providers, so it can run the public conformance suite.
-//
-// It has no Close method because Journal lifetime is represented by the
-// framework.ReleaseFunc returned by NewMemoryLLMWorkerJournal.
+// MemoryLLMWorkerJournal is one open handle onto a
+// MemoryLLMWorkerJournalImage. It has no Close method because handle lifetime is
+// represented by the framework.ReleaseFunc returned when it is opened.
 type MemoryLLMWorkerJournal struct {
+	memoryLLMWorkerJournalHandle
+}
+
+// The unexported embedding preserves concise access to the image state inside
+// this semantic model without exposing a replaceable image pointer on a live
+// handle.
+type memoryLLMWorkerJournalHandle struct {
+	*MemoryLLMWorkerJournalImage
+	lifecycle *memoryLLMWorkerJournalLifecycle
+}
+
+type memoryLLMWorkerJournalLifecycle struct{ closed bool }
+
+// MemoryLLMWorkerJournalImage is a concurrency-safe semantic durable image for
+// tests. It deliberately follows the same binding, FIFO, exact-replay,
+// compaction, and byte-ownership rules as durable providers. Closing a handle
+// leaves the image intact, so recovery tests can open a fresh handle after
+// simulated loss of process-local handle state. This does not model physical
+// process or storage durability.
+//
+// At most one handle may be open at a time. The image is a test model, not a
+// production persistence adapter.
+type MemoryLLMWorkerJournalImage struct {
 	mu          sync.Mutex
-	closed      bool
+	owner       *memoryLLMWorkerJournalLifecycle
 	binding     *workerws.JournalBinding
 	next        workerws.JournalSequence
 	assignments map[llm.WorkerDeliveryID]*memoryLLMJournalAssignment
@@ -196,22 +215,83 @@ type memoryLLMJournalRejection struct {
 	pending       *workerws.RejectedEvent
 }
 
-// NewMemoryLLMWorkerJournal creates an independent, initially unbound
-// Journal and its idempotent release function.
-func NewMemoryLLMWorkerJournal() (*MemoryLLMWorkerJournal, framework.ReleaseFunc) {
-	journal := &MemoryLLMWorkerJournal{
+// NewMemoryLLMWorkerJournalImage creates an independent, initially unbound
+// durable image with no open handle.
+func NewMemoryLLMWorkerJournalImage() *MemoryLLMWorkerJournalImage {
+	return &MemoryLLMWorkerJournalImage{
 		assignments: make(map[llm.WorkerDeliveryID]*memoryLLMJournalAssignment),
 		events:      make(map[llm.WorkerDeliveryID]*memoryLLMJournalEvent),
 		rejections:  make(map[llm.WorkerDeliveryID]*memoryLLMJournalRejection),
 	}
+}
+
+// Open returns the sole live handle onto image. Successful Journal mutations
+// update image before they return; releasing the handle only relinquishes
+// ownership and never flushes otherwise-volatile state.
+func (image *MemoryLLMWorkerJournalImage) Open(
+	ctx context.Context,
+) (*MemoryLLMWorkerJournal, framework.ReleaseFunc, error) {
+	if ctx == nil {
+		return nil, nil, errors.New("open memory HumanLLM worker Journal: context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if image == nil {
+		return nil, nil, errors.New("open memory HumanLLM worker Journal: image is required")
+	}
+	image.mu.Lock()
+	defer image.mu.Unlock()
+	if image.owner != nil {
+		return nil, nil, errors.New("open memory HumanLLM worker Journal: image already has an open handle")
+	}
+	lifecycle := &memoryLLMWorkerJournalLifecycle{}
+	journal := &MemoryLLMWorkerJournal{
+		memoryLLMWorkerJournalHandle: memoryLLMWorkerJournalHandle{
+			MemoryLLMWorkerJournalImage: image,
+			lifecycle:                   lifecycle,
+		},
+	}
+	image.owner = lifecycle
 	var once sync.Once
 	release := func(context.Context) error {
 		once.Do(func() {
-			journal.mu.Lock()
-			journal.closed = true
-			journal.mu.Unlock()
+			image.mu.Lock()
+			lifecycle.closed = true
+			if image.owner == lifecycle {
+				image.owner = nil
+			}
+			image.mu.Unlock()
 		})
 		return nil
+	}
+	return journal, release, nil
+}
+
+// Abandon invalidates journal without invoking its Release function. It is a
+// deterministic crash semantic for tests, not physical durability evidence.
+// A late Release for this generation cannot close a newer image owner.
+func (image *MemoryLLMWorkerJournalImage) Abandon(journal *MemoryLLMWorkerJournal) error {
+	if image == nil || journal == nil ||
+		journal.MemoryLLMWorkerJournalImage != image || journal.lifecycle == nil {
+		return workerws.ErrJournalClosed
+	}
+	image.mu.Lock()
+	defer image.mu.Unlock()
+	if journal.lifecycle.closed || image.owner != journal.lifecycle {
+		return workerws.ErrJournalClosed
+	}
+	journal.lifecycle.closed = true
+	image.owner = nil
+	return nil
+}
+
+// NewMemoryLLMWorkerJournal creates an independent image, opens its first
+// handle, and returns that handle with an idempotent release function.
+func NewMemoryLLMWorkerJournal() (*MemoryLLMWorkerJournal, framework.ReleaseFunc) {
+	journal, release, err := NewMemoryLLMWorkerJournalImage().Open(context.Background())
+	if err != nil {
+		panic(fmt.Sprintf("open fresh memory HumanLLM worker Journal: %v", err))
 	}
 	return journal, release
 }
@@ -496,7 +576,7 @@ func (journal *MemoryLLMWorkerJournal) contextAndOpen(ctx context.Context) error
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if journal.closed {
+	if journal.lifecycle == nil || journal.lifecycle.closed {
 		return workerws.ErrJournalClosed
 	}
 	return nil

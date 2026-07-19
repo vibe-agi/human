@@ -11,14 +11,20 @@ go run ./examples/custom-framework
 
 The composition has four application-defined adapters:
 
-- `auditedStore` explicitly forwards the complete `llm.Store` contract to the
-  official `llm/sqlite` implementation. Its `Description` advertises the
-  application provider while retaining a frozen negotiated copy of the
-  underlying contract and features. `Bind`, `View`, and `Update` are all
-  forwarded explicitly. Its audit policy records operation names without
-  logging customer payloads. Replace the wrapped SQLite store with Postgres,
-  MySQL, a service API, or another conforming store without changing
-  `human.NewLLM`.
+- `customstore` contains a genuinely application-owned physical Store opened by
+  `customstore.Open`: it implements every `llm.StoreView`/`llm.StoreTx` method
+  itself and persists a versioned, SHA-256-checked snapshot with fsync plus
+  atomic replacement. Its direct `humantest.TestLLMStore` run, release/reopen
+  test, and truncation/tamper tests show how an application can implement the
+  public contract without importing Human internals. It is intentionally a
+  compact, single-owner teaching adapter (every commit rewrites the complete
+  image), not a production database. It fences a second cooperating process
+  with an advisory lock on supported Unix systems and fails closed on other
+  systems; its parent directory remains a trusted private boundary. The
+  executable uses this physical adapter directly. The same package retains
+  `Own`/`Borrow` as a separate
+  policy-middleware example. A Postgres, MySQL, service API, or other
+  conforming Store can replace either choice without changing `human.NewLLM`.
 - `tokenAuthenticator` maps a verified token to `llm.CallerID`. Caller identity
   is absent from the inbound `call` value, so untrusted input cannot select its
   own authority. A real embedding can use its existing session service, mTLS,
@@ -33,18 +39,22 @@ The composition has four application-defined adapters:
   Go method calls onto `llm.CallerEndpoint`. A queue, gRPC service, Unix socket,
   or proprietary RPC adapter can implement the same lifecycle and replay
   contract. It verifies authenticated admission identity, request digest,
-  response mode, monotonic cursors, and ordered event sequences instead of
-  trusting an endpoint blindly. The example supports both aggregate bodies and
+  response mode, monotonic cursors, ordered event sequences, and the immutable
+  first committed response decision instead of trusting an endpoint blindly.
+  Events before that decision, aggregate events, stream decision bodies, and
+  later decision changes are rejected. A safe `llm.AdmissionError` becomes an
+  ordinary `callResult` containing only status, content type, retry hint, and a
+  copied body; its `Cause` is never exposed, and unknown endpoint errors collapse
+  to one fixed adapter error. The example supports both aggregate bodies and
   ordered stream frames even though the demonstrated request is aggregate.
 
 ## Ownership
 
 Ownership is explicit at every boundary:
 
-- `llm/sqlite.Open` creates an **owned** SQLite resource. The example transfers
-  it into an owned `auditedStore` resource, then transfers that resource to
-  `human.NewLLM`. HumanLLM releases it on shutdown (or constructor failure).
-  The host must not also close the decorator or SQLite database.
+- `customstore.Open` creates an **owned** application Store resource and the
+  example transfers it directly to `human.NewLLM`. HumanLLM releases it on
+  shutdown (or constructor failure); the host must not also release it.
 - `customprotect.OpenLocal` similarly creates an **owned** decorated Protector.
   Its release callback releases the underlying AEAD resource and wipes the
   keyring's copied material. That resource is transferred through
@@ -62,12 +72,12 @@ Ownership is explicit at every boundary:
 - `tokenAuthenticator` is borrowed by the transport. A stateful authentication
   adapter remains host-owned and must stay alive until transport shutdown.
 
-For production, use a file-backed database path (or a custom durable Store), a
+For production, use a production-grade database-backed Store, a
 real authentication authority, a transport with bounded messages and durable
 reconnect/replay behavior, and a `protect.Protector` backed by the deployment's
-KMS/HSM. This executable's random key is appropriate only because its SQLite
-database is also ephemeral; durable storage requires the same historical key
-IDs and versions to remain retrievable across restart. A native KMS/HSM
+KMS/HSM. This executable's random key is appropriate only because its temporary
+snapshot is removed when the process exits; durable storage requires the same
+historical key IDs and versions to remain retrievable across restart. A native KMS/HSM
 implementation should define and authenticate its own stable Provider/Format
 envelope identity; a transparent decorator such as this example must preserve
 the underlying identity rather than merely relabeling ciphertext. The HumanLLM

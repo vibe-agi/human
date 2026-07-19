@@ -16,20 +16,22 @@ import (
 )
 
 // TestServiceDurableFaultMatrix runs the same lifecycle failures against both
-// the semantic in-memory Store model and the official SQLite adapter. Keeping
-// the scenarios here transport-neutral makes Store/recovery regressions fail
-// independently of WebSocket or HTTP retry policy.
+// a restartable semantic in-memory Store image and the official SQLite adapter.
+// Restart scenarios abandon the Memory handle or release/reopen SQLite over the
+// same durable image/path. Keeping the scenarios transport-neutral makes
+// Store/recovery regressions fail independently of WebSocket or HTTP retry
+// policy.
 func TestServiceDurableFaultMatrix(t *testing.T) {
 	backends := []struct {
 		name string
-		open func(*testing.T) llm.Store
+		open func(*testing.T) *faultMatrixBackend
 	}{
-		{name: "memory", open: openFaultMatrixMemoryStore},
-		{name: "sqlite", open: openFaultMatrixSQLiteStore},
+		{name: "memory", open: openFaultMatrixMemoryBackend},
+		{name: "sqlite", open: openFaultMatrixSQLiteBackend},
 	}
 	scenarios := []struct {
 		name string
-		run  func(*testing.T, llm.Store)
+		run  func(*testing.T, *faultMatrixBackend)
 	}{
 		{name: "caller_wait_cancel_exact_retry", run: faultCallerWaitCancelExactRetry},
 		{name: "worker_disconnect_before_assignment_ack", run: faultWorkerDisconnectBeforeAssignmentACK},
@@ -52,8 +54,8 @@ func TestServiceDurableFaultMatrix(t *testing.T) {
 	}
 }
 
-func faultCallerWaitCancelExactRetry(t *testing.T, store llm.Store) {
-	service := newFaultMatrixService(t, store)
+func faultCallerWaitCancelExactRetry(t *testing.T, backend *faultMatrixBackend) {
+	service := newFaultMatrixService(t, backend.Store())
 	worker := openTestWorker(t, service, "worker-a", "wait-session")
 	result, assignment := admitFaultMatrixRequest(t, service, worker, "fault-wait", true)
 	if err := worker.AckAssignment(t.Context(), assignment.ID); err != nil {
@@ -114,8 +116,8 @@ func faultCallerWaitCancelExactRetry(t *testing.T, store llm.Store) {
 	}
 }
 
-func faultWorkerDisconnectBeforeAssignmentACK(t *testing.T, store llm.Store) {
-	service := newFaultMatrixService(t, store)
+func faultWorkerDisconnectBeforeAssignmentACK(t *testing.T, backend *faultMatrixBackend) {
+	service := newFaultMatrixService(t, backend.Store())
 	firstWorker := openTestWorker(t, service, "worker-a", "assignment-before")
 	result, first := admitFaultMatrixRequest(t, service, firstWorker, "fault-assignment", true)
 	shutdownRuntime(t, firstWorker)
@@ -132,8 +134,8 @@ func faultWorkerDisconnectBeforeAssignmentACK(t *testing.T, store llm.Store) {
 	assertFaultMatrixComplete(t, service, result, []string{"start\n", "final:done\n"})
 }
 
-func faultEventACKLossExactReplay(t *testing.T, store llm.Store) {
-	service := newFaultMatrixService(t, store)
+func faultEventACKLossExactReplay(t *testing.T, backend *faultMatrixBackend) {
+	service := newFaultMatrixService(t, backend.Store())
 	firstWorker := openTestWorker(t, service, "worker-a", "event-before")
 	result, assignment := admitFaultMatrixRequest(t, service, firstWorker, "fault-event", true)
 	if err := firstWorker.AckAssignment(t.Context(), assignment.ID); err != nil {
@@ -167,13 +169,13 @@ func faultEventACKLossExactReplay(t *testing.T, store llm.Store) {
 	assertFaultMatrixComplete(t, service, result, []string{"start\n", "progress:once\n", "final:done\n"})
 }
 
-func faultServiceRestartRedeliversAssignment(t *testing.T, store llm.Store) {
-	service := newFaultMatrixService(t, store)
+func faultServiceRestartRedeliversAssignment(t *testing.T, backend *faultMatrixBackend) {
+	service := newFaultMatrixService(t, backend.Store())
 	worker := openTestWorker(t, service, "worker-a", "restart-before")
 	result, first := admitFaultMatrixRequest(t, service, worker, "fault-restart", false)
 	shutdownRuntime(t, service)
 
-	service = newFaultMatrixService(t, store)
+	service = newFaultMatrixService(t, backend.Restart(t))
 	worker = openTestWorker(t, service, "worker-a", "restart-after")
 	redelivered := receiveServiceAssignment(t, worker)
 	assertExactAssignment(t, first, redelivered)
@@ -189,8 +191,8 @@ func faultServiceRestartRedeliversAssignment(t *testing.T, store llm.Store) {
 	}
 }
 
-func faultPoisonNACKDoesNotBlockFollower(t *testing.T, store llm.Store) {
-	service := newFaultMatrixService(t, store)
+func faultPoisonNACKDoesNotBlockFollower(t *testing.T, backend *faultMatrixBackend) {
+	service := newFaultMatrixService(t, backend.Store())
 	worker := openTestWorker(t, service, "worker-a", "poison-session")
 	result, assignment := admitFaultMatrixRequest(t, service, worker, "fault-poison", true)
 	if err := worker.AckAssignment(t.Context(), assignment.ID); err != nil {
@@ -210,8 +212,8 @@ func faultPoisonNACKDoesNotBlockFollower(t *testing.T, store llm.Store) {
 	assertFaultMatrixComplete(t, service, result, []string{"start\n", "final:healthy\n"})
 }
 
-func faultCallerWorkerServiceOfflineConverges(t *testing.T, store llm.Store) {
-	service := newFaultMatrixService(t, store)
+func faultCallerWorkerServiceOfflineConverges(t *testing.T, backend *faultMatrixBackend) {
+	service := newFaultMatrixService(t, backend.Store())
 	worker := openTestWorker(t, service, "worker-a", "combined-before")
 	result, assignment := admitFaultMatrixRequest(t, service, worker, "fault-combined", true)
 	if err := worker.AckAssignment(t.Context(), assignment.ID); err != nil {
@@ -242,7 +244,7 @@ func faultCallerWorkerServiceOfflineConverges(t *testing.T, store llm.Store) {
 	shutdownRuntime(t, worker)
 	shutdownRuntime(t, service)
 
-	service = newFaultMatrixService(t, store)
+	service = newFaultMatrixService(t, backend.Restart(t))
 	worker = openTestWorker(t, service, "worker-a", "combined-after")
 	assertWorkerACK(t, worker, progress)
 	assertWorkerACK(t, worker, workerDelivery(assignment, "delivery-combined-final", llm.Event{
@@ -264,35 +266,95 @@ func faultCallerWorkerServiceOfflineConverges(t *testing.T, store llm.Store) {
 	assertExactResponsePage(t, recovered, replayed)
 }
 
-func openFaultMatrixMemoryStore(t *testing.T) llm.Store {
-	t.Helper()
-	store, release := humantest.NewMemoryLLMStore()
-	t.Cleanup(func() {
-		if err := release(context.Background()); err != nil {
-			t.Errorf("release memory Store: %v", err)
-		}
-	})
-	return store
+type faultMatrixBackend struct {
+	store   llm.Store
+	release framework.ReleaseFunc
+	open    func(*testing.T) (llm.Store, framework.ReleaseFunc)
+	abandon func(*testing.T, llm.Store)
 }
 
-func openFaultMatrixSQLiteStore(t *testing.T) llm.Store {
+func newFaultMatrixBackend(
+	t *testing.T,
+	open func(*testing.T) (llm.Store, framework.ReleaseFunc),
+) *faultMatrixBackend {
 	t.Helper()
-	resource, err := llmsqlite.Open(t.Context(), llmsqlite.Config{
-		Path: filepath.Join(t.TempDir(), "fault-matrix.db"),
-	})
-	if err != nil {
-		t.Fatal(err)
+	store, release := open(t)
+	backend := &faultMatrixBackend{store: store, release: release, open: open}
+	t.Cleanup(func() { backend.close(t) })
+	return backend
+}
+
+func (backend *faultMatrixBackend) Store() llm.Store {
+	return backend.store
+}
+
+// Restart opens a fresh handle over the backend's unchanged durable domain.
+// The Memory backend abandons process-local state without Release; SQLite's
+// physical crash boundary is tested separately in its adapter package.
+func (backend *faultMatrixBackend) Restart(t *testing.T) llm.Store {
+	t.Helper()
+	oldStore, oldRelease := backend.store, backend.release
+	if backend.abandon != nil {
+		backend.abandon(t, oldStore)
+		backend.store, backend.release = nil, nil
+	} else {
+		backend.close(t)
 	}
-	store, err := resource.Value()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := resource.Release(context.Background()); err != nil {
-			t.Errorf("release SQLite Store: %v", err)
+	backend.store, backend.release = backend.open(t)
+	if backend.abandon != nil {
+		if err := oldRelease(context.Background()); err != nil {
+			t.Fatalf("late release of abandoned HumanLLM Store: %v", err)
 		}
+	}
+	return backend.store
+}
+
+func (backend *faultMatrixBackend) close(t *testing.T) {
+	t.Helper()
+	if backend.release == nil {
+		return
+	}
+	if err := backend.release(context.Background()); err != nil {
+		t.Fatalf("release fault-matrix Store: %v", err)
+	}
+	backend.store = nil
+	backend.release = nil
+}
+
+func openFaultMatrixMemoryBackend(t *testing.T) *faultMatrixBackend {
+	t.Helper()
+	image := humantest.NewMemoryLLMStoreImage()
+	backend := newFaultMatrixBackend(t, func(*testing.T) (llm.Store, framework.ReleaseFunc) {
+		store, release := image.Open()
+		return store, release
 	})
-	return store
+	backend.abandon = func(t *testing.T, store llm.Store) {
+		t.Helper()
+		concrete, ok := store.(*humantest.MemoryLLMStore)
+		if !ok {
+			t.Fatalf("memory HumanLLM Store type = %T", store)
+		}
+		if err := image.Abandon(concrete); err != nil {
+			t.Fatalf("abandon memory HumanLLM Store handle: %v", err)
+		}
+	}
+	return backend
+}
+
+func openFaultMatrixSQLiteBackend(t *testing.T) *faultMatrixBackend {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fault-matrix.db")
+	return newFaultMatrixBackend(t, func(t *testing.T) (llm.Store, framework.ReleaseFunc) {
+		resource, err := llmsqlite.Open(t.Context(), llmsqlite.Config{Path: path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := resource.Value()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store, resource.Release
+	})
 }
 
 func newFaultMatrixService(t *testing.T, store llm.Store) *llm.Service {

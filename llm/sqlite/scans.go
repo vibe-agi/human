@@ -10,6 +10,14 @@ import (
 	"github.com/vibe-agi/human/llm"
 )
 
+func validRecoveryCursor(cursor llm.StoreRecoveryCursor) bool {
+	return !cursor.CreatedAt.IsZero() && cursor.Caller != "" && cursor.IdempotencyKey != ""
+}
+
+func validRetentionCursor(cursor llm.StoreRetentionCursor) bool {
+	return !cursor.CompletedAt.IsZero() && cursor.Caller != "" && cursor.IdempotencyKey != ""
+}
+
 func (view *view) ScanResponseEvents(
 	scan llm.StoreResponseEventScan,
 ) ([]llm.StoreResponseEventRecord, error) {
@@ -161,6 +169,9 @@ func (view *view) ScanRecovery(scan llm.StoreRecoveryScan) ([]llm.StoreRecoveryR
 	if err := view.unit.ensureActive(); err != nil {
 		return nil, err
 	}
+	if scan.After != nil && !validRecoveryCursor(*scan.After) {
+		return nil, invalidArgument("invalid recovery cursor")
+	}
 	if err := validateScanLimit(scan.Limit); err != nil {
 		return nil, err
 	}
@@ -257,6 +268,9 @@ func (view *view) ScanRetention(scan llm.StoreRetentionScan) ([]llm.StoreRetenti
 	}
 	if scan.CompletedBefore.IsZero() {
 		return nil, invalidArgument("retention completion boundary is required")
+	}
+	if scan.After != nil && !validRetentionCursor(*scan.After) {
+		return nil, invalidArgument("invalid retention cursor")
 	}
 	if err := validateScanLimit(scan.Limit); err != nil {
 		return nil, err

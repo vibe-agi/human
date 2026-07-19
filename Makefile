@@ -16,6 +16,12 @@ test:
 fault-test:
 	go test -race -count=$(FAULT_COUNT) -timeout=5m ./internal/completion/gateway -run '^(TestCallerFiveTCPDisconnectsThenExactIdempotentRecovery|TestCodexResponsesFiveUnkeyedDisconnectsRecoverOneDerivedRequest|TestTransientHeartbeatFailureDoesNotAbandonLiveSession|TestContinueStreamingResponseStopsOnWriteOrFlushFailure|TestBeginStreamingReplayReturnsStartedCursorOnWriteFailure)$$'
 	go test -race -count=$(FAULT_COUNT) -timeout=5m ./internal/workerclient -run '^(TestWorkerClientInitialTransientFailuresRecoverAfterFiveAttempts|TestWorkerClientInitialConnectionRefusedRetriesUntilGatewayStarts|TestWorkerClientReconnectsAndReceivesActiveAssignmentAgain|TestWorkerClientFiveFlapsPreserveAssignmentOutboxAndACKs|TestWorkerClientKeepaliveRecoversFromPeerThatStopsReading|TestWorkerClientReplaysTerminalEventAfterACKLoss|TestWorkerClientCredentialRotationReplaysPendingOutbox|TestExpiredSessionRejectsLateOutboxEventAndContinuesWithLiveWork|TestGatewayRestartWithLiveWorkerRecoversPartialCallerAndOfflineOutbox|TestThreePartyOutageRecoversExactlyOnce|TestWorkspaceToolLoopSurvivesThreePartyOutage)$$'
+	go test -race -count=$(FAULT_COUNT) -timeout=5m ./llm -run '^TestServiceDurableFaultMatrix$$'
+	go test -race -count=$(FAULT_COUNT) -timeout=5m ./agent -run '^TestAgentDurableFaultMatrix$$'
+	go test -race -count=$(FAULT_COUNT) -timeout=5m ./humantest -run '^(TestAgentWorkerJournalRecoverySuiteAgainstMemoryImage|TestLLMWorkerJournalRecoverySuiteAgainstMemoryImage|TestMemoryAgentWorkerJournalAbandonRecoversCommittedImage|TestMemoryLLMWorkerJournalAbandonRecoversCommittedImage)$$'
+	go test -race -count=$(FAULT_COUNT) -timeout=5m ./agent/sqlite ./llm/sqlite -run '^TestStoreRecoversCommittedTransactionAfterAbruptProcessExit$$'
+	go test -race -count=$(FAULT_COUNT) -timeout=5m ./examples/custom-framework/customstore -run '^TestFileStoreRecoversCommittedSnapshotAfterAbruptProcessExit$$'
+	go test -race -count=$(FAULT_COUNT) -timeout=5m ./agent/workerws/sqlite ./llm/workerws/sqlite -run '^(TestJournalRecoveryFaultMatrix|TestJournalRecoversCommittedStateAfterAbruptProcessExit)$$'
 
 formal-check:
 	./formal/run-checks.sh

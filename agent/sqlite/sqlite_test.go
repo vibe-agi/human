@@ -3,13 +3,25 @@ package sqlite_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/vibe-agi/human/agent"
 	agentsqlite "github.com/vibe-agi/human/agent/sqlite"
 	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/humantest"
+	"github.com/vibe-agi/human/workspace"
+)
+
+const (
+	agentStoreCrashChildEnv = "HUMAN_AGENT_SQLITE_STORE_CRASH_CHILD"
+	agentStoreCrashPathEnv  = "HUMAN_AGENT_SQLITE_STORE_CRASH_PATH"
+	agentStoreCrashExitCode = 95
 )
 
 func TestStoreConformance(t *testing.T) {
@@ -75,6 +87,79 @@ func TestOwnedResourceReleaseAndReopen(t *testing.T) {
 	if err := reopened.Release(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestStoreRecoversCommittedTransactionAfterAbruptProcessExit(t *testing.T) {
+	if os.Getenv(agentStoreCrashChildEnv) == "1" {
+		if err := seedAgentStoreBeforeCrash(os.Getenv(agentStoreCrashPathEnv)); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(agentStoreCrashExitCode + 1)
+		}
+		os.Exit(agentStoreCrashExitCode) // intentionally bypass Resource.Release
+	}
+
+	path := filepath.Join(t.TempDir(), "agent-crash.db")
+	command := exec.Command(os.Args[0], "-test.run=^TestStoreRecoversCommittedTransactionAfterAbruptProcessExit$", "-test.count=1")
+	command.Env = append(os.Environ(), agentStoreCrashChildEnv+"=1", agentStoreCrashPathEnv+"="+path)
+	output, err := command.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != agentStoreCrashExitCode {
+		t.Fatalf("crash child = %v (exit %d), want %d; output:\n%s", err, agentStoreProcessExitCode(exit), agentStoreCrashExitCode, output)
+	}
+
+	resource, err := agentsqlite.Open(t.Context(), agentsqlite.Config{Path: path})
+	if err != nil {
+		t.Fatalf("open Agent Store after process crash: %v", err)
+	}
+	t.Cleanup(func() { _ = resource.Release(context.Background()) })
+	store, err := resource.Value()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := agentCrashWorkspaceHead()
+	if err := store.View(t.Context(), func(view agent.StoreView) error {
+		got, err := view.LoadWorkspaceHead(want.Head.Workspace)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(got, want) {
+			return fmt.Errorf("workspace head after crash = %#v, want %#v", got, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedAgentStoreBeforeCrash(path string) error {
+	resource, err := agentsqlite.Open(context.Background(), agentsqlite.Config{Path: path})
+	if err != nil {
+		return err
+	}
+	store, err := resource.Value()
+	if err != nil {
+		return err
+	}
+	record := agentCrashWorkspaceHead()
+	return store.Update(context.Background(), func(tx agent.StoreTx) error {
+		_, err := tx.InsertWorkspaceHead(record)
+		return err
+	})
+}
+
+func agentCrashWorkspaceHead() agent.StoreWorkspaceHeadRecord {
+	return agent.StoreWorkspaceHeadRecord{Head: agent.WorkspaceHead{
+		Workspace:         agent.WorkspaceRef{Authority: "authority-crash", ID: "workspace-crash"},
+		ConfirmedRevision: workspace.Revision("revision-crash"),
+		UpdatedAt:         time.Date(2026, 7, 19, 12, 0, 0, 123, time.UTC),
+	}}
+}
+
+func agentStoreProcessExitCode(err *exec.ExitError) int {
+	if err == nil {
+		return 0
+	}
+	return err.ExitCode()
 }
 
 func TestAgentConsumesOwnedSQLiteStore(t *testing.T) {

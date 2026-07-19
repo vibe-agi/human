@@ -3,6 +3,7 @@ package humantest
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -17,15 +18,35 @@ import (
 // for tests, examples, and fault-injection harnesses. It preserves atomic
 // serializable updates, stable View snapshots, callback lifetimes, logical
 // constraints, scan ordering, read budgets, and byte ownership. It does not
-// provide process durability.
+// provide real process durability; [MemoryAgentStoreImage] only models a
+// committed image for deterministic lifecycle and fault-state tests.
 //
 // Construct it with [NewMemoryAgentStore] so ownership and release remain
 // explicit. Store has no Close method by design.
 type MemoryAgentStore struct {
-	mu     sync.RWMutex
-	closed bool
-	state  memoryAgentState
+	image  *MemoryAgentStoreImage
+	handle *memoryAgentStoreHandle
 }
+
+type memoryAgentStoreHandle struct{ closed bool }
+
+// MemoryAgentStoreImage is a test-only model of durable Agent storage media.
+// Every successful Update changes the image synchronously. Releasing an open
+// MemoryAgentStore closes only that runtime handle; opening the same image again
+// creates a distinct Store handle over the already committed state. Abandon
+// can explicitly model loss of a process-local handle without pretending that
+// in-memory data survives a real process exit.
+//
+// An image admits at most one live Store handle, matching Agent Store's
+// single-active-owner correctness boundary.
+type MemoryAgentStoreImage struct {
+	mu    sync.RWMutex
+	state memoryAgentState
+	owner *memoryAgentStoreHandle
+}
+
+// ErrMemoryAgentStoreImageInUse means an image already has a live Store handle.
+var ErrMemoryAgentStoreImageInUse = errors.New("memory Agent Store image is already in use")
 
 type memoryAgentLeaseKey struct {
 	task  agent.TaskRef
@@ -48,13 +69,61 @@ type memoryAgentState struct {
 // idempotent release function. After release, View and Update return
 // [agent.ErrStoreClosed].
 func NewMemoryAgentStore() (*MemoryAgentStore, framework.ReleaseFunc) {
-	store := &MemoryAgentStore{state: newMemoryAgentState()}
+	store, release, err := NewMemoryAgentStoreImage().Open()
+	if err != nil {
+		panic(fmt.Sprintf("open new memory Agent Store image: %v", err))
+	}
+	return store, release
+}
+
+// NewMemoryAgentStoreImage creates an empty test-only durable image. Call Open
+// to acquire a Store handle, then Release or Abandon it before reopening the
+// committed state.
+func NewMemoryAgentStoreImage() *MemoryAgentStoreImage {
+	return &MemoryAgentStoreImage{state: newMemoryAgentState()}
+}
+
+// Open acquires a new runtime Store handle over this image. The returned
+// release is idempotent and must run before the image can be opened again.
+func (image *MemoryAgentStoreImage) Open() (*MemoryAgentStore, framework.ReleaseFunc, error) {
+	if image == nil {
+		return nil, nil, fmt.Errorf("%w: memory Agent Store image is required", agent.ErrInvalidArgument)
+	}
+	image.mu.Lock()
+	defer image.mu.Unlock()
+	if image.owner != nil {
+		return nil, nil, ErrMemoryAgentStoreImageInUse
+	}
+	if image.state.commands == nil {
+		image.state = newMemoryAgentState()
+	}
+	handle := &memoryAgentStoreHandle{}
+	store := &MemoryAgentStore{image: image, handle: handle}
+	image.owner = handle
 	var once sync.Once
 	release := func(context.Context) error {
 		once.Do(store.close)
 		return nil
 	}
-	return store, release
+	return store, release, nil
+}
+
+// Abandon invalidates the current handle without running its Release function.
+// It is a deterministic semantic model of process loss: mutations that already
+// returned remain committed in image, while process-local handle state is lost.
+// It does not model OS, filesystem, or hardware crash behavior.
+func (image *MemoryAgentStoreImage) Abandon(store *MemoryAgentStore) error {
+	if image == nil || store == nil || store.image != image || store.handle == nil {
+		return agent.ErrStoreClosed
+	}
+	image.mu.Lock()
+	defer image.mu.Unlock()
+	if store.handle.closed || image.owner != store.handle {
+		return agent.ErrStoreClosed
+	}
+	store.handle.closed = true
+	image.owner = nil
+	return nil
 }
 
 func newMemoryAgentState() memoryAgentState {
@@ -86,15 +155,18 @@ func (store *MemoryAgentStore) View(ctx context.Context, callback func(agent.Sto
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	store.mu.RLock()
-	defer store.mu.RUnlock()
-	if store.closed {
+	if store == nil || store.image == nil || store.handle == nil {
+		return agent.ErrStoreClosed
+	}
+	store.image.mu.RLock()
+	defer store.image.mu.RUnlock()
+	if store.handle.closed || store.image.owner != store.handle {
 		return agent.ErrStoreClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	unit := &memoryAgentUnit{state: &store.state}
+	unit := &memoryAgentUnit{state: &store.image.state}
 	unit.active.Store(true)
 	defer unit.active.Store(false)
 	return callback(memoryAgentView{unit: unit})
@@ -107,15 +179,18 @@ func (store *MemoryAgentStore) Update(ctx context.Context, callback func(agent.S
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.closed {
+	if store == nil || store.image == nil || store.handle == nil {
+		return agent.ErrStoreClosed
+	}
+	store.image.mu.Lock()
+	defer store.image.mu.Unlock()
+	if store.handle.closed || store.image.owner != store.handle {
 		return agent.ErrStoreClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	next := store.state.clone()
+	next := store.image.state.clone()
 	unit := &memoryAgentUnit{state: &next}
 	unit.active.Store(true)
 	err := callback(memoryAgentTx{memoryAgentView{unit: unit}})
@@ -123,14 +198,20 @@ func (store *MemoryAgentStore) Update(ctx context.Context, callback func(agent.S
 	if err != nil {
 		return err
 	}
-	store.state = next
+	store.image.state = next
 	return nil
 }
 
 func (store *MemoryAgentStore) close() {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	store.closed = true
+	if store == nil || store.image == nil || store.handle == nil {
+		return
+	}
+	store.image.mu.Lock()
+	defer store.image.mu.Unlock()
+	store.handle.closed = true
+	if store.image.owner == store.handle {
+		store.image.owner = nil
+	}
 }
 
 func (state memoryAgentState) clone() memoryAgentState {

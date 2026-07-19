@@ -115,16 +115,35 @@ func TestAgentWorkerJournal(t *testing.T, factory AgentWorkerJournalFactory) {
 	}
 }
 
-// MemoryAgentWorkerJournal is a concurrency-safe semantic Journal model for
-// tests and embedders which do not need process durability. It deliberately
-// follows the same binding, FIFO, exact-replay, compaction, and byte-ownership
-// rules as durable providers, so it can run the public conformance suite.
-//
-// It has no Close method because Journal lifetime is represented by the
-// framework.ReleaseFunc returned by NewMemoryAgentWorkerJournal.
+// MemoryAgentWorkerJournal is one open handle onto a
+// MemoryAgentWorkerJournalImage. It has no Close method because handle lifetime
+// is represented by the framework.ReleaseFunc returned when it is opened.
 type MemoryAgentWorkerJournal struct {
+	memoryAgentWorkerJournalHandle
+}
+
+// The unexported embedding preserves concise access to the image state inside
+// this semantic model without exposing a replaceable image pointer on a live
+// handle.
+type memoryAgentWorkerJournalHandle struct {
+	*MemoryAgentWorkerJournalImage
+	lifecycle *memoryAgentWorkerJournalLifecycle
+}
+
+type memoryAgentWorkerJournalLifecycle struct{ closed bool }
+
+// MemoryAgentWorkerJournalImage is a concurrency-safe semantic durable image
+// for tests. It deliberately follows the same binding, FIFO, exact-replay,
+// compaction, and byte-ownership rules as durable providers. Closing a handle
+// leaves the image intact, so recovery tests can open a fresh handle after
+// simulated loss of process-local handle state. This does not model physical
+// process or storage durability.
+//
+// At most one handle may be open at a time. The image is a test model, not a
+// production persistence adapter.
+type MemoryAgentWorkerJournalImage struct {
 	mu          sync.Mutex
-	closed      bool
+	owner       *memoryAgentWorkerJournalLifecycle
 	binding     *workerws.JournalBinding
 	next        workerws.JournalSequence
 	assignments map[agent.WorkerDeliveryID]*memoryJournalAssignment
@@ -152,22 +171,83 @@ type memoryJournalRejection struct {
 	pending       *workerws.RejectedEvent
 }
 
-// NewMemoryAgentWorkerJournal creates an independent, initially unbound
-// Journal and its idempotent release function.
-func NewMemoryAgentWorkerJournal() (*MemoryAgentWorkerJournal, framework.ReleaseFunc) {
-	journal := &MemoryAgentWorkerJournal{
+// NewMemoryAgentWorkerJournalImage creates an independent, initially unbound
+// durable image with no open handle.
+func NewMemoryAgentWorkerJournalImage() *MemoryAgentWorkerJournalImage {
+	return &MemoryAgentWorkerJournalImage{
 		assignments: make(map[agent.WorkerDeliveryID]*memoryJournalAssignment),
 		events:      make(map[agent.WorkerDeliveryID]*memoryJournalEvent),
 		rejections:  make(map[agent.WorkerDeliveryID]*memoryJournalRejection),
 	}
+}
+
+// Open returns the sole live handle onto image. Successful Journal mutations
+// update image before they return; releasing the handle only relinquishes
+// ownership and never flushes otherwise-volatile state.
+func (image *MemoryAgentWorkerJournalImage) Open(
+	ctx context.Context,
+) (*MemoryAgentWorkerJournal, framework.ReleaseFunc, error) {
+	if ctx == nil {
+		return nil, nil, errors.New("open memory Agent worker Journal: context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if image == nil {
+		return nil, nil, errors.New("open memory Agent worker Journal: image is required")
+	}
+	image.mu.Lock()
+	defer image.mu.Unlock()
+	if image.owner != nil {
+		return nil, nil, errors.New("open memory Agent worker Journal: image already has an open handle")
+	}
+	lifecycle := &memoryAgentWorkerJournalLifecycle{}
+	journal := &MemoryAgentWorkerJournal{
+		memoryAgentWorkerJournalHandle: memoryAgentWorkerJournalHandle{
+			MemoryAgentWorkerJournalImage: image,
+			lifecycle:                     lifecycle,
+		},
+	}
+	image.owner = lifecycle
 	var once sync.Once
 	release := func(context.Context) error {
 		once.Do(func() {
-			journal.mu.Lock()
-			journal.closed = true
-			journal.mu.Unlock()
+			image.mu.Lock()
+			lifecycle.closed = true
+			if image.owner == lifecycle {
+				image.owner = nil
+			}
+			image.mu.Unlock()
 		})
 		return nil
+	}
+	return journal, release, nil
+}
+
+// Abandon invalidates journal without invoking its Release function. It is a
+// deterministic crash semantic for tests, not physical durability evidence.
+// A late Release for this generation cannot close a newer image owner.
+func (image *MemoryAgentWorkerJournalImage) Abandon(journal *MemoryAgentWorkerJournal) error {
+	if image == nil || journal == nil ||
+		journal.MemoryAgentWorkerJournalImage != image || journal.lifecycle == nil {
+		return workerws.ErrJournalClosed
+	}
+	image.mu.Lock()
+	defer image.mu.Unlock()
+	if journal.lifecycle.closed || image.owner != journal.lifecycle {
+		return workerws.ErrJournalClosed
+	}
+	journal.lifecycle.closed = true
+	image.owner = nil
+	return nil
+}
+
+// NewMemoryAgentWorkerJournal creates an independent image, opens its first
+// handle, and returns that handle with an idempotent release function.
+func NewMemoryAgentWorkerJournal() (*MemoryAgentWorkerJournal, framework.ReleaseFunc) {
+	journal, release, err := NewMemoryAgentWorkerJournalImage().Open(context.Background())
+	if err != nil {
+		panic(fmt.Sprintf("open fresh memory Agent worker Journal: %v", err))
 	}
 	return journal, release
 }
@@ -452,7 +532,7 @@ func (journal *MemoryAgentWorkerJournal) contextAndOpen(ctx context.Context) err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if journal.closed {
+	if journal.lifecycle == nil || journal.lifecycle.closed {
 		return workerws.ErrJournalClosed
 	}
 	return nil

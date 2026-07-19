@@ -51,9 +51,10 @@ SQLite 不是构造器要求。第三方实现直接写
 相似度猜测。自有 transport 可以直接实现相同 port，不需要 HTTP。
 
 [`examples/custom-framework`](../examples/custom-framework/README.md) 是完整可运行证据：
-它用 Store decorator、自有 token authenticator、非 HTTP in-process transport 和独立
+它用自行实现全部事务原语并通过公开 conformance 的单文件 Store、自有 token authenticator、非 HTTP in-process transport 和独立
 `protect.Protector` decorator 组合 `human.NewLLM`。示例不引用 `internal/`，并明确展示
-owned/borrowed 转移与 transport → core → Protector → Store 的关闭顺序。
+owned/borrowed 转移与 transport → core → Protector → Store 的关闭顺序；同包另有 Store
+middleware 示例，说明如何包装宿主已有的数据库实现。
 
 桌面一体化仍可用 `local.Open`；旧的 `gateway.Open` 仍是现有 CLI/兼容服务的一体化
 composition，但它不再定义根 `NewLLM` 的库边界。
@@ -82,7 +83,7 @@ task, err := service.CreateTask(ctx, agent.CreateTaskCommand{/* ... */})
 第三方实现的注入形状同样是 `framework.Borrow[agent.Store](myStore)` 或
 `framework.Own[agent.Store](myStore, release)`。
 
-当前实现已经包含独立 SQLite schema、命令级精确 replay/冲突、Task revision CAS、多轮 `input_required`、终态不可重开、分页 Message/Event、不可变 Artifact、final Submission 原子发布、取消/失败丢弃 frozen Artifact，以及 apply receipt 推进 Workspace confirmed head。Agent worker mutation 需携带 `LeaseGrant`，并在 effect/command receipt 的同一 commit 内复验 worker、fence 与 expected revision；grant 不用墙钟到期，只由显式 fence 撤销。`ClaimLease` 把最早可领 Task 的选取、fence 增加、不可变 grant 历史和 command receipt 放在同一 SQLite 事务。Task、final message、Submission、Artifact publish 和 command result 也在同一 SQLite 事务里；真实文件写入不在该事务中。
+当前实现已经包含独立 SQLite schema、命令级精确 replay/冲突、Task revision CAS、多轮 `input_required`、终态不可重开、分页 Message/Event、不可变 Artifact、final Submission 原子发布、取消/失败丢弃 frozen Artifact，以及 apply receipt 推进 Workspace confirmed head。Agent worker mutation 需携带 `LeaseGrant`，并在 effect/command receipt 的同一 Store commit 内复验 worker、fence 与 expected revision；grant 不用墙钟到期，只由显式 fence 撤销。`ClaimLease` 把最早可领 Task 的选取、fence 增加、不可变 grant 历史和 command receipt 放在同一 Store transaction。Task、final message、Submission、Artifact publish 和 command result 也在同一 Store transaction 里；官方 SQLite adapter 用 SQLite 事务兑现它，自定义 Store 必须提供等价原子性。真实文件写入不在该事务中。
 
 caller 侧依赖的是 `workspace.Store`。官方 `workspace/sqlite.Open` 返回 owned `framework.Resource[workspace.Store]`：它在调用宿主 `CASApplier` 前先持久 exact `ApplyIntent`；已完成记录只重放结果，重启发现的 `pending` 或 applier 错误被固化为 `indeterminate`，不盲目重跑外部副作用。宿主也可以注入自己的 Store。真实 applier 必须实现 exact-base 文件树 CAS；Store 不会自己解释 bundle 或授权 shell 副作用。终态结果再通过 A2A apply-receipt extension 回传 Agent confirmed head。
 

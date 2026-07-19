@@ -7,14 +7,23 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/humantest"
 	"github.com/vibe-agi/human/llm"
 	"github.com/vibe-agi/human/llm/workerws"
+)
+
+const (
+	llmCrashChildEnv = "HUMAN_LLM_SQLITE_JOURNAL_CRASH_CHILD"
+	llmCrashPathEnv  = "HUMAN_LLM_SQLITE_JOURNAL_CRASH_PATH"
+	llmCrashExitCode = 89
 )
 
 func TestJournalConformance(t *testing.T) {
@@ -34,6 +43,171 @@ func TestJournalConformance(t *testing.T) {
 		}
 		return journal, resource.Release, nil
 	})
+}
+
+func TestJournalRecoveryFaultMatrix(t *testing.T) {
+	humantest.TestLLMWorkerJournalRecovery(t, func(
+		_ context.Context,
+		test testing.TB,
+	) (humantest.LLMWorkerJournalRecoveryOpener, error) {
+		path := filepath.Join(test.TempDir(), "journal-recovery.db")
+		return func(ctx context.Context) (
+			workerws.Journal,
+			framework.ReleaseFunc,
+			error,
+		) {
+			resource, err := Open(ctx, Config{Path: path})
+			if err != nil {
+				return nil, nil, err
+			}
+			journal, err := resource.Value()
+			if err != nil {
+				_ = resource.Release(context.Background())
+				return nil, nil, err
+			}
+			return journal, resource.Release, nil
+		}, nil
+	})
+}
+
+func TestJournalRecoversCommittedStateAfterAbruptProcessExit(t *testing.T) {
+	if os.Getenv(llmCrashChildEnv) == "1" {
+		if err := seedLLMJournalBeforeCrash(os.Getenv(llmCrashPathEnv)); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(llmCrashExitCode + 1)
+		}
+		// Deliberately skip Resource.Release and all testing cleanup so the parent
+		// exercises SQLite/WAL recovery after a genuine process boundary.
+		os.Exit(llmCrashExitCode)
+	}
+
+	path := filepath.Join(t.TempDir(), "journal-crash.db")
+	command := exec.Command(os.Args[0], "-test.run=^TestJournalRecoversCommittedStateAfterAbruptProcessExit$", "-test.count=1")
+	command.Env = append(os.Environ(), llmCrashChildEnv+"=1", llmCrashPathEnv+"="+path)
+	output, err := command.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != llmCrashExitCode {
+		t.Fatalf("crash child = %v (exit %v), want %d; output:\n%s", err, llmProcessExitCode(exit), llmCrashExitCode, output)
+	}
+
+	resource, err := Open(t.Context(), Config{Path: path})
+	if err != nil {
+		t.Fatalf("open HumanLLM Journal after process crash: %v", err)
+	}
+	t.Cleanup(func() { _ = resource.Release(context.Background()) })
+	journal, err := resource.Value()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := workerws.JournalBinding{Gateway: "gateway-crash", Worker: "worker-crash"}
+	if err := journal.Bind(t.Context(), binding); err != nil {
+		t.Fatalf("durable binding after process crash: %v", err)
+	}
+
+	ackEvent := sqliteTestEvent("crash-event-ack")
+	nackEvent := sqliteTestEvent("crash-event-nack")
+	follower := sqliteTestEvent("crash-event-follower")
+	events, err := journal.ListEvents(t.Context(), 0, 10)
+	if err != nil || len(events) != 1 || events[0].Digest != follower.Digest ||
+		!reflect.DeepEqual(events[0].Delivery, follower.Delivery) {
+		t.Fatalf("pending follower after process crash = %#v, %v", events, err)
+	}
+	nack := llm.WorkerEventReceipt{
+		Delivery: nackEvent.Delivery.ID, EventID: nackEvent.Delivery.Event.ID,
+		Decision: llm.WorkerEventNACK, Code: llm.WorkerRejectInvalid, Message: "crash rejection",
+	}
+	rejections, err := journal.ListRejections(t.Context(), 0, 10)
+	if err != nil || len(rejections) != 1 || rejections[0].EventDigest != nackEvent.Digest ||
+		rejections[0].ReceiptDigest != sqliteDigest(nack) ||
+		!reflect.DeepEqual(rejections[0].Delivery, nackEvent.Delivery) || rejections[0].Receipt != nack {
+		t.Fatalf("rejection after process crash = %#v, %v", rejections, err)
+	}
+	for _, settled := range []workerws.JournalEvent{ackEvent, nackEvent} {
+		if state, err := journal.PutEvent(t.Context(), settled); err != nil || state != workerws.JournalEntrySettled {
+			t.Fatalf("settled event %q after crash = (%q, %v)", settled.Delivery.ID, state, err)
+		}
+	}
+	divergent := ackEvent
+	divergent.Delivery = llm.CloneWorkerEventDelivery(ackEvent.Delivery)
+	divergent.Delivery.Event.Text = "changed after crash"
+	divergent.Digest = sqliteDigest(divergent.Delivery)
+	if _, err := journal.PutEvent(t.Context(), divergent); !errors.Is(err, workerws.ErrJournalConflict) {
+		t.Fatalf("divergent event after crash = %v, want ErrJournalConflict", err)
+	}
+	ack := llm.WorkerEventReceipt{
+		Delivery: ackEvent.Delivery.ID, EventID: ackEvent.Delivery.Event.ID, Decision: llm.WorkerEventACK,
+	}
+	conflictingReceipt := ack
+	conflictingReceipt.Decision = llm.WorkerEventNACK
+	conflictingReceipt.Code = llm.WorkerRejectInvalid
+	conflictingReceipt.Message = "different"
+	if err := journal.SettleEvent(
+		t.Context(), conflictingReceipt, ackEvent.Digest, sqliteDigest(conflictingReceipt),
+	); !errors.Is(err, workerws.ErrJournalConflict) {
+		t.Fatalf("divergent receipt after crash = %v, want ErrJournalConflict", err)
+	}
+	if err := journal.SettleEvent(t.Context(), ack, ackEvent.Digest, sqliteDigest(ack)); err != nil {
+		t.Fatalf("exact ACK receipt after crash: %v", err)
+	}
+	maximum := events[0].Sequence
+	if rejections[0].Sequence > maximum {
+		maximum = rejections[0].Sequence
+	}
+	fresh := sqliteTestEvent("crash-event-new")
+	if _, err := journal.PutEvent(t.Context(), fresh); err != nil {
+		t.Fatal(err)
+	}
+	events, err = journal.ListEvents(t.Context(), events[0].Sequence, 10)
+	if err != nil || len(events) != 1 || events[0].Sequence <= maximum ||
+		!reflect.DeepEqual(events[0].Delivery, fresh.Delivery) {
+		t.Fatalf("new sequence after process crash = %#v, %v; want > %d", events, err, maximum)
+	}
+}
+
+func seedLLMJournalBeforeCrash(path string) error {
+	resource, err := Open(context.Background(), Config{Path: path})
+	if err != nil {
+		return err
+	}
+	journal, err := resource.Value()
+	if err != nil {
+		return err
+	}
+	if err := journal.Bind(context.Background(), workerws.JournalBinding{
+		Gateway: "gateway-crash", Worker: "worker-crash",
+	}); err != nil {
+		return err
+	}
+	ackEvent := sqliteTestEvent("crash-event-ack")
+	if _, err := journal.PutEvent(context.Background(), ackEvent); err != nil {
+		return err
+	}
+	ack := llm.WorkerEventReceipt{
+		Delivery: ackEvent.Delivery.ID, EventID: ackEvent.Delivery.Event.ID, Decision: llm.WorkerEventACK,
+	}
+	if err := journal.SettleEvent(context.Background(), ack, ackEvent.Digest, sqliteDigest(ack)); err != nil {
+		return err
+	}
+	nackEvent := sqliteTestEvent("crash-event-nack")
+	if _, err := journal.PutEvent(context.Background(), nackEvent); err != nil {
+		return err
+	}
+	nack := llm.WorkerEventReceipt{
+		Delivery: nackEvent.Delivery.ID, EventID: nackEvent.Delivery.Event.ID,
+		Decision: llm.WorkerEventNACK, Code: llm.WorkerRejectInvalid, Message: "crash rejection",
+	}
+	if err := journal.SettleEvent(context.Background(), nack, nackEvent.Digest, sqliteDigest(nack)); err != nil {
+		return err
+	}
+	_, err = journal.PutEvent(context.Background(), sqliteTestEvent("crash-event-follower"))
+	return err
+}
+
+func llmProcessExitCode(err *exec.ExitError) int {
+	if err == nil {
+		return 0
+	}
+	return err.ExitCode()
 }
 
 func TestFilePermissionsOwnerLockAndStrictSchema(t *testing.T) {

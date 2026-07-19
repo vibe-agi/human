@@ -80,7 +80,7 @@
 | G-16 | 跨 completion 持久任务状态机（admitted→…→final）；会话粘连原接单人；baseline 仅成功 tool result 后推进；部分失败保留未确认 diff | M1 |
 | G-17 | 稳定标识 `caller_id/workspace_key/task_id` 定正确性边界（能力/镜像/baseline 绑它）；指纹仅 UI 聚合（[05](05-m0-contract.md) §1） | M1 |
 | G-18 | Responses API stream/aggregate codec、严格控制字段、serial/namespace/hosted/reasoning 边界与 golden fixture 已实现；Codex 0.144.5 Basic 函数闭环已真实通过，其 Workspace/故障恢复仍由 M0 实测裁决 | M0 |
-| G-19 | 内部持久边界按领域接口切分、当前只实现 SQLite；公共库不把 internal store 冒充稳定 driver API，postgres/mysql/redis 待多实例需求再设计 | M1 |
+| G-19 | 公共持久边界已按 `agent.Store`、`llm.Store`、`workspace.Store` 三个领域合同切分；官方生产 adapter 当前为 SQLite，宿主可实现自有 Store，postgres/mysql/redis 官方实现待多实例需求再设计 | M1 |
 | G-20 | 故障矩阵：caller 重试、worker 抖动/半开、gateway/SQLite 重启及三方重叠离线；同一逻辑事件零重复、零静默丢失、无队头毒丸 | M0 |
 | G-21 | 公共 Go API：`gateway` 提供 handler/恢复/认证接缝，`worker` 提供 Bubble Tea model，`local` 单进程组合 loopback gateway + SQLite + TUI；CLI 为薄装配 | M1 |
 

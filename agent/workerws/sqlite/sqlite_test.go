@@ -7,8 +7,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 	"time"
@@ -19,6 +22,12 @@ import (
 	"github.com/vibe-agi/human/humantest"
 	"github.com/vibe-agi/human/workspace"
 	_ "modernc.org/sqlite"
+)
+
+const (
+	agentCrashChildEnv = "HUMAN_AGENT_SQLITE_JOURNAL_CRASH_CHILD"
+	agentCrashPathEnv  = "HUMAN_AGENT_SQLITE_JOURNAL_CRASH_PATH"
+	agentCrashExitCode = 87
 )
 
 func TestJournalConformance(t *testing.T) {
@@ -37,6 +46,187 @@ func TestJournalConformance(t *testing.T) {
 		}
 		return journal, resource.Release, nil
 	})
+}
+
+func TestJournalRecoveryFaultMatrix(t *testing.T) {
+	humantest.TestAgentWorkerJournalRecovery(t, func(
+		_ context.Context,
+		test testing.TB,
+	) (humantest.AgentWorkerJournalRecoveryOpener, error) {
+		path := filepath.Join(test.TempDir(), "journal-recovery.db")
+		return func(ctx context.Context) (
+			workerws.Journal,
+			framework.ReleaseFunc,
+			error,
+		) {
+			resource, err := Open(ctx, Config{Path: path})
+			if err != nil {
+				return nil, nil, err
+			}
+			journal, err := resource.Value()
+			if err != nil {
+				_ = resource.Release(context.Background())
+				return nil, nil, err
+			}
+			return journal, resource.Release, nil
+		}, nil
+	})
+}
+
+func TestJournalRecoversCommittedStateAfterAbruptProcessExit(t *testing.T) {
+	if os.Getenv(agentCrashChildEnv) == "1" {
+		if err := seedAgentJournalBeforeCrash(os.Getenv(agentCrashPathEnv)); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(agentCrashExitCode + 1)
+		}
+		// Intentionally bypass every Release, defer, and testing cleanup. The
+		// parent process must recover only writes that were durable on return.
+		os.Exit(agentCrashExitCode)
+	}
+
+	path := filepath.Join(t.TempDir(), "journal-crash.db")
+	command := exec.Command(os.Args[0], "-test.run=^TestJournalRecoversCommittedStateAfterAbruptProcessExit$", "-test.count=1")
+	command.Env = append(os.Environ(), agentCrashChildEnv+"=1", agentCrashPathEnv+"="+path)
+	output, err := command.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != agentCrashExitCode {
+		t.Fatalf("crash child = %v (exit %v), want %d; output:\n%s", err, exitCode(exit), agentCrashExitCode, output)
+	}
+
+	resource, err := Open(t.Context(), Config{Path: path})
+	if err != nil {
+		t.Fatalf("open Journal after process crash: %v", err)
+	}
+	t.Cleanup(func() { _ = resource.Release(context.Background()) })
+	journal, err := resource.Value()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Bind(t.Context(), sqliteTestBinding()); err != nil {
+		t.Fatalf("durable binding after process crash: %v", err)
+	}
+
+	assignment := sqliteTestAssignment("crash-assignment")
+	assignments, err := journal.ListAssignments(t.Context(), 0, 10)
+	if err != nil || len(assignments) != 1 || assignments[0].Digest != sqliteTestDigest(assignment) ||
+		!reflect.DeepEqual(assignments[0].Delivery, assignment) {
+		t.Fatalf("assignments after process crash = %#v, %v", assignments, err)
+	}
+	divergentAssignment := assignment
+	divergentAssignment.Assignment.Task.Revision++
+	divergentAssignment.Assignment.Task.EventCount++
+	if _, err := journal.PutAssignment(t.Context(), workerws.JournalAssignment{
+		Digest: sqliteTestDigest(divergentAssignment), Delivery: divergentAssignment,
+	}); !errors.Is(err, workerws.ErrJournalConflict) {
+		t.Fatalf("divergent assignment after crash = %v, want ErrJournalConflict", err)
+	}
+
+	ackEvent := sqliteTestEvent("crash-event-ack")
+	nackEvent := sqliteTestEvent("crash-event-nack")
+	follower := sqliteTestEvent("crash-event-follower")
+	events, err := journal.ListEvents(t.Context(), 0, 10)
+	if err != nil || len(events) != 1 || events[0].Digest != sqliteTestDigest(follower) ||
+		!reflect.DeepEqual(events[0].Delivery, follower) {
+		t.Fatalf("pending follower after process crash = %#v, %v", events, err)
+	}
+	rejections, err := journal.ListRejections(t.Context(), 0, 10)
+	wantNACK := sqliteTestNACK(nackEvent)
+	if err != nil || len(rejections) != 1 || rejections[0].EventDigest != sqliteTestDigest(nackEvent) ||
+		rejections[0].ReceiptDigest != sqliteTestDigest(wantNACK) ||
+		!reflect.DeepEqual(rejections[0].Delivery, nackEvent) || rejections[0].Receipt != wantNACK {
+		t.Fatalf("rejection after process crash = %#v, %v", rejections, err)
+	}
+	for _, settled := range []agent.WorkerEventDelivery{ackEvent, nackEvent} {
+		if state, err := journal.PutEvent(t.Context(), workerws.JournalEvent{
+			Digest: sqliteTestDigest(settled), Delivery: settled,
+		}); err != nil || state != workerws.JournalEntrySettled {
+			t.Fatalf("settled event %q after crash = (%q, %v)", settled.ID, state, err)
+		}
+	}
+	ackReceipt := agent.WorkerEventReceipt{
+		Delivery: ackEvent.ID, Event: ackEvent.Event.ID, Decision: agent.WorkerEventACK,
+	}
+	if err := journal.SettleEvent(
+		t.Context(), sqliteTestNACK(ackEvent), sqliteTestDigest(ackEvent), sqliteTestDigest(sqliteTestNACK(ackEvent)),
+	); !errors.Is(err, workerws.ErrJournalConflict) {
+		t.Fatalf("divergent receipt after crash = %v, want ErrJournalConflict", err)
+	}
+	if err := journal.SettleEvent(
+		t.Context(), ackReceipt, sqliteTestDigest(ackEvent), sqliteTestDigest(ackReceipt),
+	); err != nil {
+		t.Fatalf("exact ACK receipt after crash: %v", err)
+	}
+	maximum := assignments[0].Sequence
+	if events[0].Sequence > maximum {
+		maximum = events[0].Sequence
+	}
+	if rejections[0].Sequence > maximum {
+		maximum = rejections[0].Sequence
+	}
+	fresh := sqliteTestEvent("crash-event-new")
+	if _, err := journal.PutEvent(t.Context(), workerws.JournalEvent{
+		Digest: sqliteTestDigest(fresh), Delivery: fresh,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events, err = journal.ListEvents(t.Context(), events[0].Sequence, 10)
+	if err != nil || len(events) != 1 || events[0].Sequence <= maximum || !reflect.DeepEqual(events[0].Delivery, fresh) {
+		t.Fatalf("new sequence after process crash = %#v, %v; want > %d", events, err, maximum)
+	}
+}
+
+func seedAgentJournalBeforeCrash(path string) error {
+	resource, err := Open(context.Background(), Config{Path: path})
+	if err != nil {
+		return err
+	}
+	journal, err := resource.Value()
+	if err != nil {
+		return err
+	}
+	if err := journal.Bind(context.Background(), sqliteTestBinding()); err != nil {
+		return err
+	}
+	assignment := sqliteTestAssignment("crash-assignment")
+	if _, err := journal.PutAssignment(context.Background(), workerws.JournalAssignment{
+		Digest: sqliteTestDigest(assignment), Delivery: assignment,
+	}); err != nil {
+		return err
+	}
+	ackEvent := sqliteTestEvent("crash-event-ack")
+	if _, err := journal.PutEvent(context.Background(), workerws.JournalEvent{
+		Digest: sqliteTestDigest(ackEvent), Delivery: ackEvent,
+	}); err != nil {
+		return err
+	}
+	ack := agent.WorkerEventReceipt{
+		Delivery: ackEvent.ID, Event: ackEvent.Event.ID, Decision: agent.WorkerEventACK,
+	}
+	if err := journal.SettleEvent(context.Background(), ack, sqliteTestDigest(ackEvent), sqliteTestDigest(ack)); err != nil {
+		return err
+	}
+	nackEvent := sqliteTestEvent("crash-event-nack")
+	if _, err := journal.PutEvent(context.Background(), workerws.JournalEvent{
+		Digest: sqliteTestDigest(nackEvent), Delivery: nackEvent,
+	}); err != nil {
+		return err
+	}
+	nack := sqliteTestNACK(nackEvent)
+	if err := journal.SettleEvent(context.Background(), nack, sqliteTestDigest(nackEvent), sqliteTestDigest(nack)); err != nil {
+		return err
+	}
+	follower := sqliteTestEvent("crash-event-follower")
+	_, err = journal.PutEvent(context.Background(), workerws.JournalEvent{
+		Digest: sqliteTestDigest(follower), Delivery: follower,
+	})
+	return err
+}
+
+func exitCode(err *exec.ExitError) int {
+	if err == nil {
+		return 0
+	}
+	return err.ExitCode()
 }
 
 func TestOwnedResourcePersistsBindingAndRecordsAcrossReopen(t *testing.T) {

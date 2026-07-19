@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,17 +9,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
+	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
 	human "github.com/vibe-agi/human"
 	"github.com/vibe-agi/human/examples/custom-framework/customprotect"
+	"github.com/vibe-agi/human/examples/custom-framework/customstore"
 	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/llm"
-	llmsqlite "github.com/vibe-agi/human/llm/sqlite"
 	protectaead "github.com/vibe-agi/human/protect/aead"
 )
 
@@ -27,16 +30,8 @@ var (
 	errTransportClosed  = errors.New("custom transport: runtime is closed")
 	errAlreadyStarted   = errors.New("custom transport: already started")
 	errEndpointProtocol = errors.New("custom transport: endpoint violated response protocol")
+	errEndpointFailure  = errors.New("custom transport: HumanLLM endpoint failed")
 )
-
-// auditedStore is an application-owned Store decorator. It deliberately
-// advertises the application's provider identity while forwarding the complete
-// storage contract to an official SQLite adapter.
-type auditedStore struct {
-	next        llm.Store
-	description llm.StoreDescription
-	log         *auditLog
-}
 
 type auditLog struct {
 	out io.Writer
@@ -49,79 +44,19 @@ func (audit *auditLog) record(message string) {
 	_, _ = fmt.Fprintf(audit.out, "audit %s\n", message)
 }
 
-func (store *auditedStore) Description() llm.StoreDescription {
-	description := store.description
-	description.Contract.Features = maps.Clone(description.Contract.Features)
-	return description
-}
-
-func (store *auditedStore) Bind(ctx context.Context, binding llm.StoreBinding) error {
-	store.audit("bind")
-	return store.next.Bind(ctx, binding)
-}
-
-func (store *auditedStore) View(ctx context.Context, view func(llm.StoreView) error) error {
-	store.audit("view")
-	return store.next.View(ctx, view)
-}
-
-func (store *auditedStore) Update(ctx context.Context, update func(llm.StoreTx) error) error {
-	store.audit("update")
-	return store.next.Update(ctx, update)
-}
-
-func (store *auditedStore) audit(operation string) {
-	store.log.record("store." + operation)
-}
-
-// openAuditedSQLite transfers the SQLite resource into a new owned decorator
-// resource. HumanLLM releases the decorator, whose callback releases SQLite;
-// the host must not also close either object.
-func openAuditedSQLite(
+// openCustomStore constructs the application's independent physical Store.
+// HumanLLM consumes and releases the returned owned Resource.
+func openCustomStore(
 	ctx context.Context,
 	path string,
 	audit *auditLog,
 ) (framework.Resource[llm.Store], error) {
-	baseResource, err := llmsqlite.Open(ctx, llmsqlite.Config{Path: path})
-	if err != nil {
-		return framework.Resource[llm.Store]{}, err
-	}
-	base, err := baseResource.Value()
-	if err != nil {
-		_ = releaseResource(baseResource)
-		return framework.Resource[llm.Store]{}, err
-	}
-	baseDescription := base.Description()
-	if err := baseDescription.Validate(); err != nil {
-		return framework.Resource[llm.Store]{}, errors.Join(
-			err,
-			releaseResource(baseResource),
-		)
-	}
-	contract, err := framework.Negotiate(baseDescription.Contract, llm.StoreRequirements())
-	if err != nil {
-		return framework.Resource[llm.Store]{}, errors.Join(
-			err,
-			releaseResource(baseResource),
-		)
-	}
-	resource, err := framework.Own[llm.Store](
-		&auditedStore{
-			next: base,
-			description: llm.StoreDescription{
-				Contract: contract, Provider: "example.audited-sqlite", Version: "1",
-			},
-			log: audit,
-		},
-		baseResource.Release,
-	)
-	if err != nil {
-		return framework.Resource[llm.Store]{}, errors.Join(
-			err,
-			releaseResource(baseResource),
-		)
-	}
-	return resource, nil
+	return customstore.Open(ctx, customstore.Config{
+		Path:     path,
+		Provider: "example.audited-store",
+		Version:  "1",
+		Audit:    func(operation string) { audit.record("store." + operation) },
+	})
 }
 
 // authenticator belongs to this adapter, not to HumanLLM core. A real adapter
@@ -168,6 +103,7 @@ type callResult struct {
 	RequestDigest llm.StoreDigest
 	StatusCode    int
 	ContentType   string
+	RetryAfter    string
 	Body          []byte
 	Frames        [][]byte
 }
@@ -328,7 +264,13 @@ func (runtime *inProcessRuntime) call(ctx context.Context, request call) (callRe
 		CodecID: request.CodecID, Body: request.Body, Task: request.Task,
 	})
 	if err != nil {
-		return callResult{}, err
+		if operationErr := operation.Err(); operationErr != nil {
+			return callResult{}, operationErr
+		}
+		if projected, ok := projectAdmissionError(err); ok {
+			return projected, nil
+		}
+		return callResult{}, errEndpointFailure
 	}
 	if err := validateAdmission(admission, caller, request.IdempotencyKey); err != nil {
 		return callResult{}, err
@@ -336,27 +278,50 @@ func (runtime *inProcessRuntime) call(ctx context.Context, request call) (callRe
 
 	result := callResult{Identity: admission.Identity, RequestDigest: admission.RequestDigest}
 	page := admission.Response
-	mode := page.Mode
-	after := uint64(0)
-	waited := false
+	state := responseState{}
 	for {
-		if err := validatePage(page, admission.Identity, admission.RequestDigest, mode, after, waited); err != nil {
-			return callResult{}, err
-		}
-		mergePage(&result, page)
-		if page.Complete {
-			return result, nil
-		}
-		after = page.Cursor
-		page, err = runtime.endpoint.WaitResponse(operation, llm.ResponseQuery{
-			CallerID: caller, IdempotencyKey: request.IdempotencyKey,
-			RequestDigest: admission.RequestDigest, After: after,
-		})
+		nextState, err := validatePage(page, admission.Identity, admission.RequestDigest, state)
 		if err != nil {
 			return callResult{}, err
 		}
-		waited = true
+		mergePage(&result, page, state.decisionCommitted)
+		state = nextState
+		if page.Complete {
+			return result, nil
+		}
+		page, err = runtime.endpoint.WaitResponse(operation, llm.ResponseQuery{
+			CallerID: caller, IdempotencyKey: request.IdempotencyKey,
+			RequestDigest: admission.RequestDigest, After: state.cursor,
+		})
+		if err != nil {
+			if operationErr := operation.Err(); operationErr != nil {
+				return callResult{}, operationErr
+			}
+			// AdmissionError is meaningful only before a response identity exists.
+			// Once admitted, any endpoint failure is deliberately collapsed instead
+			// of exposing an implementation error or replacing a durable decision.
+			return callResult{}, errEndpointFailure
+		}
 	}
+}
+
+// projectAdmissionError converts the only caller-safe endpoint error into this
+// non-HTTP transport's ordinary result shape. It deliberately does not retain,
+// wrap, format, or otherwise reveal AdmissionError.Cause. Malformed typed errors
+// are treated exactly like unknown endpoint errors by returning ok=false.
+func projectAdmissionError(err error) (callResult, bool) {
+	var admission *llm.AdmissionError
+	if !errors.As(err, &admission) || admission == nil || admission.Failure.Validate() != nil ||
+		!safeWireValue(admission.ContentType, 256) ||
+		(admission.RetryAfter != "" && !safeWireValue(admission.RetryAfter, 128)) {
+		return callResult{}, false
+	}
+	return callResult{
+		StatusCode:  admission.Failure.Status,
+		ContentType: admission.ContentType,
+		RetryAfter:  admission.RetryAfter,
+		Body:        bytes.Clone(admission.Body),
+	}, true
 }
 
 func validateAdmission(
@@ -365,7 +330,7 @@ func validateAdmission(
 	key llm.IdempotencyKey,
 ) error {
 	if err := admission.Identity.Validate(); err != nil {
-		return fmt.Errorf("%w: invalid admission identity: %v", errEndpointProtocol, err)
+		return fmt.Errorf("%w: invalid admission identity", errEndpointProtocol)
 	}
 	if admission.Identity.CallerID != caller || admission.Identity.IdempotencyKey != key {
 		return fmt.Errorf("%w: admission authority changed", errEndpointProtocol)
@@ -380,48 +345,137 @@ func validateAdmission(
 	return nil
 }
 
+type responseState struct {
+	seen              bool
+	mode              llm.ResponseMode
+	cursor            uint64
+	decisionCommitted bool
+	decision          llm.ResponseDecision
+}
+
 func validatePage(
 	page llm.ResponsePage,
 	identity llm.CompletionIdentity,
 	digest llm.StoreDigest,
-	mode llm.ResponseMode,
-	after uint64,
-	waited bool,
-) error {
+	state responseState,
+) (responseState, error) {
 	if page.Identity != identity || page.RequestDigest != digest {
-		return fmt.Errorf("%w: response page identity changed", errEndpointProtocol)
+		return responseState{}, fmt.Errorf("%w: response page identity changed", errEndpointProtocol)
 	}
-	if page.Mode != mode || (page.Mode != llm.ResponseAggregate && page.Mode != llm.ResponseStream) {
-		return fmt.Errorf("%w: response mode changed or is invalid", errEndpointProtocol)
+	if page.Mode != llm.ResponseAggregate && page.Mode != llm.ResponseStream {
+		return responseState{}, fmt.Errorf("%w: response mode is invalid", errEndpointProtocol)
 	}
-	if page.Cursor < after {
-		return fmt.Errorf("%w: response cursor moved backwards", errEndpointProtocol)
+	if state.seen && page.Mode != state.mode {
+		return responseState{}, fmt.Errorf("%w: response mode changed", errEndpointProtocol)
 	}
-	if waited && !page.Complete && page.Cursor == after {
-		return fmt.Errorf("%w: incomplete wait made no progress", errEndpointProtocol)
+	if page.Cursor < state.cursor {
+		return responseState{}, fmt.Errorf("%w: response cursor moved backwards", errEndpointProtocol)
 	}
-	sequence := after
+	decisionAdvanced := page.DecisionCommitted && !state.decisionCommitted
+	if state.seen && !page.Complete && page.Cursor == state.cursor && !decisionAdvanced {
+		return responseState{}, fmt.Errorf("%w: incomplete wait made no progress", errEndpointProtocol)
+	}
+	sequence := state.cursor
 	for _, event := range page.Events {
 		if event.Sequence <= sequence || event.Sequence > page.Cursor {
-			return fmt.Errorf("%w: response event sequence is unordered", errEndpointProtocol)
+			return responseState{}, fmt.Errorf("%w: response event sequence is unordered", errEndpointProtocol)
 		}
 		sequence = event.Sequence
 	}
+
+	next := state
+	next.seen = true
+	next.mode = page.Mode
+	next.cursor = page.Cursor
+	if page.DecisionCommitted {
+		if err := validateResponseDecision(page.Decision); err != nil {
+			return responseState{}, err
+		}
+		if state.decisionCommitted && !sameResponseDecision(page.Decision, state.decision) {
+			return responseState{}, fmt.Errorf("%w: committed response decision changed", errEndpointProtocol)
+		}
+		if !state.decisionCommitted {
+			next.decisionCommitted = true
+			next.decision = cloneResponseDecision(page.Decision)
+		}
+	} else {
+		if !emptyResponseDecision(page.Decision) {
+			return responseState{}, fmt.Errorf("%w: uncommitted response carries a decision", errEndpointProtocol)
+		}
+		if state.decisionCommitted {
+			return responseState{}, fmt.Errorf("%w: committed response decision disappeared", errEndpointProtocol)
+		}
+		if len(page.Events) != 0 {
+			return responseState{}, fmt.Errorf("%w: response events preceded the decision", errEndpointProtocol)
+		}
+	}
 	if page.Complete && !page.DecisionCommitted {
-		return fmt.Errorf("%w: response completed without a decision", errEndpointProtocol)
+		return responseState{}, fmt.Errorf("%w: response completed without a decision", errEndpointProtocol)
+	}
+	switch page.Mode {
+	case llm.ResponseAggregate:
+		if len(page.Events) != 0 {
+			return responseState{}, fmt.Errorf("%w: aggregate response contains stream events", errEndpointProtocol)
+		}
+		if page.DecisionCommitted && !page.Complete {
+			return responseState{}, fmt.Errorf("%w: aggregate decision committed before completion", errEndpointProtocol)
+		}
+	case llm.ResponseStream:
+		if page.DecisionCommitted && len(page.Decision.Body) != 0 {
+			return responseState{}, fmt.Errorf("%w: stream decision contains an aggregate body", errEndpointProtocol)
+		}
+	}
+	return next, nil
+}
+
+func mergePage(result *callResult, page llm.ResponsePage, decisionAlreadyCommitted bool) {
+	if page.DecisionCommitted && !decisionAlreadyCommitted {
+		result.StatusCode = page.Decision.StatusCode
+		result.ContentType = page.Decision.ContentType
+		result.RetryAfter = page.Decision.RetryAfter
+		result.Body = bytes.Clone(page.Decision.Body)
+	}
+	for _, event := range page.Events {
+		result.Frames = append(result.Frames, bytes.Clone(event.Data))
+	}
+}
+
+func validateResponseDecision(decision llm.ResponseDecision) error {
+	if decision.StatusCode < 200 || decision.StatusCode > 599 ||
+		decision.StatusCode >= 300 && decision.StatusCode < 400 ||
+		decision.StatusCode == http.StatusNoContent || decision.StatusCode == http.StatusResetContent ||
+		!safeWireValue(decision.ContentType, 256) ||
+		(decision.RetryAfter != "" && !safeWireValue(decision.RetryAfter, 128)) {
+		return fmt.Errorf("%w: response decision is invalid", errEndpointProtocol)
 	}
 	return nil
 }
 
-func mergePage(result *callResult, page llm.ResponsePage) {
-	if page.DecisionCommitted {
-		result.StatusCode = page.Decision.StatusCode
-		result.ContentType = page.Decision.ContentType
-		result.Body = append(result.Body[:0], page.Decision.Body...)
+func safeWireValue(value string, maximum int) bool {
+	if value == "" || len(value) > maximum || value != strings.TrimSpace(value) {
+		return false
 	}
-	for _, event := range page.Events {
-		result.Frames = append(result.Frames, append([]byte(nil), event.Data...))
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
 	}
+	return true
+}
+
+func emptyResponseDecision(decision llm.ResponseDecision) bool {
+	return decision.StatusCode == 0 && decision.ContentType == "" &&
+		decision.RetryAfter == "" && len(decision.Body) == 0
+}
+
+func sameResponseDecision(left, right llm.ResponseDecision) bool {
+	return left.StatusCode == right.StatusCode && left.ContentType == right.ContentType &&
+		left.RetryAfter == right.RetryAfter && bytes.Equal(left.Body, right.Body)
+}
+
+func cloneResponseDecision(decision llm.ResponseDecision) llm.ResponseDecision {
+	decision.Body = bytes.Clone(decision.Body)
+	return decision
 }
 
 func nilInterface(value any) bool {
@@ -444,7 +498,12 @@ func run(ctx context.Context, out io.Writer) (resultErr error) {
 	}
 
 	audit := &auditLog{out: out}
-	storeResource, err := openAuditedSQLite(ctx, ":memory:", audit)
+	storeDirectory, err := os.MkdirTemp("", "human-custom-framework-")
+	if err != nil {
+		return fmt.Errorf("create example Store directory: %w", err)
+	}
+	defer os.RemoveAll(storeDirectory)
+	storeResource, err := openCustomStore(ctx, filepath.Join(storeDirectory, "llm.snapshot"), audit)
 	if err != nil {
 		return err
 	}

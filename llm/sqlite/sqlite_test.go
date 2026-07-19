@@ -5,8 +5,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 	"time"
@@ -15,6 +18,12 @@ import (
 	"github.com/vibe-agi/human/humantest"
 	"github.com/vibe-agi/human/llm"
 	llmsqlite "github.com/vibe-agi/human/llm/sqlite"
+)
+
+const (
+	llmStoreCrashChildEnv = "HUMAN_LLM_SQLITE_STORE_CRASH_CHILD"
+	llmStoreCrashPathEnv  = "HUMAN_LLM_SQLITE_STORE_CRASH_PATH"
+	llmStoreCrashExitCode = 93
 )
 
 func TestStoreConformance(t *testing.T) {
@@ -130,6 +139,86 @@ func TestOwnedResourcePersistsAndReopens(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestStoreRecoversCommittedTransactionAfterAbruptProcessExit(t *testing.T) {
+	if os.Getenv(llmStoreCrashChildEnv) == "1" {
+		if err := seedLLMStoreBeforeCrash(t, os.Getenv(llmStoreCrashPathEnv)); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(llmStoreCrashExitCode + 1)
+		}
+		os.Exit(llmStoreCrashExitCode) // intentionally bypass Resource.Release
+	}
+
+	path := filepath.Join(t.TempDir(), "llm-crash.db")
+	command := exec.Command(os.Args[0], "-test.run=^TestStoreRecoversCommittedTransactionAfterAbruptProcessExit$", "-test.count=1")
+	command.Env = append(os.Environ(), llmStoreCrashChildEnv+"=1", llmStoreCrashPathEnv+"="+path)
+	output, err := command.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != llmStoreCrashExitCode {
+		t.Fatalf("crash child = %v (exit %d), want %d; output:\n%s", err, llmStoreProcessExitCode(exit), llmStoreCrashExitCode, output)
+	}
+
+	resource, err := llmsqlite.Open(t.Context(), llmsqlite.Config{Path: path})
+	if err != nil {
+		t.Fatalf("open HumanLLM Store after process crash: %v", err)
+	}
+	t.Cleanup(func() { _ = resource.Release(context.Background()) })
+	store, err := resource.Value()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Bind(t.Context(), llm.StoreBinding{DeploymentID: "deployment-crash"}); err != nil {
+		t.Fatalf("durable binding after process crash: %v", err)
+	}
+	wantTask, wantRequest := sqliteFixture(t)
+	if err := store.View(t.Context(), func(view llm.StoreView) error {
+		task, err := view.LoadTask(wantTask.Key)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(task, wantTask) {
+			return fmt.Errorf("task after crash = %#v, want %#v", task, wantTask)
+		}
+		request, err := view.LoadRequest(wantRequest.Key, llm.StoreReadLimit{MaxBytes: 1 << 20})
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(request, wantRequest) {
+			return fmt.Errorf("request after crash = %#v, want %#v", request, wantRequest)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedLLMStoreBeforeCrash(t *testing.T, path string) error {
+	resource, err := llmsqlite.Open(context.Background(), llmsqlite.Config{Path: path})
+	if err != nil {
+		return err
+	}
+	store, err := resource.Value()
+	if err != nil {
+		return err
+	}
+	if err := store.Bind(context.Background(), llm.StoreBinding{DeploymentID: "deployment-crash"}); err != nil {
+		return err
+	}
+	task, request := sqliteFixture(t)
+	return store.Update(context.Background(), func(tx llm.StoreTx) error {
+		if err := tx.InsertTask(task); err != nil {
+			return err
+		}
+		return tx.InsertRequest(request)
+	})
+}
+
+func llmStoreProcessExitCode(err *exec.ExitError) int {
+	if err == nil {
+		return 0
+	}
+	return err.ExitCode()
 }
 
 func TestUpdateRollbackAndEscapedTransaction(t *testing.T) {

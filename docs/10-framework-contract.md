@@ -176,21 +176,33 @@ record；允许读取旧明文只能由显式 migration policy 开启。
 ## 8. Conformance 与故障证据
 
 `humantest` 已公开 Agent Store、LLM Store、Workspace Store 以及两个 worker Journal 的
-conformance kit。官方 SQLite adapters 与可用的 Memory model 运行相同的领域套件，覆盖
+conformance kit；两个 Journal 另有可由第三方直接调用的
+`TestAgentWorkerJournalRecovery` / `TestLLMWorkerJournalRecovery`。官方 SQLite adapters
+与可用的 Memory model 运行相同的领域套件，覆盖
 callback exactly-once、rollback、strict serialization、byte ownership、limits、CAS、binding、
-receipt、recovery 与 retention。第三方 driver 应在自己的包中用 fresh-store factory 运行
+receipt、release/reopen recovery 与 retention。Journal recovery kit 会跨 reopen 验证完整
+payload/digest、冲突 tombstone 和 sequence 单调性，但不会把 `Release` 当作 crash。第三方 driver
+应在自己的包中用 fresh-store factory 运行
 `humantest.TestAgentStore`、`humantest.TestLLMStore` 或 `humantest.TestWorkspaceStore`，再
-补充该 backend 特有的 crash、迁移、损坏与基础设施故障测试。
+补充由测试宿主控制的进程退出/kill、迁移、损坏与基础设施故障测试。
 
 [`examples/custom-framework`](../examples/custom-framework/README.md) 同时演示仓外形状的
-Store decorator、自有认证、非 HTTP CallerTransport 和自定义 Protector decorator，且只
-使用公共 package。它用 SQLite/AEAD 作为安全底座，但 HumanLLM core 不知道底层产品；
-相同位置可替换为远程 Store 或 KMS/HSM。
+独立单文件 Store、自有认证、非 HTTP CallerTransport 和自定义 Protector decorator，且只
+使用公共 package。该 Store 自行实现全部 `StoreView` / `StoreTx`，用版本化校验快照做原子
+提交，直接运行公开 conformance、损坏测试与无 `Release` 的子进程退出恢复测试；同包另保留
+可选 Store middleware 说明 owned/borrowed 组合。它是教学 adapter，不是生产数据库。
+Postgres、MySQL 或远程 Store 在同一个 port 实现事务原语即可，HumanLLM core 无需知道底层产品；
+Protector 的相同位置可替换为 KMS/HSM。
 
 Codec 与策略 hook 已有 external-package contract fixtures；独立的通用 codec/policy
-conformance kit 仍是后续项。网络故障矩阵必须继续验证 caller disconnect、worker
-reconnect、ACK 丢失、service restart、commit-unknown、NACK follower 与三方同时离线；
-长时间健康连接不能代替这些故障证据。
+conformance kit 仍是后续项。LLM 的 Memory/SQLite 共用矩阵覆盖 caller wait cancel、worker
+断线、ACK 丢失、精确重放、poison follower 与三方同时离线；Agent 共用矩阵覆盖 assignment
+重投、event receipt 重放、Store 重启与 poison follower。Memory Store 的重启分支使用
+`Abandon`（不调用 `Release`）作为确定性语义模型；SQLite 在共用矩阵里只做诚实的 release/reopen。
+两套 worker Journal 以相同 factory/opener 套件验证 release/reopen，并另以 Memory `Abandon`
+验证进程内语义。真正的进程边界由 Agent/LLM SQLite Store、两套 SQLite Journal 和示例 custom
+Store 的子进程在成功提交后直接 `os.Exit`、父进程同路径重开来证明。它们仍不冒充断电、磁盘
+损坏或远程数据库分区测试，第三方 driver 必须补自己的故障注入。
 
 ## 9. 当前落地状态
 
@@ -202,8 +214,8 @@ reconnect、ACK 丢失、service restart、commit-unknown、NACK follower 与三
 4. HumanLLM caller HTTP、Codec、路由、准入和工具授权 ports；
 5. 两个 surface 共用的 Protector/KMS port 与官方 AEAD；
 6. `workspace.Store` 与独立 `workspace/sqlite` adapter；
-7. 完整自定义 HumanLLM composition 示例；
-8. SQLite/Memory Store、caller/worker/service 重启、断线重放与三方同时离线故障矩阵。
+7. 完整自定义 HumanLLM composition 示例（独立 Store、Auth、CallerTransport、Protector）；
+8. SQLite/Memory Store 与 worker Journal 的 handle 重启、语义 abandon、真实 SQLite 子进程退出、断线、精确重放、poison 隔离及三方同时离线故障矩阵。
 
 尚未完成的产品能力包括两个 surface 共用同一条 Workspace revision chain、通用 Observer
 port、面向多实例协调的 Store adapter，以及独立 codec/policy conformance kit。这些边界

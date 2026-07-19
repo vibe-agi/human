@@ -1,5 +1,5 @@
 // Package sqlite is HumanLLM's official single-process SQLite Store adapter.
-// It is a default implementation of llm.Store, not a requirement imposed on
+// It is one official implementation of llm.Store, not a requirement imposed on
 // applications: custom databases implement the same public port and run the
 // same humantest conformance suite.
 package sqlite

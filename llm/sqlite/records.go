@@ -64,6 +64,69 @@ func validToolKey(key llm.StoreToolExecutionKey) bool {
 	return validTaskKey(key.Task) && key.ToolCallID != ""
 }
 
+func validateTaskRecord(record llm.StoreTaskRecord) error {
+	if !validTaskKey(record.Key) || record.Revision == 0 ||
+		record.CreatedAt.IsZero() || record.UpdatedAt.IsZero() || !taskStateValid(record.State) {
+		return invalidArgument("invalid task record")
+	}
+	switch record.CapabilityTier {
+	case llm.TierChat:
+	case llm.TierRemoteTools, llm.TierWorkspace:
+		if record.WorkspaceKey == "" || record.HarnessID == "" ||
+			record.HarnessVersion == "" || record.HarnessSessionID == "" {
+			return invalidArgument("tool-capable task requires complete affinity")
+		}
+	default:
+		return invalidArgument("invalid capability tier %q", record.CapabilityTier)
+	}
+	if err := record.Codec.Validate(); err != nil {
+		return invalidArgument("invalid task codec: %v", err)
+	}
+	return nil
+}
+
+func validateRequestRecord(record llm.StoreRequestRecord) error {
+	if !validRequestKey(record.Key) || !validTaskKey(record.Task) || record.RequestID == "" ||
+		record.ResponseID == "" || record.RequestDigest == "" || record.Revision == 0 ||
+		record.CreatedAt.IsZero() || (record.Mode != llm.ResponseStream && record.Mode != llm.ResponseAggregate) {
+		return invalidArgument("invalid request record")
+	}
+	if err := record.Codec.Validate(); err != nil {
+		return invalidArgument("invalid request codec: %v", err)
+	}
+	if record.PayloadPrunedAt != nil &&
+		(len(record.CanonicalPayload) != 0 || len(record.Decision.Body) != 0) {
+		return invalidArgument("tombstoned request retains payload bytes")
+	}
+	return nil
+}
+
+func validateResponseEventRecord(record llm.StoreResponseEventRecord) error {
+	if !validRequestKey(record.Request) || record.Sequence == 0 ||
+		(record.Kind != llm.StoreEventCheckpoint && record.Kind != llm.StoreEventWire) ||
+		record.CreatedAt.IsZero() || ((record.Worker == "") != (record.WorkerEventID == "")) ||
+		((record.WorkerEventID == "") != (record.WorkerEventDigest == "")) {
+		return invalidArgument("invalid response event record")
+	}
+	return nil
+}
+
+func validateWorkerReceiptRecord(record llm.StoreWorkerReceiptRecord) error {
+	if !validRequestKey(record.Request) || record.EventID == "" || record.Worker == "" ||
+		record.Digest == "" || record.CreatedAt.IsZero() {
+		return invalidArgument("invalid worker receipt record")
+	}
+	return nil
+}
+
+func validateToolRecord(record llm.StoreToolExecutionRecord) error {
+	if !validToolKey(record.Key) || record.InputDigest == "" || record.Revision == 0 ||
+		record.CreatedAt.IsZero() || (record.State != llm.ToolExecutionPending && record.State != llm.ToolExecutionCompleted) {
+		return invalidArgument("invalid tool execution record")
+	}
+	return nil
+}
+
 func taskIdentityEqual(left, right llm.StoreTaskRecord) bool {
 	return left.Key == right.Key &&
 		left.WorkspaceKey == right.WorkspaceKey &&
@@ -158,12 +221,8 @@ func (tx *tx) InsertTask(record llm.StoreTaskRecord) error {
 	if err := tx.unit.ensureActive(); err != nil {
 		return err
 	}
-	if !validTaskKey(record.Key) || record.Revision == 0 ||
-		record.CreatedAt.IsZero() || record.UpdatedAt.IsZero() || !taskStateValid(record.State) {
-		return invalidArgument("invalid task record")
-	}
-	if err := record.Codec.Validate(); err != nil {
-		return invalidArgument("invalid task codec: %v", err)
+	if err := validateTaskRecord(record); err != nil {
+		return err
 	}
 	if _, err := loadTask(tx.unit, record.Key); err == nil {
 		return conflict(llm.StoreConstraintTaskKey, record.Key)
@@ -222,6 +281,20 @@ func (tx *tx) CompareAndSwapTask(mutation llm.StoreTaskMutation) (bool, error) {
 	}
 	if !taskIdentityEqual(current, mutation.Next) || mutation.Next.Revision != current.Revision+1 {
 		return false, conflict(llm.StoreConstraintImmutableRecord, mutation.Key)
+	}
+	if !mutation.Next.State.Terminal() &&
+		(mutation.Next.CapabilityTier == llm.TierRemoteTools || mutation.Next.CapabilityTier == llm.TierWorkspace) {
+		found, err := tx.FindOpenTask(llm.StoreTaskAffinity{
+			Caller: mutation.Next.Key.Caller, WorkspaceKey: mutation.Next.WorkspaceKey,
+			HarnessID: mutation.Next.HarnessID, HarnessVersion: mutation.Next.HarnessVersion,
+			HarnessSessionID: mutation.Next.HarnessSessionID,
+		})
+		if err == nil && found.Key != mutation.Key {
+			return false, conflict(llm.StoreConstraintOpenAffinity, mutation.Key)
+		}
+		if err != nil && !errors.Is(err, llm.ErrStoreRecordNotFound) {
+			return false, err
+		}
 	}
 	codec, err := encodeRecord(llm.StoreRecordTask, mutation.Next.Codec)
 	if err != nil {
@@ -412,13 +485,8 @@ func (tx *tx) InsertRequest(record llm.StoreRequestRecord) error {
 	if err := tx.unit.ensureActive(); err != nil {
 		return err
 	}
-	if !validRequestKey(record.Key) || !validTaskKey(record.Task) || record.RequestID == "" ||
-		record.ResponseID == "" || record.RequestDigest == "" || record.Revision == 0 ||
-		record.CreatedAt.IsZero() || (record.Mode != llm.ResponseStream && record.Mode != llm.ResponseAggregate) {
-		return invalidArgument("invalid request record")
-	}
-	if err := record.Codec.Validate(); err != nil {
-		return invalidArgument("invalid request codec: %v", err)
+	if err := validateRequestRecord(record); err != nil {
+		return err
 	}
 	if _, err := loadRequestUnbounded(tx.unit, record.Key); err == nil {
 		return conflict(llm.StoreConstraintRequestKey, record.Key)
@@ -521,6 +589,15 @@ func (tx *tx) CompareAndSwapRequest(mutation llm.StoreRequestMutation) (bool, er
 		len(mutation.Next.CanonicalPayload) != 0 || len(mutation.Next.Decision.Body) != 0 {
 		return false, conflict(llm.StoreConstraintImmutableRecord, mutation.Key)
 	}
+	if !mutation.Next.ResponseComplete {
+		found, err := tx.FindActiveRequest(mutation.Next.Task)
+		if err == nil && found.Key != mutation.Key {
+			return false, conflict(llm.StoreConstraintActiveRequest, mutation.Next.Task)
+		}
+		if err != nil && !errors.Is(err, llm.ErrStoreRecordNotFound) {
+			return false, err
+		}
+	}
 	codec, err := encodeRecord(llm.StoreRecordRequest, mutation.Next.Codec)
 	if err != nil {
 		return false, err
@@ -596,9 +673,8 @@ func (tx *tx) InsertWorkerReceipt(record llm.StoreWorkerReceiptRecord) error {
 	if err := tx.unit.ensureActive(); err != nil {
 		return err
 	}
-	if !validRequestKey(record.Request) || record.EventID == "" || record.Worker == "" ||
-		record.Digest == "" || record.CreatedAt.IsZero() {
-		return invalidArgument("invalid worker receipt record")
+	if err := validateWorkerReceiptRecord(record); err != nil {
+		return err
 	}
 	if _, err := tx.LoadWorkerReceipt(record.Request, record.EventID); err == nil {
 		return conflict(llm.StoreConstraintWorkerReceipt, record.EventID)
@@ -622,11 +698,8 @@ func (tx *tx) InsertResponseEvent(record llm.StoreResponseEventRecord) error {
 	if err := tx.unit.ensureActive(); err != nil {
 		return err
 	}
-	if !validRequestKey(record.Request) || record.Sequence == 0 ||
-		(record.Kind != llm.StoreEventCheckpoint && record.Kind != llm.StoreEventWire) ||
-		record.CreatedAt.IsZero() || ((record.Worker == "") != (record.WorkerEventID == "")) ||
-		((record.WorkerEventID == "") != (record.WorkerEventDigest == "")) {
-		return invalidArgument("invalid response event record")
+	if err := validateResponseEventRecord(record); err != nil {
+		return err
 	}
 	var existingWorker, existingDigest string
 	if record.WorkerEventID != "" {
@@ -738,9 +811,8 @@ func (tx *tx) InsertToolExecution(record llm.StoreToolExecutionRecord) error {
 	if err := tx.unit.ensureActive(); err != nil {
 		return err
 	}
-	if !validToolKey(record.Key) || record.InputDigest == "" || record.Revision == 0 ||
-		record.CreatedAt.IsZero() || (record.State != llm.ToolExecutionPending && record.State != llm.ToolExecutionCompleted) {
-		return invalidArgument("invalid tool execution record")
+	if err := validateToolRecord(record); err != nil {
+		return err
 	}
 	if _, err := loadToolUnbounded(tx.unit, record.Key); err == nil {
 		return conflict(llm.StoreConstraintToolCall, record.Key)
