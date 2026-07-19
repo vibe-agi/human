@@ -8,6 +8,7 @@ import (
 
 	human "github.com/vibe-agi/human"
 	"github.com/vibe-agi/human/agent"
+	llmsqlite "github.com/vibe-agi/human/llm/sqlite"
 )
 
 func TestNewAgentPersistsTaskLifecycle(t *testing.T) {
@@ -92,9 +93,17 @@ func TestAgentAndLLMRequireSeparateDatabaseIdentities(t *testing.T) {
 		t.Fatal(err)
 	}
 	llmConfig := human.DefaultLLMConfig()
-	llmConfig.DatabasePath = path
+	store, openErr := llmsqlite.Open(ctx, llmsqlite.Config{Path: path})
+	if openErr != nil {
+		// The official adapter normally rejects the foreign schema while opening.
+		return
+	}
+	// A custom Store may defer schema validation until the core begins recovery;
+	// that constructor boundary must reject the same mixed identity as well.
+	llmConfig.DeploymentID = "separate-schema-test"
+	llmConfig.Store = store
 	if llm, err := human.NewLLM(ctx, llmConfig); err == nil {
-		_ = llm.Close()
+		_ = llm.Shutdown(ctx)
 		t.Fatal("NewLLM accepted a HumanAgent database")
 	}
 }

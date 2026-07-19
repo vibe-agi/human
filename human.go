@@ -1,48 +1,42 @@
-// Package human exposes the two top-level Human protocol surfaces.
+// Package human exposes the two top-level Human framework surfaces.
 //
-// NewLLM opens the real-time, response-oriented model gateway that already
-// powers the OpenAI- and Anthropic-compatible endpoints. NewAgent is a
-// separate task-oriented surface; its lifecycle is intentionally not built on
-// completion requests.
-//
-// The lower-level agent, a2a, workspace, gateway, local, and worker packages
-// remain available to embedders that need domain types or direct composition
-// of transports, listeners, credentials, and terminal UIs.
+// NewLLM constructs the real-time, response-oriented HumanLLM correctness
+// core. NewAgent constructs the durable, task-oriented HumanAgent core. Both
+// are transport-neutral library objects: listeners, authentication, storage,
+// encryption, worker clients, and user interfaces are explicit adapters owned
+// by the embedding application.
 package human
 
 import (
 	"context"
 
-	"github.com/vibe-agi/human/gateway"
+	"github.com/vibe-agi/human/llm"
+	"github.com/vibe-agi/human/llm/builtin"
 )
 
-// LLMConfig is the configuration for the real-time HumanLLM surface.
-//
-// It is an alias, rather than a copied configuration, so the root facade and
-// gateway package cannot drift. DatabasePath must identify an explicit SQLite
-// database; production durability requires a filesystem path, while :memory:
-// is only ephemeral/test storage. DefaultLLMConfig deliberately leaves it empty.
-type LLMConfig = gateway.Config
+// LLMConfig composes the real-time HumanLLM core. Store and DeploymentID are
+// deliberately required deployment choices. Every other port can be replaced
+// independently; framework.Resource records whether Human owns or merely
+// borrows each stateful dependency.
+type LLMConfig = llm.Config
 
-// LLM is the real-time HumanLLM surface. It implements http.Handler and owns
-// the same durable gateway lifecycle as gateway.Server. Stop any embedding
-// HTTP listener before calling Close.
-type LLM = gateway.Server
+// LLM is the transport-neutral HumanLLM correctness core. It owns no HTTP
+// listener, authentication system, WebSocket endpoint, terminal UI, or hidden
+// process-global state. Caller and worker transports borrow it through the
+// public llm.CallerEndpoint and llm.WorkerEndpoint ports.
+type LLM = llm.Service
 
-// LLMWorkerPath is the built-in private worker WebSocket route used when LLM
-// is mounted directly as an HTTP handler.
-const LLMWorkerPath = gateway.WorkerPath
-
-// DefaultLLMConfig returns the gateway defaults without selecting a database
-// identity. The caller must set DatabasePath before NewLLM.
+// DefaultLLMConfig returns the built-in OpenAI Chat Completions, OpenAI
+// Responses, and Anthropic Messages codecs. It intentionally leaves Store and
+// DeploymentID unset so an embedder must choose a durable identity explicitly.
+// The returned codecs are fresh values and may be replaced or extended.
 func DefaultLLMConfig() LLMConfig {
-	return gateway.DefaultConfig()
+	return LLMConfig{Codecs: builtin.Registrations()}
 }
 
-// NewLLM opens and recovers the real-time HumanLLM surface. ctx controls the
-// whole gateway runtime, including background work and active sessions. This
-// is the conceptual root facade for gateway.Open and deliberately preserves
-// its exact wire protocol, SQLite schema, handler set, and shutdown semantics.
+// NewLLM validates the injected contracts, recovers durable in-flight work,
+// and starts the transport-neutral HumanLLM core. ctx bounds construction and
+// recovery only; method contexts and Shutdown control its subsequent lifetime.
 func NewLLM(ctx context.Context, config LLMConfig) (*LLM, error) {
-	return gateway.Open(ctx, config)
+	return llm.NewService(ctx, config)
 }

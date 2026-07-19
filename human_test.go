@@ -2,88 +2,86 @@ package human_test
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"path/filepath"
-	"reflect"
 	"testing"
 
 	human "github.com/vibe-agi/human"
-	"github.com/vibe-agi/human/gateway"
+	"github.com/vibe-agi/human/framework"
+	"github.com/vibe-agi/human/llm"
+	llmsqlite "github.com/vibe-agi/human/llm/sqlite"
 )
 
-func TestLLMFacadeKeepsGatewayTypeAndDefaults(t *testing.T) {
-	var _ http.Handler = (*human.LLM)(nil)
-	var rootConfig human.LLMConfig = gateway.DefaultConfig()
-	var gatewayConfig gateway.Config = human.DefaultLLMConfig()
-	if !reflect.DeepEqual(rootConfig, gatewayConfig) {
-		t.Fatalf("root defaults differ from gateway defaults:\nroot = %#v\ngateway = %#v", rootConfig, gatewayConfig)
-	}
-	if human.LLMWorkerPath != gateway.WorkerPath {
-		t.Fatalf("worker path = %q, want %q", human.LLMWorkerPath, gateway.WorkerPath)
-	}
+func TestLLMFacadeIsTransportNeutralCore(t *testing.T) {
+	var rootConfig human.LLMConfig
+	var domainConfig llm.Config = rootConfig
+	rootConfig = domainConfig
+	_ = rootConfig
 
-	// These assignments are compile-time compatibility assertions. The facade
-	// must not grow a wrapper type with a second lifecycle or method set.
-	var rootServer *human.LLM
-	var gatewayServer *gateway.Server = rootServer
-	rootServer = gatewayServer
-	_ = rootServer
+	var rootService *human.LLM
+	var domainService *llm.Service = rootService
+	rootService = domainService
+	_ = rootService
+
+	var _ framework.Runtime = (*human.LLM)(nil)
+	var _ llm.CallerEndpoint = (*human.LLM)(nil)
+	var _ llm.WorkerEndpoint = (*human.LLM)(nil)
 }
 
-func TestNewLLMAndGatewayCrossRecoverSameSchema(t *testing.T) {
-	ctx := context.Background()
-	config := human.DefaultLLMConfig()
-	config.DatabasePath = filepath.Join(t.TempDir(), "gateway.db")
-	root, err := human.NewLLM(ctx, config)
-	if err != nil {
-		t.Fatal(err)
+func TestDefaultLLMConfigRegistersFreshBuiltInCodecs(t *testing.T) {
+	first := human.DefaultLLMConfig()
+	second := human.DefaultLLMConfig()
+	if first.DeploymentID != "" || second.DeploymentID != "" {
+		t.Fatal("default config selected a deployment identity")
 	}
-	if err := root.Close(); err != nil {
-		t.Fatal(err)
+	if _, err := first.Store.Value(); err != nil {
+		t.Fatalf("inspect zero Store resource: %v", err)
 	}
-	direct, err := gateway.Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
+	if len(first.Codecs) != 3 || len(second.Codecs) != 3 {
+		t.Fatalf("built-in codec count = %d, %d; want 3", len(first.Codecs), len(second.Codecs))
 	}
-	if err := direct.Close(); err != nil {
-		t.Fatal(err)
-	}
-	recovered, err := human.NewLLM(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := recovered.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := recovered.Close(); err != nil {
-		t.Fatalf("idempotent close: %v", err)
-	}
-}
-
-func TestNewLLMOpensRealModelHandler(t *testing.T) {
-	config := human.DefaultLLMConfig()
-	config.DatabasePath = filepath.Join(t.TempDir(), "gateway.db")
-
-	server, err := human.NewLLM(context.Background(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := server.Close(); err != nil {
-			t.Errorf("close HumanLLM: %v", err)
+	want := []llm.CodecID{"openai.chat", "openai.responses", "anthropic.messages"}
+	for index := range want {
+		if got := first.Codecs[index].Codec.Description().ID; got != want[index] {
+			t.Fatalf("codec[%d] = %q, want %q", index, got, want[index])
 		}
-	})
+		if first.Codecs[index].Codec == second.Codecs[index].Codec {
+			t.Fatalf("codec[%d] was shared between default configs", index)
+		}
+	}
+	first.Codecs[0] = llm.CodecRegistration{}
+	if second.Codecs[0].Codec == nil {
+		t.Fatal("mutating one default config changed another")
+	}
+}
 
-	issued, err := server.Issue(context.Background(), gateway.PrincipalCaller, "facade-caller")
-	if err != nil {
+func TestNewLLMRecoversThroughOfficialSQLiteAdapter(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "llm.db")
+	open := func() *human.LLM {
+		t.Helper()
+		store, err := llmsqlite.Open(ctx, llmsqlite.Config{Path: path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		config := human.DefaultLLMConfig()
+		config.DeploymentID = "facade-test"
+		config.Store = store
+		service, err := human.NewLLM(ctx, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return service
+	}
+
+	first := open()
+	if err := first.Shutdown(ctx); err != nil {
 		t.Fatal(err)
 	}
-	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	request.Header.Set("Authorization", "Bearer "+issued.Secret)
-	response := httptest.NewRecorder()
-	server.ModelHandler().ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
-		t.Fatalf("models status = %d, body = %s", response.Code, response.Body.String())
+	second := open()
+	if err := second.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Shutdown(ctx); err != nil {
+		t.Fatalf("idempotent shutdown: %v", err)
 	}
 }

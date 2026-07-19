@@ -56,6 +56,39 @@ func builtinCodecCases() []codecCase {
 	}
 }
 
+func TestRegistrationsAreCompleteAndFresh(t *testing.T) {
+	first := builtin.Registrations()
+	second := builtin.Registrations()
+	want := []llm.CodecID{"openai.chat", "openai.responses", "anthropic.messages"}
+	if len(first) != len(want) || len(second) != len(want) {
+		t.Fatalf("registration lengths = %d/%d, want %d", len(first), len(second), len(want))
+	}
+	for index, id := range want {
+		firstDescription, err := llm.ValidateCodec(first[index].Codec)
+		if err != nil {
+			t.Fatalf("first registration %d: %v", index, err)
+		}
+		secondDescription, err := llm.ValidateCodec(second[index].Codec)
+		if err != nil {
+			t.Fatalf("second registration %d: %v", index, err)
+		}
+		if firstDescription.ID != id || secondDescription.ID != id {
+			t.Fatalf("registration %d IDs = %q/%q, want %q", index, firstDescription.ID, secondDescription.ID, id)
+		}
+		if first[index].Codec == second[index].Codec {
+			t.Fatalf("registration %d reused a mutable Codec instance", index)
+		}
+		if first[index].StreamContentType != "text/event-stream" ||
+			first[index].AggregateContentType != "application/json" || first[index].SuccessStatus != 200 {
+			t.Fatalf("registration %d metadata = %+v", index, first[index])
+		}
+	}
+	first[0] = llm.CodecRegistration{}
+	if later := builtin.Registrations(); later[0].Codec == nil {
+		t.Fatal("Registrations reused a mutable slice")
+	}
+}
+
 func TestBuiltinsDecodeToOwnedPublicRequests(t *testing.T) {
 	for _, test := range builtinCodecCases() {
 		t.Run(test.name, func(t *testing.T) {

@@ -41,6 +41,26 @@ var builtinLimits = llm.CodecLimits{
 	MaxAdmissionErrorBytes: 1 << 20,
 }
 
+// Registrations returns fresh registrations for every built-in model API.
+// Applications may remove, replace, or append codecs before constructing a
+// Service; mutating the returned slice never changes a later call.
+func Registrations() []llm.CodecRegistration {
+	return []llm.CodecRegistration{
+		{
+			Codec: OpenAIChat(), StreamContentType: "text/event-stream",
+			AggregateContentType: "application/json", SuccessStatus: 200,
+		},
+		{
+			Codec: OpenAIResponses(), StreamContentType: "text/event-stream",
+			AggregateContentType: "application/json", SuccessStatus: 200,
+		},
+		{
+			Codec: AnthropicMessages(), StreamContentType: "text/event-stream",
+			AggregateContentType: "application/json", SuccessStatus: 200,
+		},
+	}
+}
+
 // OpenAIChat returns the built-in OpenAI Chat Completions codec.
 func OpenAIChat() llm.Codec {
 	return newCodec("openai.chat", openAIChatManifest, internalopenai.New())
