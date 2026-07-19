@@ -46,6 +46,26 @@ func TestStoreConformance(t *testing.T) {
 	})
 }
 
+func TestStoreCommitUnknownReconciliation(t *testing.T) {
+	humantest.TestLLMServiceCommitUnknownReconciliation(t, func(
+		ctx context.Context,
+		test testing.TB,
+	) (llm.Store, framework.ReleaseFunc, error) {
+		resource, err := customstore.Open(ctx, fileConfig(
+			filepath.Join(test.TempDir(), "custom-store.snapshot"),
+		))
+		if err != nil {
+			return nil, nil, err
+		}
+		store, err := resource.Value()
+		if err != nil {
+			_ = resource.Release(context.Background())
+			return nil, nil, err
+		}
+		return store, resource.Release, nil
+	})
+}
+
 func TestFileStoreReleaseAndReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "durable.snapshot")
 	firstResource, err := customstore.Open(t.Context(), fileConfig(path))
