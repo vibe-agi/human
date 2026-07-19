@@ -1,9 +1,10 @@
-package agent
+package agent_test
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	. "github.com/vibe-agi/human/agent"
 	"reflect"
 	"strings"
 	"testing"

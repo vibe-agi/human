@@ -12,6 +12,7 @@ import (
 
 	human "github.com/vibe-agi/human"
 	"github.com/vibe-agi/human/agent"
+	agentsqlite "github.com/vibe-agi/human/agent/sqlite"
 )
 
 func main() {
@@ -31,8 +32,12 @@ func run() (resultErr error) {
 		}
 		path = filepath.Join(userConfig, "human", "examples", "agent.db")
 	}
+	store, err := agentsqlite.Open(ctx, agentsqlite.Config{Path: path})
+	if err != nil {
+		return err
+	}
 	config := human.DefaultAgentConfig()
-	config.DatabasePath = path
+	config.Store = store
 	service, err := human.NewAgent(ctx, config)
 	if err != nil {
 		return err

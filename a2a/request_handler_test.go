@@ -13,6 +13,7 @@ import (
 
 	sdk "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/vibe-agi/human/agent"
+	agentsqlite "github.com/vibe-agi/human/agent/sqlite"
 	"github.com/vibe-agi/human/workspace"
 )
 
@@ -272,8 +273,14 @@ func TestApplyReceiptExtensionAuthorizesAndAdvancesExactWorkspaceHead(t *testing
 
 func openA2ATestAgent(t *testing.T) *agent.Agent {
 	t.Helper()
+	store, err := agentsqlite.Open(t.Context(), agentsqlite.Config{
+		Path: filepath.Join(t.TempDir(), "agent.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	config := agent.DefaultConfig()
-	config.DatabasePath = filepath.Join(t.TempDir(), "agent.db")
+	config.Store = store
 	service, err := agent.Open(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)

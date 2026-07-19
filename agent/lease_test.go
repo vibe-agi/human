@@ -1,8 +1,9 @@
-package agent
+package agent_test
 
 import (
 	"context"
 	"errors"
+	. "github.com/vibe-agi/human/agent"
 	"reflect"
 	"sync"
 	"testing"
@@ -57,13 +58,7 @@ func TestLeaseFenceRecoveryAndSameWorkerGeneration(t *testing.T) {
 	if err := service.Close(); err != nil {
 		t.Fatal(err)
 	}
-	config := DefaultConfig()
-	config.DatabasePath = path
-	reopened, err := Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
+	reopened := openTestAgentWithConfig(t, path, DefaultConfig())
 	recovered, err := reopened.GetLease(ctx, taskRef)
 	if err != nil {
 		t.Fatal(err)

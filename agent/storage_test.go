@@ -1,28 +1,28 @@
-package agent
+package agent_test
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	. "github.com/vibe-agi/human/agent"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 
+	agentsqlite "github.com/vibe-agi/human/agent/sqlite"
 	"github.com/vibe-agi/human/workspace"
 )
 
 func TestOpenCreatesPrivateDatabaseParent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "private", "agent.db")
-	config := DefaultConfig()
-	config.DatabasePath = path
-	service, err := Open(context.Background(), config)
+	resource, err := agentsqlite.Open(context.Background(), agentsqlite.Config{Path: path})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Close(); err != nil {
+	if err := resource.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(filepath.Dir(path))
@@ -57,14 +57,12 @@ func TestOpenRejectsOldAgentSchemaFingerprint(t *testing.T) {
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	config := DefaultConfig()
-	config.DatabasePath = path
-	service, err := Open(context.Background(), config)
-	if service != nil {
-		_ = service.Close()
-		t.Fatal("Open accepted an old clean-break schema fingerprint")
+	resource, err := agentsqlite.Open(context.Background(), agentsqlite.Config{Path: path})
+	if err == nil {
+		_ = resource.Release(context.Background())
+		t.Fatal("SQLite adapter accepted an old clean-break schema fingerprint")
 	}
-	if !errors.Is(err, errUnsupportedSchema) {
+	if !errors.Is(err, agentsqlite.ErrUnsupportedSchema) {
 		t.Fatalf("old schema error = %v", err)
 	}
 }

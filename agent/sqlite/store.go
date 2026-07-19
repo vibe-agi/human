@@ -1,4 +1,4 @@
-package agent
+package sqlite
 
 import (
 	"bytes"
@@ -10,13 +10,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	agent "github.com/vibe-agi/human/agent"
 	"github.com/vibe-agi/human/framework"
 )
 
-// sqliteStore is the unexported physical implementation shared by Agent's
-// DatabasePath composition and the official agent/sqlite adapter. Keeping the
-// implementation here lets the adapter depend on the public Store contract
-// without exporting a database handle or creating a package cycle.
+// sqliteStore is the physical implementation behind the official SQLite
+// adapter. The agent.Agent core only sees the public agent.Store contract.
 type sqliteStore struct {
 	database *sql.DB
 	closed   atomic.Bool
@@ -28,7 +27,7 @@ func newSQLiteStore(database *sql.DB) *sqliteStore {
 	return &sqliteStore{database: database}
 }
 
-// close stops new operations before the owned database is released. Store has
+// close stops new operations before the owned database is released. agent.Store has
 // no public lifecycle method: only the framework.Resource created by the
 // SQLite composition primitive calls this hook.
 func (store *sqliteStore) close() {
@@ -37,23 +36,23 @@ func (store *sqliteStore) close() {
 	}
 }
 
-func (*sqliteStore) Description() StoreDescription {
-	return StoreDescription{
-		Contract: framework.Contract{ID: StoreContractID, Major: StoreContractMajor},
+func (*sqliteStore) Description() agent.StoreDescription {
+	return agent.StoreDescription{
+		Contract: framework.Contract{ID: agent.StoreContractID, Major: agent.StoreContractMajor},
 		Provider: "sqlite",
 		Version:  fmt.Sprintf("schema-%d", agentSchemaVersion),
 	}
 }
 
-func (store *sqliteStore) View(ctx context.Context, callback func(StoreView) error) error {
+func (store *sqliteStore) View(ctx context.Context, callback func(agent.StoreView) error) error {
 	if ctx == nil {
-		return fmt.Errorf("%w: context is required", ErrInvalidArgument)
+		return fmt.Errorf("%w: context is required", agent.ErrInvalidArgument)
 	}
 	if callback == nil {
-		return fmt.Errorf("%w: Store View callback is required", ErrInvalidArgument)
+		return fmt.Errorf("%w: agent.Store View callback is required", agent.ErrInvalidArgument)
 	}
 	if store == nil || store.database == nil || store.closed.Load() {
-		return ErrStoreClosed
+		return agent.ErrStoreClosed
 	}
 	tx, err := store.database.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelSerializable,
@@ -83,15 +82,15 @@ func (store *sqliteStore) View(ctx context.Context, callback func(StoreView) err
 	return nil
 }
 
-func (store *sqliteStore) Update(ctx context.Context, callback func(StoreTx) error) error {
+func (store *sqliteStore) Update(ctx context.Context, callback func(agent.StoreTx) error) error {
 	if ctx == nil {
-		return fmt.Errorf("%w: context is required", ErrInvalidArgument)
+		return fmt.Errorf("%w: context is required", agent.ErrInvalidArgument)
 	}
 	if callback == nil {
-		return fmt.Errorf("%w: Store Update callback is required", ErrInvalidArgument)
+		return fmt.Errorf("%w: agent.Store Update callback is required", agent.ErrInvalidArgument)
 	}
 	if store == nil || store.database == nil || store.closed.Load() {
-		return ErrStoreClosed
+		return agent.ErrStoreClosed
 	}
 	tx, err := store.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
@@ -116,7 +115,7 @@ func (store *sqliteStore) Update(ctx context.Context, callback func(StoreTx) err
 	if err := tx.Commit(); err != nil {
 		// database/sql does not expose enough information to distinguish every
 		// transport-level Commit failure. Conservatively force exact command retry.
-		return &StoreCommitUnknownError{Cause: err}
+		return &agent.StoreCommitUnknownError{Cause: err}
 	}
 	return nil
 }
@@ -135,7 +134,7 @@ func newSQLiteStoreUnit(ctx context.Context, tx *sql.Tx) *sqliteStoreUnit {
 
 func (unit *sqliteStoreUnit) ensureActive() error {
 	if unit == nil || unit.tx == nil || !unit.active.Load() {
-		return ErrStoreClosed
+		return agent.ErrStoreClosed
 	}
 	return nil
 }
@@ -148,43 +147,43 @@ type sqliteStoreTx struct {
 	*sqliteStoreView
 }
 
-var _ Store = (*sqliteStore)(nil)
-var _ StoreView = (*sqliteStoreView)(nil)
-var _ StoreTx = (*sqliteStoreTx)(nil)
+var _ agent.Store = (*sqliteStore)(nil)
+var _ agent.StoreView = (*sqliteStoreView)(nil)
+var _ agent.StoreTx = (*sqliteStoreTx)(nil)
 
-func validateSQLiteReadLimit(record StoreRecordKind, limit StoreReadLimit) error {
+func validateSQLiteReadLimit(record agent.StoreRecordKind, limit agent.StoreReadLimit) error {
 	if limit.MaxBytes < 1 {
-		return &StoreLimitError{Record: record, Limit: limit.MaxBytes}
+		return &agent.StoreLimitError{Record: record, Limit: limit.MaxBytes}
 	}
 	return nil
 }
 
 func validateSQLiteScanLimit(limit int) error {
-	if limit < 1 || limit > MaxPageSize+1 {
-		return fmt.Errorf("%w: Store scan limit must be 1..%d", ErrInvalidArgument, MaxPageSize+1)
+	if limit < 1 || limit > agent.MaxPageSize+1 {
+		return fmt.Errorf("%w: agent.Store scan limit must be 1..%d", agent.ErrInvalidArgument, agent.MaxPageSize+1)
 	}
 	return nil
 }
 
-func sqliteNotFound(record StoreRecordKind, key any) error {
-	return &StoreNotFoundError{Record: record, Key: fmt.Sprint(key)}
+func sqliteNotFound(record agent.StoreRecordKind, key any) error {
+	return &agent.StoreNotFoundError{Record: record, Key: fmt.Sprint(key)}
 }
 
-func sqliteConflict(constraint StoreConstraint, key any) error {
-	return &StoreConflictError{Constraint: constraint, Key: fmt.Sprint(key)}
+func sqliteConflict(constraint agent.StoreConstraint, key any) error {
+	return &agent.StoreConflictError{Constraint: constraint, Key: fmt.Sprint(key)}
 }
 
 func (view *sqliteStoreView) LookupCommand(
-	key StoreCommandKey,
-	limit StoreReadLimit,
-) (StoreCommandRecord, error) {
+	key agent.StoreCommandKey,
+	limit agent.StoreReadLimit,
+) (agent.StoreCommandRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
-		return StoreCommandRecord{}, err
+		return agent.StoreCommandRecord{}, err
 	}
-	if err := validateSQLiteReadLimit(StoreRecordCommand, limit); err != nil {
-		return StoreCommandRecord{}, err
+	if err := validateSQLiteReadLimit(agent.StoreRecordCommand, limit); err != nil {
+		return agent.StoreCommandRecord{}, err
 	}
-	var record StoreCommandRecord
+	var record agent.StoreCommandRecord
 	var result []byte
 	var size int64
 	var created int64
@@ -202,33 +201,33 @@ func (view *sqliteStoreView) LookupCommand(
 		&size, &record.ResultDigest, &created,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return StoreCommandRecord{}, sqliteNotFound(StoreRecordCommand, key.ID)
+		return agent.StoreCommandRecord{}, sqliteNotFound(agent.StoreRecordCommand, key.ID)
 	}
 	if err != nil {
-		return StoreCommandRecord{}, fmt.Errorf("load Agent Store command: %w", err)
+		return agent.StoreCommandRecord{}, fmt.Errorf("load Agent Store command: %w", err)
 	}
 	if size > limit.MaxBytes || result == nil {
-		return StoreCommandRecord{}, &StoreLimitError{Record: StoreRecordCommand, Limit: limit.MaxBytes}
+		return agent.StoreCommandRecord{}, &agent.StoreLimitError{Record: agent.StoreRecordCommand, Limit: limit.MaxBytes}
 	}
 	record.Result = bytes.Clone(result)
 	record.CreatedAt = fromUnixNano(created)
 	return cloneStoreCommandRecord(record), nil
 }
 
-func (view *sqliteStoreView) LoadTask(ref TaskRef) (StoreTaskRecord, error) {
+func (view *sqliteStoreView) LoadTask(ref agent.TaskRef) (agent.StoreTaskRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
-		return StoreTaskRecord{}, err
+		return agent.StoreTaskRecord{}, err
 	}
 	return loadSQLiteStoreTask(view.unit.ctx, view.unit.tx, ref)
 }
 
-// loadSQLiteStoreTask materializes physical columns without applying Agent
-// state-machine or digest policy. Store is the persistence port; the Agent core
+// loadSQLiteStoreTask materializes physical columns without applying agent.Agent
+// state-machine or digest policy. agent.Store is the persistence port; the agent.Agent core
 // validates the returned aggregate after the callback. Keeping that validation
 // out of the adapter is also required for read-your-writes while a transaction
-// is atomically linking an Artifact and advancing its Task.
-func loadSQLiteStoreTask(ctx context.Context, tx *sql.Tx, ref TaskRef) (StoreTaskRecord, error) {
-	var record StoreTaskRecord
+// is atomically linking an agent.Artifact and advancing its agent.Task.
+func loadSQLiteStoreTask(ctx context.Context, tx *sql.Tx, ref agent.TaskRef) (agent.StoreTaskRecord, error) {
+	var record agent.StoreTaskRecord
 	record.Task.Ref = ref
 	record.Task.Context.Authority = ref.Workspace.Authority
 	var created, updated int64
@@ -258,71 +257,71 @@ func loadSQLiteStoreTask(ctx context.Context, tx *sql.Tx, ref TaskRef) (StoreTas
 		&submissionID, &finalMessageID, &submissionArtifactID, &publishedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return StoreTaskRecord{}, sqliteNotFound(StoreRecordTask, ref.ID)
+		return agent.StoreTaskRecord{}, sqliteNotFound(agent.StoreRecordTask, ref.ID)
 	}
 	if err != nil {
-		return StoreTaskRecord{}, fmt.Errorf("load Agent Store task: %w", err)
+		return agent.StoreTaskRecord{}, fmt.Errorf("load Agent Store task: %w", err)
 	}
 	record.Task.CreatedAt = fromUnixNano(created)
 	record.Task.UpdatedAt = fromUnixNano(updated)
 	if artifactID.Valid != artifactState.Valid {
-		return StoreTaskRecord{}, fmt.Errorf("%w: partial Artifact columns for task %q", ErrCorruptStore, ref.ID)
+		return agent.StoreTaskRecord{}, fmt.Errorf("%w: partial agent.Artifact columns for task %q", agent.ErrCorruptStore, ref.ID)
 	}
 	if artifactID.Valid {
-		artifactRef := ArtifactRef{Workspace: ref.Workspace, ID: ArtifactID(artifactID.String)}
-		state := ArtifactState(artifactState.String)
+		artifactRef := agent.ArtifactRef{Workspace: ref.Workspace, ID: agent.ArtifactID(artifactID.String)}
+		state := agent.ArtifactState(artifactState.String)
 		record.Task.Artifact = &artifactRef
 		record.ArtifactState = &state
 	}
 	if submissionID.Valid || finalMessageID.Valid || publishedAt.Valid {
 		if !submissionID.Valid || !finalMessageID.Valid || !publishedAt.Valid {
-			return StoreTaskRecord{}, fmt.Errorf("%w: partial submission columns for task %q", ErrCorruptStore, ref.ID)
+			return agent.StoreTaskRecord{}, fmt.Errorf("%w: partial submission columns for task %q", agent.ErrCorruptStore, ref.ID)
 		}
-		record.Task.Submission = &Submission{
-			ID:           SubmissionID(submissionID.String),
+		record.Task.Submission = &agent.Submission{
+			ID:           agent.SubmissionID(submissionID.String),
 			Task:         ref,
-			FinalMessage: MessageID(finalMessageID.String),
+			FinalMessage: agent.MessageID(finalMessageID.String),
 			PublishedAt:  fromUnixNano(publishedAt.Int64),
 		}
 		if submissionArtifactID.Valid {
-			artifactRef := ArtifactRef{Workspace: ref.Workspace, ID: ArtifactID(submissionArtifactID.String)}
+			artifactRef := agent.ArtifactRef{Workspace: ref.Workspace, ID: agent.ArtifactID(submissionArtifactID.String)}
 			record.Task.Submission.Artifact = &artifactRef
 		}
 	} else if submissionArtifactID.Valid {
-		return StoreTaskRecord{}, fmt.Errorf("%w: orphaned submission Artifact for task %q", ErrCorruptStore, ref.ID)
+		return agent.StoreTaskRecord{}, fmt.Errorf("%w: orphaned submission agent.Artifact for task %q", agent.ErrCorruptStore, ref.ID)
 	}
 	return cloneStoreTaskRecord(record), nil
 }
 
-func (view *sqliteStoreView) ResolveTask(authority AuthorityID, id TaskID) (TaskRef, error) {
+func (view *sqliteStoreView) ResolveTask(authority agent.AuthorityID, id agent.TaskID) (agent.TaskRef, error) {
 	if err := view.unit.ensureActive(); err != nil {
-		return TaskRef{}, err
+		return agent.TaskRef{}, err
 	}
-	var workspaceID WorkspaceID
+	var workspaceID agent.WorkspaceID
 	err := view.unit.tx.QueryRowContext(view.unit.ctx, `
 		SELECT workspace_id FROM agent_tasks
 		WHERE authority_id = ? AND task_id = ?`, authority, id,
 	).Scan(&workspaceID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return TaskRef{}, sqliteNotFound(StoreRecordTask, id)
+		return agent.TaskRef{}, sqliteNotFound(agent.StoreRecordTask, id)
 	}
 	if err != nil {
-		return TaskRef{}, fmt.Errorf("resolve Agent Store task: %w", err)
+		return agent.TaskRef{}, fmt.Errorf("resolve Agent Store task: %w", err)
 	}
-	return TaskRef{Workspace: WorkspaceRef{Authority: authority, ID: workspaceID}, ID: id}, nil
+	return agent.TaskRef{Workspace: agent.WorkspaceRef{Authority: authority, ID: workspaceID}, ID: id}, nil
 }
 
 func (view *sqliteStoreView) LoadMessage(
-	key StoreMessageKey,
-	limit StoreReadLimit,
-) (StoreMessageRecord, error) {
+	key agent.StoreMessageKey,
+	limit agent.StoreReadLimit,
+) (agent.StoreMessageRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
-		return StoreMessageRecord{}, err
+		return agent.StoreMessageRecord{}, err
 	}
-	if err := validateSQLiteReadLimit(StoreRecordMessage, limit); err != nil {
-		return StoreMessageRecord{}, err
+	if err := validateSQLiteReadLimit(agent.StoreRecordMessage, limit); err != nil {
+		return agent.StoreMessageRecord{}, err
 	}
-	var record StoreMessageRecord
+	var record agent.StoreMessageRecord
 	var size int64
 	var created int64
 	record.ID = key.ID
@@ -339,13 +338,13 @@ func (view *sqliteStoreView) LoadMessage(
 		&record.EncodedParts, &size, &record.PartsDigest, &created,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return StoreMessageRecord{}, sqliteNotFound(StoreRecordMessage, key.ID)
+		return agent.StoreMessageRecord{}, sqliteNotFound(agent.StoreRecordMessage, key.ID)
 	}
 	if err != nil {
-		return StoreMessageRecord{}, fmt.Errorf("load Agent Store message: %w", err)
+		return agent.StoreMessageRecord{}, fmt.Errorf("load Agent Store message: %w", err)
 	}
 	if size > limit.MaxBytes || record.EncodedParts == nil {
-		return StoreMessageRecord{}, &StoreLimitError{Record: StoreRecordMessage, Limit: limit.MaxBytes}
+		return agent.StoreMessageRecord{}, &agent.StoreLimitError{Record: agent.StoreRecordMessage, Limit: limit.MaxBytes}
 	}
 	record.EncodedParts = bytes.Clone(record.EncodedParts)
 	record.CreatedAt = fromUnixNano(created)
@@ -353,16 +352,16 @@ func (view *sqliteStoreView) LoadMessage(
 }
 
 func (view *sqliteStoreView) LoadArtifact(
-	ref ArtifactRef,
-	limit StoreReadLimit,
-) (StoreArtifactRecord, error) {
+	ref agent.ArtifactRef,
+	limit agent.StoreReadLimit,
+) (agent.StoreArtifactRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
-		return StoreArtifactRecord{}, err
+		return agent.StoreArtifactRecord{}, err
 	}
-	if err := validateSQLiteReadLimit(StoreRecordArtifact, limit); err != nil {
-		return StoreArtifactRecord{}, err
+	if err := validateSQLiteReadLimit(agent.StoreRecordArtifact, limit); err != nil {
+		return agent.StoreArtifactRecord{}, err
 	}
-	var record StoreArtifactRecord
+	var record agent.StoreArtifactRecord
 	var encodedSize, payloadSize int64
 	var frozen int64
 	var published, discarded sql.NullInt64
@@ -383,13 +382,13 @@ func (view *sqliteStoreView) LoadArtifact(
 		&frozen, &published, &discarded,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return StoreArtifactRecord{}, sqliteNotFound(StoreRecordArtifact, ref.ID)
+		return agent.StoreArtifactRecord{}, sqliteNotFound(agent.StoreRecordArtifact, ref.ID)
 	}
 	if err != nil {
-		return StoreArtifactRecord{}, fmt.Errorf("load Agent Store Artifact: %w", err)
+		return agent.StoreArtifactRecord{}, fmt.Errorf("load Agent Store Artifact: %w", err)
 	}
 	if encodedSize > limit.MaxBytes || record.EncodedPayload == nil {
-		return StoreArtifactRecord{}, &StoreLimitError{Record: StoreRecordArtifact, Limit: limit.MaxBytes}
+		return agent.StoreArtifactRecord{}, &agent.StoreLimitError{Record: agent.StoreRecordArtifact, Limit: limit.MaxBytes}
 	}
 	record.Artifact.Task.Workspace = ref.Workspace
 	record.Artifact.PayloadSize = payloadSize
@@ -405,11 +404,11 @@ func (view *sqliteStoreView) LoadArtifact(
 	return cloneStoreArtifactRecord(record), nil
 }
 
-func (view *sqliteStoreView) LoadApplyReceipt(ref ArtifactRef) (StoreApplyReceiptRecord, error) {
+func (view *sqliteStoreView) LoadApplyReceipt(ref agent.ArtifactRef) (agent.StoreApplyReceiptRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
-		return StoreApplyReceiptRecord{}, err
+		return agent.StoreApplyReceiptRecord{}, err
 	}
-	var receipt ApplyReceipt
+	var receipt agent.ApplyReceipt
 	var recorded int64
 	receipt.Artifact = ref
 	err := view.unit.tx.QueryRowContext(view.unit.ctx, `
@@ -424,20 +423,20 @@ func (view *sqliteStoreView) LoadApplyReceipt(ref ArtifactRef) (StoreApplyReceip
 		&receipt.Code, &receipt.Message, &recorded,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return StoreApplyReceiptRecord{}, sqliteNotFound(StoreRecordApplyReceipt, ref.ID)
+		return agent.StoreApplyReceiptRecord{}, sqliteNotFound(agent.StoreRecordApplyReceipt, ref.ID)
 	}
 	if err != nil {
-		return StoreApplyReceiptRecord{}, fmt.Errorf("load Agent Store apply receipt: %w", err)
+		return agent.StoreApplyReceiptRecord{}, fmt.Errorf("load Agent Store apply receipt: %w", err)
 	}
 	receipt.RecordedAt = fromUnixNano(recorded)
-	return StoreApplyReceiptRecord{Receipt: receipt}, nil
+	return agent.StoreApplyReceiptRecord{Receipt: receipt}, nil
 }
 
-func (view *sqliteStoreView) LoadWorkspaceHead(ref WorkspaceRef) (StoreWorkspaceHeadRecord, error) {
+func (view *sqliteStoreView) LoadWorkspaceHead(ref agent.WorkspaceRef) (agent.StoreWorkspaceHeadRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
-		return StoreWorkspaceHeadRecord{}, err
+		return agent.StoreWorkspaceHeadRecord{}, err
 	}
-	var head WorkspaceHead
+	var head agent.WorkspaceHead
 	var updated int64
 	head.Workspace = ref
 	err := view.unit.tx.QueryRowContext(view.unit.ctx, `
@@ -446,23 +445,23 @@ func (view *sqliteStoreView) LoadWorkspaceHead(ref WorkspaceRef) (StoreWorkspace
 		WHERE authority_id = ? AND workspace_id = ?`, ref.Authority, ref.ID,
 	).Scan(&head.ConfirmedRevision, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
-		return StoreWorkspaceHeadRecord{}, sqliteNotFound(StoreRecordWorkspaceHead, ref.ID)
+		return agent.StoreWorkspaceHeadRecord{}, sqliteNotFound(agent.StoreRecordWorkspaceHead, ref.ID)
 	}
 	if err != nil {
-		return StoreWorkspaceHeadRecord{}, fmt.Errorf("load Agent Store Workspace head: %w", err)
+		return agent.StoreWorkspaceHeadRecord{}, fmt.Errorf("load Agent Store Workspace head: %w", err)
 	}
 	head.UpdatedAt = fromUnixNano(updated)
-	return StoreWorkspaceHeadRecord{Head: head}, nil
+	return agent.StoreWorkspaceHeadRecord{Head: head}, nil
 }
 
 func (view *sqliteStoreView) LoadLeaseGrant(
-	ref TaskRef,
-	fence LeaseFence,
-) (StoreLeaseGrantRecord, error) {
+	ref agent.TaskRef,
+	fence agent.LeaseFence,
+) (agent.StoreLeaseGrantRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
-		return StoreLeaseGrantRecord{}, err
+		return agent.StoreLeaseGrantRecord{}, err
 	}
-	var record StoreLeaseGrantRecord
+	var record agent.StoreLeaseGrantRecord
 	var granted int64
 	record.Grant.Task = ref
 	record.Grant.Fence = fence
@@ -473,20 +472,20 @@ func (view *sqliteStoreView) LoadLeaseGrant(
 		ref.Workspace.Authority, ref.Workspace.ID, ref.ID, fence,
 	).Scan(&record.Grant.Worker, &granted)
 	if errors.Is(err, sql.ErrNoRows) {
-		return StoreLeaseGrantRecord{}, sqliteNotFound(StoreRecordLeaseGrant, fence)
+		return agent.StoreLeaseGrantRecord{}, sqliteNotFound(agent.StoreRecordLeaseGrant, fence)
 	}
 	if err != nil {
-		return StoreLeaseGrantRecord{}, fmt.Errorf("load Agent Store lease grant: %w", err)
+		return agent.StoreLeaseGrantRecord{}, fmt.Errorf("load Agent Store lease grant: %w", err)
 	}
 	record.GrantedAt = fromUnixNano(granted)
 	return record, nil
 }
 
-func (view *sqliteStoreView) LoadLatestLeaseGrant(ref TaskRef) (StoreLeaseGrantRecord, error) {
+func (view *sqliteStoreView) LoadLatestLeaseGrant(ref agent.TaskRef) (agent.StoreLeaseGrantRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
-		return StoreLeaseGrantRecord{}, err
+		return agent.StoreLeaseGrantRecord{}, err
 	}
-	var record StoreLeaseGrantRecord
+	var record agent.StoreLeaseGrantRecord
 	var granted int64
 	record.Grant.Task = ref
 	err := view.unit.tx.QueryRowContext(view.unit.ctx, `
@@ -497,20 +496,20 @@ func (view *sqliteStoreView) LoadLatestLeaseGrant(ref TaskRef) (StoreLeaseGrantR
 		ref.Workspace.Authority, ref.Workspace.ID, ref.ID,
 	).Scan(&record.Grant.Fence, &record.Grant.Worker, &granted)
 	if errors.Is(err, sql.ErrNoRows) {
-		return StoreLeaseGrantRecord{}, sqliteNotFound(StoreRecordLeaseGrant, ref.ID)
+		return agent.StoreLeaseGrantRecord{}, sqliteNotFound(agent.StoreRecordLeaseGrant, ref.ID)
 	}
 	if err != nil {
-		return StoreLeaseGrantRecord{}, fmt.Errorf("load latest Agent Store lease grant: %w", err)
+		return agent.StoreLeaseGrantRecord{}, fmt.Errorf("load latest Agent Store lease grant: %w", err)
 	}
 	record.GrantedAt = fromUnixNano(granted)
 	return record, nil
 }
 
-func (view *sqliteStoreView) FindClaimableTask(authority AuthorityID) (StoreTaskRecord, error) {
+func (view *sqliteStoreView) FindClaimableTask(authority agent.AuthorityID) (agent.StoreTaskRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
-		return StoreTaskRecord{}, err
+		return agent.StoreTaskRecord{}, err
 	}
-	var ref TaskRef
+	var ref agent.TaskRef
 	ref.Workspace.Authority = authority
 	err := view.unit.tx.QueryRowContext(view.unit.ctx, `
 		SELECT workspace_id, task_id
@@ -521,17 +520,17 @@ func (view *sqliteStoreView) FindClaimableTask(authority AuthorityID) (StoreTask
 		LIMIT 1`, authority,
 	).Scan(&ref.Workspace.ID, &ref.ID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return StoreTaskRecord{}, sqliteNotFound(StoreRecordTask, "claimable")
+		return agent.StoreTaskRecord{}, sqliteNotFound(agent.StoreRecordTask, "claimable")
 	}
 	if err != nil {
-		return StoreTaskRecord{}, fmt.Errorf("find claimable Agent Store task: %w", err)
+		return agent.StoreTaskRecord{}, fmt.Errorf("find claimable Agent Store task: %w", err)
 	}
 	return view.LoadTask(ref)
 }
 
 func (view *sqliteStoreView) ScanContextTasks(
-	scan StoreTaskContextScan,
-) ([]StoreTaskRecord, error) {
+	scan agent.StoreTaskContextScan,
+) ([]agent.StoreTaskRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
 		return nil, err
 	}
@@ -559,9 +558,9 @@ func (view *sqliteStoreView) ScanContextTasks(
 	if err != nil {
 		return nil, fmt.Errorf("scan Agent Store context tasks: %w", err)
 	}
-	refs := make([]TaskRef, 0, scan.Limit)
+	refs := make([]agent.TaskRef, 0, scan.Limit)
 	for rows.Next() {
-		ref := TaskRef{Workspace: WorkspaceRef{Authority: scan.Context.Authority}}
+		ref := agent.TaskRef{Workspace: agent.WorkspaceRef{Authority: scan.Context.Authority}}
 		if err := rows.Scan(&ref.Workspace.ID, &ref.ID); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan Agent Store context task key: %w", err)
@@ -575,7 +574,7 @@ func (view *sqliteStoreView) ScanContextTasks(
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("close Agent Store context task scan: %w", err)
 	}
-	records := make([]StoreTaskRecord, 0, len(refs))
+	records := make([]agent.StoreTaskRecord, 0, len(refs))
 	for _, ref := range refs {
 		record, err := view.LoadTask(ref)
 		if err != nil {
@@ -587,13 +586,13 @@ func (view *sqliteStoreView) ScanContextTasks(
 }
 
 func (view *sqliteStoreView) ScanAuthorityTasks(
-	scan StoreTaskAuthorityScan,
-) (StoreTaskAuthorityResult, error) {
+	scan agent.StoreTaskAuthorityScan,
+) (agent.StoreTaskAuthorityResult, error) {
 	if err := view.unit.ensureActive(); err != nil {
-		return StoreTaskAuthorityResult{}, err
+		return agent.StoreTaskAuthorityResult{}, err
 	}
 	if err := validateSQLiteScanLimit(scan.Limit); err != nil {
-		return StoreTaskAuthorityResult{}, err
+		return agent.StoreTaskAuthorityResult{}, err
 	}
 	filters := []string{"authority_id = ?"}
 	filterArguments := []any{scan.Authority}
@@ -616,10 +615,10 @@ func (view *sqliteStoreView) ScanAuthorityTasks(
 		"SELECT COUNT(*) FROM agent_tasks WHERE "+where,
 		filterArguments...,
 	).Scan(&total); err != nil {
-		return StoreTaskAuthorityResult{}, fmt.Errorf("count Agent Store authority tasks: %w", err)
+		return agent.StoreTaskAuthorityResult{}, fmt.Errorf("count Agent Store authority tasks: %w", err)
 	}
 	if total < 0 {
-		return StoreTaskAuthorityResult{}, fmt.Errorf("%w: negative Agent Store task count", ErrCorruptStore)
+		return agent.StoreTaskAuthorityResult{}, fmt.Errorf("%w: negative Agent Store task count", agent.ErrCorruptStore)
 	}
 	pageWhere := where
 	pageArguments := append([]any(nil), filterArguments...)
@@ -641,32 +640,32 @@ func (view *sqliteStoreView) ScanAuthorityTasks(
 		ORDER BY updated_at DESC, workspace_id, task_id
 		LIMIT ?`, pageArguments...)
 	if err != nil {
-		return StoreTaskAuthorityResult{}, fmt.Errorf("scan Agent Store authority tasks: %w", err)
+		return agent.StoreTaskAuthorityResult{}, fmt.Errorf("scan Agent Store authority tasks: %w", err)
 	}
-	refs := make([]TaskRef, 0, scan.Limit)
+	refs := make([]agent.TaskRef, 0, scan.Limit)
 	for rows.Next() {
-		ref := TaskRef{Workspace: WorkspaceRef{Authority: scan.Authority}}
+		ref := agent.TaskRef{Workspace: agent.WorkspaceRef{Authority: scan.Authority}}
 		if err := rows.Scan(&ref.Workspace.ID, &ref.ID); err != nil {
 			_ = rows.Close()
-			return StoreTaskAuthorityResult{}, fmt.Errorf("scan Agent Store authority task key: %w", err)
+			return agent.StoreTaskAuthorityResult{}, fmt.Errorf("scan Agent Store authority task key: %w", err)
 		}
 		refs = append(refs, ref)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return StoreTaskAuthorityResult{}, fmt.Errorf("scan Agent Store authority tasks: %w", err)
+		return agent.StoreTaskAuthorityResult{}, fmt.Errorf("scan Agent Store authority tasks: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return StoreTaskAuthorityResult{}, fmt.Errorf("close Agent Store authority task scan: %w", err)
+		return agent.StoreTaskAuthorityResult{}, fmt.Errorf("close Agent Store authority task scan: %w", err)
 	}
-	result := StoreTaskAuthorityResult{
-		Records:   make([]StoreTaskRecord, 0, len(refs)),
+	result := agent.StoreTaskAuthorityResult{
+		Records:   make([]agent.StoreTaskRecord, 0, len(refs)),
 		TotalSize: uint64(total),
 	}
 	for _, ref := range refs {
 		record, err := view.LoadTask(ref)
 		if err != nil {
-			return StoreTaskAuthorityResult{}, err
+			return agent.StoreTaskAuthorityResult{}, err
 		}
 		result.Records = append(result.Records, record)
 	}
@@ -675,15 +674,15 @@ func (view *sqliteStoreView) ScanAuthorityTasks(
 }
 
 func (view *sqliteStoreView) ScanMessages(
-	scan StoreMessageScan,
-) ([]StoreMessageRecord, error) {
+	scan agent.StoreMessageScan,
+) ([]agent.StoreMessageRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
 		return nil, err
 	}
 	if err := validateSQLiteScanLimit(scan.Limit); err != nil {
 		return nil, err
 	}
-	if err := validateSQLiteReadLimit(StoreRecordMessage, scan.ReadLimit); err != nil {
+	if err := validateSQLiteReadLimit(agent.StoreRecordMessage, scan.ReadLimit); err != nil {
 		return nil, err
 	}
 	rows, err := view.unit.tx.QueryContext(view.unit.ctx, `
@@ -700,10 +699,10 @@ func (view *sqliteStoreView) ScanMessages(
 	if err != nil {
 		return nil, fmt.Errorf("scan Agent Store messages: %w", err)
 	}
-	records := make([]StoreMessageRecord, 0, scan.Limit)
+	records := make([]agent.StoreMessageRecord, 0, scan.Limit)
 	var total int64
 	for rows.Next() {
-		var record StoreMessageRecord
+		var record agent.StoreMessageRecord
 		var size int64
 		var created int64
 		record.Task = scan.Task
@@ -715,15 +714,18 @@ func (view *sqliteStoreView) ScanMessages(
 			return nil, fmt.Errorf("scan Agent Store message: %w", err)
 		}
 		if size > scan.ReadLimit.MaxBytes || record.EncodedParts == nil {
+			if len(records) != 0 {
+				break
+			}
 			_ = rows.Close()
-			return nil, &StoreLimitError{
-				Record: StoreRecordMessage,
+			return nil, &agent.StoreLimitError{
+				Record: agent.StoreRecordMessage,
 				Limit:  scan.ReadLimit.MaxBytes,
 			}
 		}
 		// An individual record that cannot fit is corruption at the core boundary.
 		// Once at least one record fits, however, the aggregate budget is a page
-		// boundary: return the contiguous prefix and let Task.MessageCount tell the
+		// boundary: return the contiguous prefix and let agent.Task.MessageCount tell the
 		// core that another page exists.
 		if total > scan.ReadLimit.MaxBytes-size {
 			break
@@ -743,7 +745,7 @@ func (view *sqliteStoreView) ScanMessages(
 	return cloneStoreMessageRecords(records), nil
 }
 
-func (view *sqliteStoreView) ScanEvents(scan StoreEventScan) ([]StoreEventRecord, error) {
+func (view *sqliteStoreView) ScanEvents(scan agent.StoreEventScan) ([]agent.StoreEventRecord, error) {
 	if err := view.unit.ensureActive(); err != nil {
 		return nil, err
 	}
@@ -762,9 +764,9 @@ func (view *sqliteStoreView) ScanEvents(scan StoreEventScan) ([]StoreEventRecord
 	if err != nil {
 		return nil, fmt.Errorf("scan Agent Store events: %w", err)
 	}
-	records := make([]StoreEventRecord, 0, scan.Limit)
+	records := make([]agent.StoreEventRecord, 0, scan.Limit)
 	for rows.Next() {
-		var record StoreEventRecord
+		var record agent.StoreEventRecord
 		var occurred int64
 		record.Event.Task = scan.Task
 		if err := rows.Scan(
@@ -785,10 +787,10 @@ func (view *sqliteStoreView) ScanEvents(scan StoreEventScan) ([]StoreEventRecord
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("close Agent Store event scan: %w", err)
 	}
-	return append([]StoreEventRecord(nil), records...), nil
+	return append([]agent.StoreEventRecord(nil), records...), nil
 }
 
-func (view *sqliteStoreView) ScanLeases(scan StoreLeaseScan) ([]LeaseAssignment, error) {
+func (view *sqliteStoreView) ScanLeases(scan agent.StoreLeaseScan) ([]agent.LeaseAssignment, error) {
 	if err := view.unit.ensureActive(); err != nil {
 		return nil, err
 	}
@@ -815,7 +817,7 @@ func (view *sqliteStoreView) ScanLeases(scan StoreLeaseScan) ([]LeaseAssignment,
 		return nil, fmt.Errorf("validate Agent Store lease history: %w", err)
 	}
 	if corrupt {
-		return nil, fmt.Errorf("%w: current Agent lease differs from durable grant", ErrCorruptStore)
+		return nil, fmt.Errorf("%w: current agent.Agent lease differs from durable grant", agent.ErrCorruptStore)
 	}
 	query := `
 		SELECT t.workspace_id, t.task_id, t.lease_fence, g.worker_id, g.granted_at
@@ -847,8 +849,8 @@ func (view *sqliteStoreView) ScanLeases(scan StoreLeaseScan) ([]LeaseAssignment,
 		return nil, fmt.Errorf("scan Agent Store leases: %w", err)
 	}
 	type leaseRow struct {
-		ref       TaskRef
-		fence     LeaseFence
+		ref       agent.TaskRef
+		fence     agent.LeaseFence
 		grantedAt time.Time
 	}
 	listed := make([]leaseRow, 0, scan.Limit)
@@ -863,10 +865,10 @@ func (view *sqliteStoreView) ScanLeases(scan StoreLeaseScan) ([]LeaseAssignment,
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan Agent Store lease: %w", err)
 		}
-		if !historyWorker.Valid || WorkerID(historyWorker.String) != scan.Worker || !granted.Valid {
+		if !historyWorker.Valid || agent.WorkerID(historyWorker.String) != scan.Worker || !granted.Valid {
 			_ = rows.Close()
 			return nil, fmt.Errorf(
-				"%w: current Agent lease differs from durable grant", ErrCorruptStore,
+				"%w: current agent.Agent lease differs from durable grant", agent.ErrCorruptStore,
 			)
 		}
 		row.grantedAt = fromUnixNano(granted.Int64)
@@ -879,28 +881,28 @@ func (view *sqliteStoreView) ScanLeases(scan StoreLeaseScan) ([]LeaseAssignment,
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("close Agent Store lease scan: %w", err)
 	}
-	assignments := make([]LeaseAssignment, 0, len(listed))
+	assignments := make([]agent.LeaseAssignment, 0, len(listed))
 	for _, row := range listed {
 		task, err := view.LoadTask(row.ref)
 		if err != nil {
 			return nil, err
 		}
 		if task.Lease.Owner != scan.Worker || task.Lease.Fence != row.fence {
-			return nil, fmt.Errorf("%w: scanned lease differs from current Task", ErrCorruptStore)
+			return nil, fmt.Errorf("%w: scanned lease differs from current agent.Task", agent.ErrCorruptStore)
 		}
-		assignments = append(assignments, LeaseAssignment{
-			Grant: LeaseGrant{Task: row.ref, Worker: scan.Worker, Fence: row.fence},
+		assignments = append(assignments, agent.LeaseAssignment{
+			Grant: agent.LeaseGrant{Task: row.ref, Worker: scan.Worker, Fence: row.fence},
 			Task:  task.Task, GrantedAt: row.grantedAt,
 		})
 	}
-	cloned := make([]LeaseAssignment, len(assignments))
+	cloned := make([]agent.LeaseAssignment, len(assignments))
 	for index := range assignments {
-		cloned[index] = cloneLeaseAssignment(assignments[index])
+		cloned[index] = cloneLeaseAssignmentValue(assignments[index])
 	}
 	return cloned, nil
 }
 
-func (unit *sqliteStoreTx) InsertCommand(record StoreCommandRecord) error {
+func (unit *sqliteStoreTx) InsertCommand(record agent.StoreCommandRecord) error {
 	if err := unit.unit.ensureActive(); err != nil {
 		return err
 	}
@@ -915,23 +917,23 @@ func (unit *sqliteStoreTx) InsertCommand(record StoreCommandRecord) error {
 	)
 	if err != nil {
 		if uniqueConstraint(err) {
-			return sqliteConflict(StoreConstraintCommandID, record.ID)
+			return sqliteConflict(agent.StoreConstraintCommandID, record.ID)
 		}
 		return fmt.Errorf("insert Agent Store command: %w", err)
 	}
 	return nil
 }
 
-func (unit *sqliteStoreTx) InsertTask(record StoreTaskRecord) error {
+func (unit *sqliteStoreTx) InsertTask(record agent.StoreTaskRecord) error {
 	if err := unit.unit.ensureActive(); err != nil {
 		return err
 	}
 	record = cloneStoreTaskRecord(record)
 	if record.Task.Artifact != nil || record.Task.Submission != nil || record.ArtifactState != nil {
-		return fmt.Errorf("%w: inserted Task cannot pre-bind Artifact or submission", ErrInvalidArgument)
+		return fmt.Errorf("%w: inserted agent.Task cannot pre-bind agent.Artifact or submission", agent.ErrInvalidArgument)
 	}
-	if record.Lease != (StoreLeaseState{}) {
-		return fmt.Errorf("%w: inserted Task must begin unleased at fence zero", ErrInvalidArgument)
+	if record.Lease != (agent.StoreLeaseState{}) {
+		return fmt.Errorf("%w: inserted agent.Task must begin unleased at fence zero", agent.ErrInvalidArgument)
 	}
 	_, err := unit.unit.tx.ExecContext(unit.unit.ctx, `
 		INSERT INTO agent_tasks (
@@ -956,9 +958,9 @@ func (unit *sqliteStoreTx) InsertTask(record StoreTaskRecord) error {
 				record.Task.Ref.ID,
 			).Scan(&count)
 			if lookupErr == nil && count != 0 {
-				return sqliteConflict(StoreConstraintTaskKey, record.Task.Ref.ID)
+				return sqliteConflict(agent.StoreConstraintTaskKey, record.Task.Ref.ID)
 			}
-			return sqliteConflict(StoreConstraintPublicTaskID, record.Task.Ref.ID)
+			return sqliteConflict(agent.StoreConstraintPublicTaskID, record.Task.Ref.ID)
 		}
 		return fmt.Errorf("insert Agent Store task: %w", err)
 	}
@@ -966,14 +968,14 @@ func (unit *sqliteStoreTx) InsertTask(record StoreTaskRecord) error {
 }
 
 func (unit *sqliteStoreTx) CompareAndSwapTask(
-	mutation StoreTaskMutation,
+	mutation agent.StoreTaskMutation,
 ) (bool, error) {
 	if err := unit.unit.ensureActive(); err != nil {
 		return false, err
 	}
 	mutation.Next = cloneStoreTaskRecord(mutation.Next)
 	if mutation.Ref != mutation.Next.Task.Ref || mutation.Condition.ExpectedRevision == 0 {
-		return false, fmt.Errorf("%w: invalid Agent Store Task mutation identity", ErrInvalidArgument)
+		return false, fmt.Errorf("%w: invalid Agent Store Task mutation identity", agent.ErrInvalidArgument)
 	}
 	current, err := unit.LoadTask(mutation.Ref)
 	if err != nil {
@@ -987,7 +989,7 @@ func (unit *sqliteStoreTx) CompareAndSwapTask(
 	}
 	if current.Task.Context != mutation.Next.Task.Context ||
 		!current.Task.CreatedAt.Equal(mutation.Next.Task.CreatedAt) {
-		return false, fmt.Errorf("%w: Task mutation changes immutable metadata", ErrInvalidArgument)
+		return false, fmt.Errorf("%w: agent.Task mutation changes immutable metadata", agent.ErrInvalidArgument)
 	}
 	query := `
 		UPDATE agent_tasks
@@ -1021,7 +1023,7 @@ func (unit *sqliteStoreTx) CompareAndSwapTask(
 	return affected == 1, nil
 }
 
-func (unit *sqliteStoreTx) InsertMessage(record StoreMessageRecord) error {
+func (unit *sqliteStoreTx) InsertMessage(record agent.StoreMessageRecord) error {
 	if err := unit.unit.ensureActive(); err != nil {
 		return err
 	}
@@ -1044,16 +1046,16 @@ func (unit *sqliteStoreTx) InsertMessage(record StoreMessageRecord) error {
 				record.Task.Workspace.Authority, record.ID,
 			).Scan(&count)
 			if lookupErr == nil && count != 0 {
-				return sqliteConflict(StoreConstraintMessageID, record.ID)
+				return sqliteConflict(agent.StoreConstraintMessageID, record.ID)
 			}
-			return sqliteConflict(StoreConstraintMessageSequence, record.Sequence)
+			return sqliteConflict(agent.StoreConstraintMessageSequence, record.Sequence)
 		}
 		return fmt.Errorf("insert Agent Store message: %w", err)
 	}
 	return nil
 }
 
-func (unit *sqliteStoreTx) InsertEvent(record StoreEventRecord) error {
+func (unit *sqliteStoreTx) InsertEvent(record agent.StoreEventRecord) error {
 	if err := unit.unit.ensureActive(); err != nil {
 		return err
 	}
@@ -1069,14 +1071,14 @@ func (unit *sqliteStoreTx) InsertEvent(record StoreEventRecord) error {
 	)
 	if err != nil {
 		if uniqueConstraint(err) {
-			return sqliteConflict(StoreConstraintEventSequence, event.Sequence)
+			return sqliteConflict(agent.StoreConstraintEventSequence, event.Sequence)
 		}
 		return fmt.Errorf("insert Agent Store event: %w", err)
 	}
 	return nil
 }
 
-func (unit *sqliteStoreTx) InsertLeaseGrant(record StoreLeaseGrantRecord) error {
+func (unit *sqliteStoreTx) InsertLeaseGrant(record agent.StoreLeaseGrantRecord) error {
 	if err := unit.unit.ensureActive(); err != nil {
 		return err
 	}
@@ -1090,14 +1092,14 @@ func (unit *sqliteStoreTx) InsertLeaseGrant(record StoreLeaseGrantRecord) error 
 	)
 	if err != nil {
 		if uniqueConstraint(err) {
-			return sqliteConflict(StoreConstraintLeaseFence, record.Grant.Fence)
+			return sqliteConflict(agent.StoreConstraintLeaseFence, record.Grant.Fence)
 		}
 		return fmt.Errorf("insert Agent Store lease grant: %w", err)
 	}
 	return nil
 }
 
-func (unit *sqliteStoreTx) InsertArtifact(record StoreArtifactRecord) error {
+func (unit *sqliteStoreTx) InsertArtifact(record agent.StoreArtifactRecord) error {
 	if err := unit.unit.ensureActive(); err != nil {
 		return err
 	}
@@ -1125,9 +1127,17 @@ func (unit *sqliteStoreTx) InsertArtifact(record StoreArtifactRecord) error {
 				artifact.Ref.Workspace.Authority, artifact.Ref.Workspace.ID, artifact.Ref.ID,
 			).Scan(&count)
 			if lookupErr == nil && count != 0 {
-				return sqliteConflict(StoreConstraintArtifactID, artifact.Ref.ID)
+				return sqliteConflict(agent.StoreConstraintArtifactID, artifact.Ref.ID)
 			}
-			return sqliteConflict(StoreConstraintArtifactTask, artifact.Task.ID)
+			lookupErr = unit.unit.tx.QueryRowContext(unit.unit.ctx, `
+				SELECT COUNT(*) FROM agent_artifacts
+				WHERE authority_id = ? AND artifact_id = ?`,
+				artifact.Ref.Workspace.Authority, artifact.Ref.ID,
+			).Scan(&count)
+			if lookupErr == nil && count != 0 {
+				return sqliteConflict(agent.StoreConstraintArtifactID, artifact.Ref.ID)
+			}
+			return sqliteConflict(agent.StoreConstraintArtifactTask, artifact.Task.ID)
 		}
 		return fmt.Errorf("insert Agent Store Artifact: %w", err)
 	}
@@ -1135,13 +1145,13 @@ func (unit *sqliteStoreTx) InsertArtifact(record StoreArtifactRecord) error {
 }
 
 func (unit *sqliteStoreTx) CompareAndSwapArtifact(
-	mutation StoreArtifactMutation,
+	mutation agent.StoreArtifactMutation,
 ) (bool, error) {
 	if err := unit.unit.ensureActive(); err != nil {
 		return false, err
 	}
 	if mutation.Task.Workspace != mutation.Ref.Workspace {
-		return false, fmt.Errorf("%w: Artifact mutation Task belongs to another Workspace", ErrInvalidArgument)
+		return false, fmt.Errorf("%w: agent.Artifact mutation agent.Task belongs to another Workspace", agent.ErrInvalidArgument)
 	}
 	result, err := unit.unit.tx.ExecContext(unit.unit.ctx, `
 		UPDATE agent_artifacts
@@ -1163,7 +1173,7 @@ func (unit *sqliteStoreTx) CompareAndSwapArtifact(
 	return affected == 1, nil
 }
 
-func (unit *sqliteStoreTx) InsertSubmission(record StoreSubmissionRecord) error {
+func (unit *sqliteStoreTx) InsertSubmission(record agent.StoreSubmissionRecord) error {
 	if err := unit.unit.ensureActive(); err != nil {
 		return err
 	}
@@ -1183,7 +1193,7 @@ func (unit *sqliteStoreTx) InsertSubmission(record StoreSubmissionRecord) error 
 	)
 	if err != nil {
 		if uniqueConstraint(err) {
-			return sqliteConflict(StoreConstraintSubmissionID, submission.ID)
+			return sqliteConflict(agent.StoreConstraintSubmissionID, submission.ID)
 		}
 		return fmt.Errorf("insert Agent Store submission: %w", err)
 	}
@@ -1191,7 +1201,7 @@ func (unit *sqliteStoreTx) InsertSubmission(record StoreSubmissionRecord) error 
 }
 
 func (unit *sqliteStoreTx) InsertWorkspaceHead(
-	record StoreWorkspaceHeadRecord,
+	record agent.StoreWorkspaceHeadRecord,
 ) (bool, error) {
 	if err := unit.unit.ensureActive(); err != nil {
 		return false, err
@@ -1216,13 +1226,13 @@ func (unit *sqliteStoreTx) InsertWorkspaceHead(
 }
 
 func (unit *sqliteStoreTx) CompareAndSwapWorkspaceHead(
-	mutation StoreWorkspaceHeadMutation,
+	mutation agent.StoreWorkspaceHeadMutation,
 ) (bool, error) {
 	if err := unit.unit.ensureActive(); err != nil {
 		return false, err
 	}
 	if mutation.Next.Head.Workspace != mutation.Workspace {
-		return false, fmt.Errorf("%w: Workspace head mutation identity mismatch", ErrInvalidArgument)
+		return false, fmt.Errorf("%w: Workspace head mutation identity mismatch", agent.ErrInvalidArgument)
 	}
 	result, err := unit.unit.tx.ExecContext(unit.unit.ctx, `
 		UPDATE agent_workspace_heads
@@ -1242,7 +1252,7 @@ func (unit *sqliteStoreTx) CompareAndSwapWorkspaceHead(
 	return affected == 1, nil
 }
 
-func (unit *sqliteStoreTx) InsertApplyReceipt(record StoreApplyReceiptRecord) error {
+func (unit *sqliteStoreTx) InsertApplyReceipt(record agent.StoreApplyReceiptRecord) error {
 	if err := unit.unit.ensureActive(); err != nil {
 		return err
 	}
@@ -1260,7 +1270,7 @@ func (unit *sqliteStoreTx) InsertApplyReceipt(record StoreApplyReceiptRecord) er
 	)
 	if err != nil {
 		if uniqueConstraint(err) {
-			return sqliteConflict(StoreConstraintReceiptID, receipt.ID)
+			return sqliteConflict(agent.StoreConstraintReceiptID, receipt.ID)
 		}
 		return fmt.Errorf("insert Agent Store apply receipt: %w", err)
 	}
@@ -1274,13 +1284,42 @@ func nullableUnixNano(value *time.Time) any {
 	return unixNano(value.UTC())
 }
 
-func cloneStoreCommandRecord(record StoreCommandRecord) StoreCommandRecord {
+func unixNano(value time.Time) int64 { return value.UnixNano() }
+
+func fromUnixNano(value int64) time.Time { return time.Unix(0, value).UTC() }
+
+func uniqueConstraint(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unique constraint failed")
+}
+
+func cloneTaskValue(task agent.Task) agent.Task {
+	if task.Artifact != nil {
+		artifact := *task.Artifact
+		task.Artifact = &artifact
+	}
+	if task.Submission != nil {
+		submission := *task.Submission
+		if submission.Artifact != nil {
+			artifact := *submission.Artifact
+			submission.Artifact = &artifact
+		}
+		task.Submission = &submission
+	}
+	return task
+}
+
+func cloneLeaseAssignmentValue(assignment agent.LeaseAssignment) agent.LeaseAssignment {
+	assignment.Task = cloneTaskValue(assignment.Task)
+	return assignment
+}
+
+func cloneStoreCommandRecord(record agent.StoreCommandRecord) agent.StoreCommandRecord {
 	record.Result = bytes.Clone(record.Result)
 	return record
 }
 
-func cloneStoreTaskRecord(record StoreTaskRecord) StoreTaskRecord {
-	record.Task = cloneTask(record.Task)
+func cloneStoreTaskRecord(record agent.StoreTaskRecord) agent.StoreTaskRecord {
+	record.Task = cloneTaskValue(record.Task)
 	if record.ArtifactState != nil {
 		state := *record.ArtifactState
 		record.ArtifactState = &state
@@ -1288,28 +1327,28 @@ func cloneStoreTaskRecord(record StoreTaskRecord) StoreTaskRecord {
 	return record
 }
 
-func cloneStoreTaskRecords(records []StoreTaskRecord) []StoreTaskRecord {
-	cloned := make([]StoreTaskRecord, len(records))
+func cloneStoreTaskRecords(records []agent.StoreTaskRecord) []agent.StoreTaskRecord {
+	cloned := make([]agent.StoreTaskRecord, len(records))
 	for index := range records {
 		cloned[index] = cloneStoreTaskRecord(records[index])
 	}
 	return cloned
 }
 
-func cloneStoreMessageRecord(record StoreMessageRecord) StoreMessageRecord {
+func cloneStoreMessageRecord(record agent.StoreMessageRecord) agent.StoreMessageRecord {
 	record.EncodedParts = bytes.Clone(record.EncodedParts)
 	return record
 }
 
-func cloneStoreMessageRecords(records []StoreMessageRecord) []StoreMessageRecord {
-	cloned := make([]StoreMessageRecord, len(records))
+func cloneStoreMessageRecords(records []agent.StoreMessageRecord) []agent.StoreMessageRecord {
+	cloned := make([]agent.StoreMessageRecord, len(records))
 	for index := range records {
 		cloned[index] = cloneStoreMessageRecord(records[index])
 	}
 	return cloned
 }
 
-func cloneStoreArtifactRecord(record StoreArtifactRecord) StoreArtifactRecord {
+func cloneStoreArtifactRecord(record agent.StoreArtifactRecord) agent.StoreArtifactRecord {
 	record.EncodedPayload = bytes.Clone(record.EncodedPayload)
 	if record.Artifact.PublishedAt != nil {
 		value := *record.Artifact.PublishedAt
@@ -1322,7 +1361,7 @@ func cloneStoreArtifactRecord(record StoreArtifactRecord) StoreArtifactRecord {
 	return record
 }
 
-func cloneStoreSubmission(submission Submission) Submission {
+func cloneStoreSubmission(submission agent.Submission) agent.Submission {
 	if submission.Artifact != nil {
 		artifact := *submission.Artifact
 		submission.Artifact = &artifact

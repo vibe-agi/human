@@ -1,16 +1,20 @@
-package agent
+package sqlite
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/vibe-agi/human/agent"
 )
 
-func openSQLiteStoreBridge(t *testing.T) Store {
+func openSQLiteStoreBridge(t *testing.T) agent.Store {
 	t.Helper()
 	database, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -32,19 +36,32 @@ func openSQLiteStoreBridge(t *testing.T) Store {
 	return newSQLiteStore(database)
 }
 
+func contentDigest(parts []agent.Part) (string, error) {
+	encoded, err := json.Marshal(parts)
+	if err != nil {
+		return "", err
+	}
+	return byteDigest(encoded), nil
+}
+
+func byteDigest(value []byte) string {
+	digest := sha256.Sum256(value)
+	return fmt.Sprintf("%x", digest[:])
+}
+
 func sqliteStoreSeedRecords(t *testing.T) (
-	StoreTaskRecord,
-	StoreMessageRecord,
-	StoreEventRecord,
-	StoreCommandRecord,
+	agent.StoreTaskRecord,
+	agent.StoreMessageRecord,
+	agent.StoreEventRecord,
+	agent.StoreCommandRecord,
 ) {
 	t.Helper()
 	now := time.Date(2026, 7, 19, 1, 2, 3, 4, time.UTC)
-	ref := TaskRef{
-		Workspace: WorkspaceRef{Authority: "authority-a", ID: "workspace-a"},
+	ref := agent.TaskRef{
+		Workspace: agent.WorkspaceRef{Authority: "authority-a", ID: "workspace-a"},
 		ID:        "task-a",
 	}
-	parts := []Part{{MediaType: "text/plain", Data: []byte("hello")}}
+	parts := []agent.Part{{MediaType: "text/plain", Data: []byte("hello")}}
 	encoded, err := json.Marshal(parts)
 	if err != nil {
 		t.Fatalf("encode message parts: %v", err)
@@ -53,24 +70,24 @@ func sqliteStoreSeedRecords(t *testing.T) (
 	if err != nil {
 		t.Fatalf("digest message parts: %v", err)
 	}
-	task := StoreTaskRecord{Task: Task{
-		Ref: ref, Context: ContextRef{Authority: "authority-a", ID: "context-a"},
-		State: TaskSubmitted, Revision: 1, MessageCount: 1, EventCount: 1,
+	task := agent.StoreTaskRecord{Task: agent.Task{
+		Ref: ref, Context: agent.ContextRef{Authority: "authority-a", ID: "context-a"},
+		State: agent.TaskSubmitted, Revision: 1, MessageCount: 1, EventCount: 1,
 		CreatedAt: now, UpdatedAt: now,
 	}}
-	message := StoreMessageRecord{
-		ID: "message-a", Task: ref, Sequence: 1, Author: AuthorCaller,
-		EncodedParts: encoded, PartsDigest: StoreDigest(digest), CreatedAt: now,
+	message := agent.StoreMessageRecord{
+		ID: "message-a", Task: ref, Sequence: 1, Author: agent.AuthorCaller,
+		EncodedParts: encoded, PartsDigest: agent.StoreDigest(digest), CreatedAt: now,
 	}
-	event := StoreEventRecord{Event: Event{
-		Task: ref, Sequence: 1, Type: EventTaskSubmitted,
-		State: TaskSubmitted, Revision: 1, Message: message.ID, OccurredAt: now,
+	event := agent.StoreEventRecord{Event: agent.Event{
+		Task: ref, Sequence: 1, Type: agent.EventTaskSubmitted,
+		State: agent.TaskSubmitted, Revision: 1, Message: message.ID, OccurredAt: now,
 	}}
 	result := []byte(`{"task":"task-a"}`)
-	command := StoreCommandRecord{
+	command := agent.StoreCommandRecord{
 		Authority: "authority-a", ID: "command-a", Kind: "create_task",
 		IntentDigest: "intent-a", ResultKind: "task", Result: result,
-		ResultDigest: StoreDigest(byteDigest(result)), CreatedAt: now,
+		ResultDigest: agent.StoreDigest(byteDigest(result)), CreatedAt: now,
 	}
 	return task, message, event, command
 }
@@ -80,8 +97,8 @@ func TestSQLiteStoreUpdateRollbackAndCallbackLifetime(t *testing.T) {
 	task, message, event, command := sqliteStoreSeedRecords(t)
 	abort := errors.New("inject rollback")
 	callbackCalls := 0
-	var escaped StoreTx
-	err := store.Update(context.Background(), func(tx StoreTx) error {
+	var escaped agent.StoreTx
+	err := store.Update(context.Background(), func(tx agent.StoreTx) error {
 		callbackCalls++
 		escaped = tx
 		if err := tx.InsertTask(task); err != nil {
@@ -101,19 +118,19 @@ func TestSQLiteStoreUpdateRollbackAndCallbackLifetime(t *testing.T) {
 	if !errors.Is(err, abort) || callbackCalls != 1 {
 		t.Fatalf("Update error/calls = %v/%d", err, callbackCalls)
 	}
-	if _, err := escaped.LoadTask(task.Task.Ref); !errors.Is(err, ErrStoreClosed) {
+	if _, err := escaped.LoadTask(task.Task.Ref); !errors.Is(err, agent.ErrStoreClosed) {
 		t.Fatalf("escaped transaction error = %v", err)
 	}
-	if err := store.View(context.Background(), func(view StoreView) error {
+	if err := store.View(context.Background(), func(view agent.StoreView) error {
 		_, err := view.LoadTask(task.Task.Ref)
-		if !errors.Is(err, ErrStoreRecordNotFound) {
-			t.Fatalf("rolled-back Task error = %v", err)
+		if !errors.Is(err, agent.ErrStoreRecordNotFound) {
+			t.Fatalf("rolled-back agent.Task error = %v", err)
 		}
 		_, err = view.LookupCommand(
-			StoreCommandKey{Authority: command.Authority, ID: command.ID},
-			StoreReadLimit{MaxBytes: 1024},
+			agent.StoreCommandKey{Authority: command.Authority, ID: command.ID},
+			agent.StoreReadLimit{MaxBytes: 1024},
 		)
-		if !errors.Is(err, ErrStoreRecordNotFound) {
+		if !errors.Is(err, agent.ErrStoreRecordNotFound) {
 			t.Fatalf("rolled-back command error = %v", err)
 		}
 		return nil
@@ -131,14 +148,14 @@ func TestSQLiteStoreCallbackPanicReleasesTransaction(t *testing.T) {
 				t.Fatalf("recovered panic = %#v, want %#v", recovered, panicValue)
 			}
 		}()
-		_ = store.Update(context.Background(), func(StoreTx) error {
+		_ = store.Update(context.Background(), func(agent.StoreTx) error {
 			panic(panicValue)
 		})
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := store.View(ctx, func(StoreView) error { return nil }); err != nil {
+	if err := store.View(ctx, func(agent.StoreView) error { return nil }); err != nil {
 		t.Fatalf("View after panicking callback: %v", err)
 	}
 }
@@ -148,7 +165,7 @@ func TestSQLiteStoreCommitSnapshotAndByteOwnership(t *testing.T) {
 	task, message, event, command := sqliteStoreSeedRecords(t)
 	wantParts := bytes.Clone(message.EncodedParts)
 	wantResult := bytes.Clone(command.Result)
-	if err := store.Update(context.Background(), func(tx StoreTx) error {
+	if err := store.Update(context.Background(), func(tx agent.StoreTx) error {
 		if err := tx.InsertTask(task); err != nil {
 			return err
 		}
@@ -165,52 +182,52 @@ func TestSQLiteStoreCommitSnapshotAndByteOwnership(t *testing.T) {
 	message.EncodedParts[0] ^= 0xff
 	command.Result[0] ^= 0xff
 
-	var escaped StoreView
-	if err := store.View(context.Background(), func(view StoreView) error {
+	var escaped agent.StoreView
+	if err := store.View(context.Background(), func(view agent.StoreView) error {
 		escaped = view
 		loadedTask, err := view.LoadTask(task.Task.Ref)
 		if err != nil || loadedTask.Task != task.Task {
-			t.Fatalf("loaded Task = %#v, %v", loadedTask, err)
+			t.Fatalf("loaded agent.Task = %#v, %v", loadedTask, err)
 		}
 		resolved, err := view.ResolveTask(task.Task.Ref.Workspace.Authority, task.Task.Ref.ID)
 		if err != nil || resolved != task.Task.Ref {
-			t.Fatalf("resolved Task = %#v, %v", resolved, err)
+			t.Fatalf("resolved agent.Task = %#v, %v", resolved, err)
 		}
 		loadedMessage, err := view.LoadMessage(
-			StoreMessageKey{Authority: message.Task.Workspace.Authority, ID: message.ID},
-			StoreReadLimit{MaxBytes: 1024},
+			agent.StoreMessageKey{Authority: message.Task.Workspace.Authority, ID: message.ID},
+			agent.StoreReadLimit{MaxBytes: 1024},
 		)
 		if err != nil || !bytes.Equal(loadedMessage.EncodedParts, wantParts) {
 			t.Fatalf("loaded message = %q, %v", loadedMessage.EncodedParts, err)
 		}
 		loadedCommand, err := view.LookupCommand(
-			StoreCommandKey{Authority: command.Authority, ID: command.ID},
-			StoreReadLimit{MaxBytes: 1024},
+			agent.StoreCommandKey{Authority: command.Authority, ID: command.ID},
+			agent.StoreReadLimit{MaxBytes: 1024},
 		)
 		if err != nil || !bytes.Equal(loadedCommand.Result, wantResult) {
 			t.Fatalf("loaded command = %q, %v", loadedCommand.Result, err)
 		}
 		loadedMessage.EncodedParts[0] ^= 0xff
 		loadedCommand.Result[0] ^= 0xff
-		contextRecords, err := view.ScanContextTasks(StoreTaskContextScan{
+		contextRecords, err := view.ScanContextTasks(agent.StoreTaskContextScan{
 			Context: task.Task.Context, Limit: 2,
 		})
 		if err != nil || len(contextRecords) != 1 || contextRecords[0].Task.Ref != task.Task.Ref {
 			t.Fatalf("context scan = %#v, %v", contextRecords, err)
 		}
-		authorityRecords, err := view.ScanAuthorityTasks(StoreTaskAuthorityScan{
+		authorityRecords, err := view.ScanAuthorityTasks(agent.StoreTaskAuthorityScan{
 			Authority: task.Task.Ref.Workspace.Authority, Limit: 2,
 		})
 		if err != nil || authorityRecords.TotalSize != 1 || len(authorityRecords.Records) != 1 {
 			t.Fatalf("authority scan = %#v, %v", authorityRecords, err)
 		}
-		messages, err := view.ScanMessages(StoreMessageScan{
-			Task: task.Task.Ref, Limit: 2, ReadLimit: StoreReadLimit{MaxBytes: 1024},
+		messages, err := view.ScanMessages(agent.StoreMessageScan{
+			Task: task.Task.Ref, Limit: 2, ReadLimit: agent.StoreReadLimit{MaxBytes: 1024},
 		})
 		if err != nil || len(messages) != 1 || !bytes.Equal(messages[0].EncodedParts, wantParts) {
 			t.Fatalf("message scan = %#v, %v", messages, err)
 		}
-		events, err := view.ScanEvents(StoreEventScan{Task: task.Task.Ref, Limit: 2})
+		events, err := view.ScanEvents(agent.StoreEventScan{Task: task.Task.Ref, Limit: 2})
 		if err != nil || len(events) != 1 || events[0].Event != event.Event {
 			t.Fatalf("event scan = %#v, %v", events, err)
 		}
@@ -218,19 +235,19 @@ func TestSQLiteStoreCommitSnapshotAndByteOwnership(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("read committed snapshot: %v", err)
 	}
-	if _, err := escaped.LoadTask(task.Task.Ref); !errors.Is(err, ErrStoreClosed) {
+	if _, err := escaped.LoadTask(task.Task.Ref); !errors.Is(err, agent.ErrStoreClosed) {
 		t.Fatalf("escaped View error = %v", err)
 	}
-	if err := store.View(context.Background(), func(view StoreView) error {
+	if err := store.View(context.Background(), func(view agent.StoreView) error {
 		if _, err := view.LookupCommand(
-			StoreCommandKey{Authority: command.Authority, ID: command.ID},
-			StoreReadLimit{},
-		); !errors.Is(err, ErrStoreRecordTooLarge) {
+			agent.StoreCommandKey{Authority: command.Authority, ID: command.ID},
+			agent.StoreReadLimit{},
+		); !errors.Is(err, agent.ErrStoreRecordTooLarge) {
 			t.Fatalf("zero-budget command error = %v", err)
 		}
 		loaded, err := view.LookupCommand(
-			StoreCommandKey{Authority: command.Authority, ID: command.ID},
-			StoreReadLimit{MaxBytes: 1024},
+			agent.StoreCommandKey{Authority: command.Authority, ID: command.ID},
+			agent.StoreReadLimit{MaxBytes: 1024},
 		)
 		if err != nil || !bytes.Equal(loaded.Result, wantResult) {
 			t.Fatalf("second command read = %q, %v", loaded.Result, err)
@@ -244,7 +261,7 @@ func TestSQLiteStoreCommitSnapshotAndByteOwnership(t *testing.T) {
 func TestSQLiteStoreLeaseHistoryAndTaskCAS(t *testing.T) {
 	store := openSQLiteStoreBridge(t)
 	task, message, event, command := sqliteStoreSeedRecords(t)
-	if err := store.Update(context.Background(), func(tx StoreTx) error {
+	if err := store.Update(context.Background(), func(tx agent.StoreTx) error {
 		if err := tx.InsertTask(task); err != nil {
 			return err
 		}
@@ -256,22 +273,22 @@ func TestSQLiteStoreLeaseHistoryAndTaskCAS(t *testing.T) {
 		}
 		return tx.InsertCommand(command)
 	}); err != nil {
-		t.Fatalf("seed Task: %v", err)
+		t.Fatalf("seed agent.Task: %v", err)
 	}
-	grant := StoreLeaseGrantRecord{
-		Grant:     LeaseGrant{Task: task.Task.Ref, Worker: "worker-a", Fence: 1},
+	grant := agent.StoreLeaseGrantRecord{
+		Grant:     agent.LeaseGrant{Task: task.Task.Ref, Worker: "worker-a", Fence: 1},
 		GrantedAt: task.Task.CreatedAt.Add(time.Second),
 	}
-	if err := store.Update(context.Background(), func(tx StoreTx) error {
+	if err := store.Update(context.Background(), func(tx agent.StoreTx) error {
 		if err := tx.InsertLeaseGrant(grant); err != nil {
 			return err
 		}
 		next := cloneStoreTaskRecord(task)
-		next.Lease = StoreLeaseState{Owner: grant.Grant.Worker, Fence: grant.Grant.Fence}
-		unleased := StoreLeaseState{}
-		changed, err := tx.CompareAndSwapTask(StoreTaskMutation{
+		next.Lease = agent.StoreLeaseState{Owner: grant.Grant.Worker, Fence: grant.Grant.Fence}
+		unleased := agent.StoreLeaseState{}
+		changed, err := tx.CompareAndSwapTask(agent.StoreTaskMutation{
 			Ref: task.Task.Ref,
-			Condition: StoreTaskCondition{
+			Condition: agent.StoreTaskCondition{
 				ExpectedRevision: task.Task.Revision,
 				ExpectedLease:    &unleased,
 			},
@@ -281,11 +298,11 @@ func TestSQLiteStoreLeaseHistoryAndTaskCAS(t *testing.T) {
 			return err
 		}
 		if !changed {
-			t.Fatal("lease Task CAS unexpectedly missed")
+			t.Fatal("lease agent.Task CAS unexpectedly missed")
 		}
-		changed, err = tx.CompareAndSwapTask(StoreTaskMutation{
+		changed, err = tx.CompareAndSwapTask(agent.StoreTaskMutation{
 			Ref: task.Task.Ref,
-			Condition: StoreTaskCondition{
+			Condition: agent.StoreTaskCondition{
 				ExpectedRevision: task.Task.Revision,
 				ExpectedLease:    &unleased,
 			},
@@ -295,15 +312,15 @@ func TestSQLiteStoreLeaseHistoryAndTaskCAS(t *testing.T) {
 			return err
 		}
 		if changed {
-			t.Fatal("stale lease CAS changed Task")
+			t.Fatal("stale lease CAS changed agent.Task")
 		}
 		return nil
 	}); err != nil {
 		t.Fatalf("grant lease: %v", err)
 	}
-	if err := store.View(context.Background(), func(view StoreView) error {
+	if err := store.View(context.Background(), func(view agent.StoreView) error {
 		loaded, err := view.LoadTask(task.Task.Ref)
-		if err != nil || loaded.Lease != (StoreLeaseState{Owner: "worker-a", Fence: 1}) {
+		if err != nil || loaded.Lease != (agent.StoreLeaseState{Owner: "worker-a", Fence: 1}) {
 			t.Fatalf("loaded lease = %#v, %v", loaded.Lease, err)
 		}
 		exact, err := view.LoadLeaseGrant(task.Task.Ref, 1)
@@ -314,7 +331,7 @@ func TestSQLiteStoreLeaseHistoryAndTaskCAS(t *testing.T) {
 		if err != nil || latest != grant {
 			t.Fatalf("latest grant = %#v, %v", latest, err)
 		}
-		leases, err := view.ScanLeases(StoreLeaseScan{
+		leases, err := view.ScanLeases(agent.StoreLeaseScan{
 			Authority: "authority-a", Worker: "worker-a", Limit: 2,
 		})
 		if err != nil || len(leases) != 1 || leases[0].Grant != grant.Grant {

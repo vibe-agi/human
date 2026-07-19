@@ -42,8 +42,9 @@ var (
 	// transition.
 	ErrStoreCommitUnknown = errors.New("agent store commit outcome is unknown")
 	// ErrStoreClosed means the resource behind a Store no longer admits View or
-	// Update calls. Store itself has no lifecycle method; framework.Resource owns
-	// release explicitly.
+	// Update calls, or a callback-scoped StoreView/StoreTx was used after its
+	// callback returned. Store itself has no lifecycle method; framework.Resource
+	// owns release explicitly.
 	ErrStoreClosed = errors.New("agent store is closed")
 	// ErrStoreRecordTooLarge means a bounded read refused to materialize a record.
 	ErrStoreRecordTooLarge = errors.New("agent store record exceeds read budget")
@@ -217,14 +218,23 @@ func (*StoreLimitError) Unwrap() error { return ErrStoreRecordTooLarge }
 // Store. Splitting them across independently committed implementations would
 // invalidate the Agent state machine.
 //
-// View must call fn exactly once with a stable read snapshot. Update must call
-// fn exactly once in a strictly serializable transaction. Implementations must
-// never retry either callback: Agent callbacks can derive timestamps and return
-// precise conflict information from the snapshot they observed. A callback and
-// its StoreView or StoreTx are valid only until the enclosing method returns and
-// must not be retained or used concurrently.
+// A non-nil context and callback are required. A nil argument is rejected with
+// ErrInvalidArgument without invoking the callback; a context already done is
+// returned without invoking it. Once admitted, View and Update call the callback
+// exactly once. Implementations must never retry a callback: Agent callbacks can
+// derive timestamps and return precise conflict information from the snapshot
+// they observed. The enclosing context supplies every primitive's cancellation
+// and deadline; an implementation must not replace it with a background context.
+//
+// View supplies one stable read snapshot. Update supplies one atomic, strictly
+// serializable read/write transaction with read-your-writes. A callback and its
+// StoreView or StoreTx are valid only until the enclosing method returns and must
+// not be retained or used concurrently. A primitive used outside that lifetime
+// returns an error matching ErrStoreClosed and performs no work.
 //
 // If an Update callback returns an error, none of its writes may become visible.
+// View and Update return an error matching the callback error; a rollback failure
+// may be joined without hiding it.
 // If it returns nil, all writes, including the command receipt, become visible
 // atomically or none do. A definite commit failure returns an ordinary error and
 // guarantees no commit. A failure that may have committed must return an error
@@ -236,6 +246,11 @@ func (*StoreLimitError) Unwrap() error { return ErrStoreRecordTooLarge }
 // byte slices after a successful write and return caller-owned copies from all
 // reads; mutable aliases may not cross a transaction boundary.
 //
+// Store serializability is not a live-runtime lease. Unless the embedding host
+// adds external generation/fencing coordination, exactly one active Agent may
+// drive a Store correctness namespace. Two Agent instances can otherwise
+// present the same durable Task to different Humans before either one commits.
+//
 // Store intentionally has no Close method. Construction receives it through a
 // framework.Resource[Store], which makes borrowed versus owned lifetime and the
 // release callback explicit without contaminating this business port.
@@ -244,10 +259,17 @@ type Store interface {
 	// safe before and during resource release and must not perform network or
 	// storage I/O.
 	Description() StoreDescription
-	// View executes exactly one read-only callback against one stable snapshot.
+	// View executes one callback against a stable, read-only snapshot. On a valid,
+	// live invocation it calls the callback exactly once and returns an error
+	// matching the callback's result. The context bounds snapshot acquisition and
+	// every StoreView primitive.
 	View(context.Context, func(StoreView) error) error
-	// Update executes exactly one callback in one atomic, strictly serializable
-	// transaction. See Store's commit-ambiguity contract.
+	// Update executes one callback in one atomic, strictly serializable transaction
+	// with read-your-writes. On a valid, live invocation it calls the callback
+	// exactly once. A callback error rolls back and remains matchable in the return;
+	// a nil callback result enters the commit-ambiguity contract described above.
+	// The context bounds transaction acquisition, every StoreTx primitive, and
+	// commit, but cancellation never permits a partial commit.
 	Update(context.Context, func(StoreTx) error) error
 }
 
@@ -368,9 +390,10 @@ type StoreMessageKey struct {
 }
 
 // StoreTaskContextScan selects a bounded page ordered by CreatedAt ascending,
-// then Workspace ID and Task ID ascending. Limit is the physical maximum number
-// of records returned; Agent normally requests one extra record to derive
-// HasMore.
+// then Workspace ID and Task ID ascending. After is an exclusive lexicographic
+// cursor in that order. Limit is the physical maximum number of records returned
+// and must be in 1..MaxPageSize+1; zero has no default meaning at the Store port.
+// Agent normally requests one extra record to derive HasMore.
 type StoreTaskContextScan struct {
 	Context ContextRef
 	After   *TaskPageCursor
@@ -378,10 +401,12 @@ type StoreTaskContextScan struct {
 }
 
 // StoreTaskAuthorityScan selects a bounded authority-wide page ordered by
-// UpdatedAt descending, then Workspace ID and Task ID ascending. Filters and
-// cursor have the same meaning as TaskQuery. Limit is the physical maximum;
-// TotalSize counts the filtered set before applying After and must be observed
-// in the same View snapshot as Records.
+// UpdatedAt descending, then Workspace ID and Task ID ascending. Context and
+// State zero values do not filter; UpdatedAtOrAfter is inclusive. After is an
+// exclusive lexicographic cursor in the mixed direction above. Limit is the
+// physical maximum, must be in 1..MaxPageSize+1, and has no zero default at the
+// Store port. TotalSize counts the filtered set before applying After and must
+// be observed in the same View snapshot as Records.
 type StoreTaskAuthorityScan struct {
 	Authority        AuthorityID
 	Context          ContextID
@@ -397,10 +422,11 @@ type StoreTaskAuthorityResult struct {
 	TotalSize uint64
 }
 
-// StoreMessageScan selects Task messages with Sequence greater than After in
-// ascending order. ReadLimit is a hard aggregate encoded-Parts budget. A driver
-// must fail with ErrStoreRecordTooLarge when the first record cannot fit; after
-// at least one record fits it returns the largest contiguous prefix within the
+// StoreMessageScan selects Task messages with Sequence strictly greater than
+// After in ascending order. Limit is an item cap in 1..MaxPageSize+1. ReadLimit
+// is a hard aggregate EncodedParts budget. A Store fails with
+// ErrStoreRecordTooLarge when the first record cannot fit; after at least one
+// record fits it returns the largest ordered contiguous prefix within the
 // budget. Agent compares the last sequence with Task.MessageCount to derive
 // HasMore without a driver-specific continuation flag.
 type StoreMessageScan struct {
@@ -410,16 +436,19 @@ type StoreMessageScan struct {
 	ReadLimit StoreReadLimit
 }
 
-// StoreEventScan selects Task events with Sequence greater than After in
-// ascending order.
+// StoreEventScan selects Task events with Sequence strictly greater than After
+// in ascending order. Limit is an item cap in 1..MaxPageSize+1 and has no zero
+// default at this port.
 type StoreEventScan struct {
 	Task  TaskRef
 	After uint64
 	Limit int
 }
 
-// StoreLeaseScan selects current leases for one authenticated worker, ordered
-// by GrantedAt, Workspace ID, Task ID, and Fence, all ascending.
+// StoreLeaseScan selects current (not historical) leases for one authenticated
+// worker, ordered by GrantedAt, Workspace ID, Task ID, and Fence, all ascending.
+// After is an exclusive lexicographic cursor in that order. Limit is an item cap
+// in 1..MaxPageSize+1 and has no zero default at this port.
 type StoreLeaseScan struct {
 	Authority AuthorityID
 	Worker    WorkerID
@@ -429,26 +458,66 @@ type StoreLeaseScan struct {
 
 // StoreView is a transaction-bound logical snapshot. It intentionally exposes
 // no SQL, table, driver cursor, or transport type. Every returned record and
-// byte slice belongs to the caller. Absence is reported with an error matching
-// ErrStoreRecordNotFound.
+// byte slice belongs to the caller. Single-record lookup, load, resolve, and
+// find methods report absence with an error matching ErrStoreRecordNotFound;
+// scan methods instead return a successful empty result. Every read made through
+// the StoreView embedded in StoreTx observes earlier writes in that Update.
 type StoreView interface {
-	// LookupCommand loads canonical result bytes subject to limit.
+	// LookupCommand loads the immutable command keyed by (Authority, ID). MaxBytes
+	// applies to Result only; absence matches ErrStoreRecordNotFound.
 	LookupCommand(StoreCommandKey, StoreReadLimit) (StoreCommandRecord, error)
+	// LoadTask loads the aggregate whose Task.Ref exactly equals ref. It includes
+	// the current lease and any Artifact/Submission links visible in this snapshot;
+	// absence matches ErrStoreRecordNotFound.
 	LoadTask(TaskRef) (StoreTaskRecord, error)
+	// ResolveTask resolves the authority-wide public identity (authority, task ID)
+	// to its unique Workspace-qualified TaskRef. It must never cross authority
+	// boundaries; absence matches ErrStoreRecordNotFound.
 	ResolveTask(AuthorityID, TaskID) (TaskRef, error)
-	// LoadMessage loads canonical encoded Parts subject to limit.
+	// LoadMessage loads the immutable message keyed by (Authority, Message ID). The
+	// returned record ID and Task authority must match that key. MaxBytes applies
+	// to EncodedParts; absence matches ErrStoreRecordNotFound.
 	LoadMessage(StoreMessageKey, StoreReadLimit) (StoreMessageRecord, error)
-	// LoadArtifact loads immutable payload bytes subject to limit.
+	// LoadArtifact loads the Artifact whose Artifact.Ref exactly equals ref.
+	// MaxBytes applies to EncodedPayload; absence matches ErrStoreRecordNotFound.
 	LoadArtifact(ArtifactRef, StoreReadLimit) (StoreArtifactRecord, error)
+	// LoadApplyReceipt loads the immutable terminal receipt keyed by its exact
+	// ArtifactRef; absence matches ErrStoreRecordNotFound.
 	LoadApplyReceipt(ArtifactRef) (StoreApplyReceiptRecord, error)
+	// LoadWorkspaceHead loads the head whose WorkspaceRef exactly equals ref;
+	// absence matches ErrStoreRecordNotFound.
 	LoadWorkspaceHead(WorkspaceRef) (StoreWorkspaceHeadRecord, error)
+	// LoadLeaseGrant loads immutable history for the exact (TaskRef, Fence) key;
+	// absence matches ErrStoreRecordNotFound.
 	LoadLeaseGrant(TaskRef, LeaseFence) (StoreLeaseGrantRecord, error)
+	// LoadLatestLeaseGrant returns the record with the greatest Fence for ref, not
+	// the record with the greatest wall-clock time. No history matches
+	// ErrStoreRecordNotFound.
 	LoadLatestLeaseGrant(TaskRef) (StoreLeaseGrantRecord, error)
+	// FindClaimableTask returns the deterministic oldest unleased, non-terminal
+	// Task in authority: CreatedAt, Workspace ID, then Task ID, all ascending. It
+	// only selects; it does not reserve or mutate the Task. No candidate matches
+	// ErrStoreRecordNotFound.
 	FindClaimableTask(AuthorityID) (StoreTaskRecord, error)
+	// ScanContextTasks returns only records in scan.Context, in the exact order and
+	// exclusive-cursor semantics defined by StoreTaskContextScan. It returns at
+	// most Limit records; zero matches are a successful empty result.
 	ScanContextTasks(StoreTaskContextScan) ([]StoreTaskRecord, error)
+	// ScanAuthorityTasks applies all filters and returns Records, ordering, and
+	// TotalSize exactly as StoreTaskAuthorityScan specifies. Zero matches are a
+	// successful result with TotalSize zero.
 	ScanAuthorityTasks(StoreTaskAuthorityScan) (StoreTaskAuthorityResult, error)
+	// ScanMessages returns at most Limit messages in the exact order, cursor, and
+	// aggregate byte-budget semantics defined by StoreMessageScan. Zero matches are
+	// a successful empty result.
 	ScanMessages(StoreMessageScan) ([]StoreMessageRecord, error)
+	// ScanEvents returns at most Limit events in the exact order and exclusive
+	// cursor semantics defined by StoreEventScan. Zero matches are a successful
+	// empty result.
 	ScanEvents(StoreEventScan) ([]StoreEventRecord, error)
+	// ScanLeases returns at most Limit assignments in StoreLeaseScan order. Each
+	// item couples the current Task lease with the immutable grant at that same
+	// Fence from this snapshot. Zero matches are a successful empty result.
 	ScanLeases(StoreLeaseScan) ([]LeaseAssignment, error)
 }
 
@@ -461,9 +530,11 @@ type StoreTaskCondition struct {
 	ExpectedLease    *StoreLeaseState
 }
 
-// StoreTaskMutation replaces one Task aggregate when Condition still matches.
-// Ref, Next.Task.Ref, and any nested Task references must be identical. A false
-// result from CompareAndSwapTask means no field was changed.
+// StoreTaskMutation replaces one existing Task aggregate when Condition still
+// matches. Ref and Next.Task.Ref must be identical; Context and CreatedAt are
+// immutable, and every nested Task/Workspace reference must remain in the same
+// identity scope. ExpectedRevision must be non-zero. A false result from
+// CompareAndSwapTask means no field was changed.
 type StoreTaskMutation struct {
 	Ref       TaskRef
 	Condition StoreTaskCondition
@@ -474,7 +545,8 @@ type StoreTaskMutation struct {
 // terminal timestamp without materializing the immutable payload. Exactly one
 // of PublishedAt or DiscardedAt is set according to NextState. Identity,
 // payload, digests, revisions, media type, Task, and FrozenAt remain unchanged.
-// A false result means ExpectedState or Task no longer matches.
+// A false result means the record is absent or ExpectedState or Task no longer
+// matches.
 type StoreArtifactMutation struct {
 	Ref           ArtifactRef
 	Task          TaskRef
@@ -485,7 +557,8 @@ type StoreArtifactMutation struct {
 }
 
 // StoreWorkspaceHeadMutation advances a Workspace head by exact revision CAS.
-// A false result means ExpectedRevision is no longer confirmed.
+// Workspace and Next.Head.Workspace must be identical. A false result means the
+// head is absent or ExpectedRevision is no longer confirmed.
 type StoreWorkspaceHeadMutation struct {
 	Workspace        WorkspaceRef
 	ExpectedRevision workspace.Revision
@@ -497,22 +570,62 @@ type StoreWorkspaceHeadMutation struct {
 // only when the enclosing Store.Update commits.
 //
 // Immutable inserts return an error matching ErrStoreConflict on any logical
-// uniqueness collision. Compare-and-swap methods return (false, nil) on an
-// expected-value miss and must not partially modify a record. The Agent core,
-// not the Store, owns state-transition policy, command digests, timestamps,
-// replay validation, and lease authorization.
+// uniqueness collision, including an exact duplicate; the typed constraint
+// named below is part of the portable contract. InsertWorkspaceHead is the sole
+// first-writer-wins exception and reports existence with its boolean. CAS and
+// first-writer methods return (false, nil) for the documented miss and must not
+// partially modify a record. The Agent core, not the Store, owns state-transition
+// policy, command digests, timestamps, replay validation, and lease authorization.
 type StoreTx interface {
 	StoreView
+	// InsertCommand inserts the immutable (Authority, ID) receipt. Any collision
+	// returns ErrStoreConflict with StoreConstraintCommandID.
 	InsertCommand(StoreCommandRecord) error
+	// InsertTask inserts an initial Task. It must be unleased at fence zero and
+	// have no pre-bound Artifact, ArtifactState, or Submission. Task.Ref is unique;
+	// (Authority, Task ID) is also unique across Workspaces. Collisions use
+	// StoreConstraintTaskKey and StoreConstraintPublicTaskID respectively.
 	InsertTask(StoreTaskRecord) error
+	// CompareAndSwapTask replaces an existing Task when ExpectedRevision and, when
+	// non-nil, ExpectedLease match. A revision/lease miss returns (false, nil); an
+	// absent Task matches ErrStoreRecordNotFound. Invalid or changed identity is an
+	// error. Artifact and Submission links in Next are backed by their paired
+	// immutable inserts in the same Update, rather than created by this primitive.
 	CompareAndSwapTask(StoreTaskMutation) (bool, error)
+	// InsertMessage inserts an immutable message. (Authority, Message ID) and
+	// (TaskRef, Sequence) are unique; collisions use StoreConstraintMessageID and
+	// StoreConstraintMessageSequence respectively.
 	InsertMessage(StoreMessageRecord) error
+	// InsertEvent inserts an immutable event keyed by (TaskRef, Sequence). A
+	// collision uses StoreConstraintEventSequence.
 	InsertEvent(StoreEventRecord) error
+	// InsertLeaseGrant inserts immutable history keyed by (TaskRef, Fence). A
+	// collision uses StoreConstraintLeaseFence. It does not itself change the
+	// Task's current lease; core pairs it with CompareAndSwapTask in this Update.
 	InsertLeaseGrant(StoreLeaseGrantRecord) error
+	// InsertArtifact inserts one immutable payload identity. Artifact IDs are
+	// authority-wide unique and a Task owns at most one Artifact; collisions use
+	// StoreConstraintArtifactID and StoreConstraintArtifactTask respectively.
 	InsertArtifact(StoreArtifactRecord) error
+	// CompareAndSwapArtifact changes only the state and terminal timestamps when
+	// the exact ArtifactRef, bound TaskRef, and ExpectedState match. Absence or a
+	// Task/state miss returns (false, nil); identity-invalid input is an error.
 	CompareAndSwapArtifact(StoreArtifactMutation) (bool, error)
+	// InsertSubmission inserts the immutable, sole Submission for its Task. Its
+	// (Authority, Submission ID) is also unique. Any collision returns
+	// ErrStoreConflict with StoreConstraintSubmissionID.
 	InsertSubmission(StoreSubmissionRecord) error
+	// InsertWorkspaceHead is first-writer-wins for Head.Workspace. It returns true
+	// only when it inserted the row. An existing row returns (false, nil), remains
+	// unchanged even when its value differs, and must be loaded before deciding the
+	// next action.
 	InsertWorkspaceHead(StoreWorkspaceHeadRecord) (bool, error)
+	// CompareAndSwapWorkspaceHead replaces an existing head only when
+	// ExpectedRevision matches. An absent head or revision miss returns (false,
+	// nil); a Workspace/Next identity mismatch is an error.
 	CompareAndSwapWorkspaceHead(StoreWorkspaceHeadMutation) (bool, error)
+	// InsertApplyReceipt inserts the immutable, sole receipt for its Artifact.
+	// (Authority, Receipt ID) is also unique. Any collision returns
+	// ErrStoreConflict with StoreConstraintReceiptID.
 	InsertApplyReceipt(StoreApplyReceiptRecord) error
 }

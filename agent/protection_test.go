@@ -1,11 +1,14 @@
-package agent
+package agent_test
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	. "github.com/vibe-agi/human/agent"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -15,6 +18,7 @@ import (
 	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/protect"
 	protectaead "github.com/vibe-agi/human/protect/aead"
+	"github.com/vibe-agi/human/workspace"
 )
 
 func TestProtectedAgentStoresSealedMessagesAndArtifacts(t *testing.T) {
@@ -271,15 +275,11 @@ func TestFreezeArtifactExactReplayDoesNotRequireProtectorOpen(t *testing.T) {
 }
 
 func TestAgentEnforcesFrozenProtectorDescription(t *testing.T) {
-	description := protect.Description{
+	baseDescription := protect.Description{
 		Contract: framework.Contract{ID: protect.ContractID, Major: protect.ContractMajor},
 		Provider: "test-kms", Format: "sealed-v1",
-		MaxPlaintextBytes: 1, MaxEnvelopeBytes: 1,
+		MaxPlaintextBytes: 4096, MaxEnvelopeBytes: 8192,
 	}
-	binding := messageProtectionBinding(
-		TaskRef{Workspace: WorkspaceRef{Authority: "authority", ID: "workspace"}, ID: "task"},
-		"message",
-	)
 	validEnvelope := func() protect.Envelope {
 		return protect.Envelope{
 			Provider: "test-kms", Format: "sealed-v1", KeyID: "key", KeyVersion: "1",
@@ -288,9 +288,15 @@ func TestAgentEnforcesFrozenProtectorDescription(t *testing.T) {
 	}
 
 	t.Run("reject plaintext before Seal", func(t *testing.T) {
+		description := baseDescription
+		description.MaxPlaintextBytes = 1
 		provider := &contractTestProtector{description: description}
 		service := newAgentWithTestProtector(t, provider)
-		if _, err := service.sealStoredValue(t.Context(), binding, []byte{1, 2}); !errors.Is(err, ErrInvalidArgument) {
+		contextRef, taskRef := refs("contract-tenant", "context", "workspace", "oversized")
+		_, err := service.CreateTask(t.Context(), createCommand(
+			"create-oversized", contextRef, taskRef, "message-oversized", "too large",
+		))
+		if !errors.Is(err, ErrInvalidArgument) {
 			t.Fatalf("seal oversized plaintext error = %v, want ErrInvalidArgument", err)
 		}
 		if got := provider.seals.Load(); got != 0 {
@@ -299,47 +305,81 @@ func TestAgentEnforcesFrozenProtectorDescription(t *testing.T) {
 	})
 
 	t.Run("reject mismatched provider after Seal", func(t *testing.T) {
-		provider := &contractTestProtector{description: description}
+		provider := &contractTestProtector{description: baseDescription}
 		provider.seal = func([]byte) protect.Envelope {
 			envelope := validEnvelope()
 			envelope.Provider = "other-kms"
 			return envelope
 		}
 		service := newAgentWithTestProtector(t, provider)
-		if _, err := service.sealStoredValue(t.Context(), binding, []byte{1}); !errors.Is(err, protect.ErrInvalidEnvelope) {
+		contextRef, taskRef := refs("contract-tenant", "context", "workspace", "provider")
+		_, err := service.CreateTask(t.Context(), createCommand(
+			"create-provider", contextRef, taskRef, "message-provider", "payload",
+		))
+		if !errors.Is(err, protect.ErrInvalidEnvelope) {
 			t.Fatalf("seal mismatched provider error = %v, want invalid envelope", err)
 		}
 	})
 
 	t.Run("reject oversized envelope after Seal", func(t *testing.T) {
+		description := baseDescription
+		description.MaxPlaintextBytes = 128
+		description.MaxEnvelopeBytes = 128
 		provider := &contractTestProtector{description: description}
 		provider.seal = func([]byte) protect.Envelope {
 			envelope := validEnvelope()
 			envelope.Nonce = []byte{1}
+			envelope.Data = make([]byte, 128)
 			return envelope
 		}
 		service := newAgentWithTestProtector(t, provider)
-		if _, err := service.sealStoredValue(t.Context(), binding, []byte{1}); !errors.Is(err, protect.ErrInvalidEnvelope) {
+		contextRef, taskRef := refs("contract-tenant", "context", "workspace", "envelope")
+		_, err := service.CreateTask(t.Context(), createCommand(
+			"create-envelope", contextRef, taskRef, "message-envelope", "payload",
+		))
+		if !errors.Is(err, protect.ErrInvalidEnvelope) {
 			t.Fatalf("seal oversized envelope error = %v, want invalid envelope", err)
 		}
 	})
 
 	t.Run("reject mismatched provider before Open", func(t *testing.T) {
-		provider := &contractTestProtector{description: description, open: func(protect.Envelope) []byte {
-			return []byte{1}
-		}}
+		var plaintext []byte
+		provider := &contractTestProtector{description: baseDescription}
+		provider.seal = func(value []byte) protect.Envelope {
+			plaintext = append([]byte(nil), value...)
+			return validEnvelope()
+		}
+		provider.open = func(protect.Envelope) []byte { return append([]byte(nil), plaintext...) }
 		service := newAgentWithTestProtector(t, provider)
-		envelope := validEnvelope()
-		envelope.Format = "other-v1"
-		value, err := protect.NewSealedStoredValue(false, envelope)
+		contextRef, taskRef := refs("contract-tenant", "context", "workspace", "open-provider")
+		if _, err := service.CreateTask(t.Context(), createCommand(
+			"create-open-provider", contextRef, taskRef, "message-open-provider", "payload",
+		)); err != nil {
+			t.Fatal(err)
+		}
+		var encoded []byte
+		if err := service.database.QueryRowContext(t.Context(), `
+			SELECT parts FROM agent_messages WHERE authority_id = ? AND message_id = ?`,
+			taskRef.Workspace.Authority, "message-open-provider",
+		).Scan(&encoded); err != nil {
+			t.Fatal(err)
+		}
+		value, err := protect.UnmarshalStoredValue(encoded)
 		if err != nil {
 			t.Fatal(err)
 		}
-		encoded, err := protect.MarshalStoredValue(value)
+		value.Envelope.Format = "other-v1"
+		encoded, err = protect.MarshalStoredValue(value)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := service.openStoredValue(t.Context(), binding, encoded, maxPageBytes); !errors.Is(err, ErrCorruptStore) || !errors.Is(err, protect.ErrInvalidEnvelope) {
+		if _, err := service.database.ExecContext(t.Context(), `
+			UPDATE agent_messages SET parts = ? WHERE authority_id = ? AND message_id = ?`,
+			encoded, taskRef.Workspace.Authority, "message-open-provider",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.GetMessage(t.Context(), taskRef.Workspace.Authority, "message-open-provider"); !errors.Is(err, ErrCorruptStore) || !errors.Is(err, protect.ErrInvalidEnvelope) {
 			t.Fatalf("open mismatched format error = %v, want corrupt/invalid envelope", err)
 		}
 		if got := provider.opens.Load(); got != 0 {
@@ -348,19 +388,19 @@ func TestAgentEnforcesFrozenProtectorDescription(t *testing.T) {
 	})
 
 	t.Run("reject oversized plaintext after Open", func(t *testing.T) {
-		provider := &contractTestProtector{description: description, open: func(protect.Envelope) []byte {
-			return []byte{1, 2}
-		}}
+		provider := &contractTestProtector{description: baseDescription}
+		provider.seal = func([]byte) protect.Envelope { return validEnvelope() }
+		provider.open = func(protect.Envelope) []byte {
+			return bytes.Repeat([]byte{'x'}, int(baseDescription.MaxPlaintextBytes)+1)
+		}
 		service := newAgentWithTestProtector(t, provider)
-		value, err := protect.NewSealedStoredValue(false, validEnvelope())
-		if err != nil {
+		contextRef, taskRef := refs("contract-tenant", "context", "workspace", "open-size")
+		if _, err := service.CreateTask(t.Context(), createCommand(
+			"create-open-size", contextRef, taskRef, "message-open-size", "payload",
+		)); err != nil {
 			t.Fatal(err)
 		}
-		encoded, err := protect.MarshalStoredValue(value)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := service.openStoredValue(t.Context(), binding, encoded, maxPageBytes); !errors.Is(err, ErrCorruptStore) {
+		if _, err := service.GetMessage(t.Context(), taskRef.Workspace.Authority, "message-open-size"); !errors.Is(err, ErrCorruptStore) {
 			t.Fatalf("open oversized plaintext error = %v, want ErrCorruptStore", err)
 		}
 	})
@@ -584,7 +624,7 @@ func (protector *contractTestProtector) Open(
 	return protector.open(protect.CloneEnvelope(envelope)), nil
 }
 
-func newAgentWithTestProtector(t *testing.T, protector protect.Protector) *Agent {
+func newAgentWithTestProtector(t *testing.T, protector protect.Protector) *testAgent {
 	t.Helper()
 	base, _ := openTestAgent(t)
 	config := DefaultConfig()
@@ -595,7 +635,7 @@ func newAgentWithTestProtector(t *testing.T, protector protect.Protector) *Agent
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = service.Close() })
-	return service
+	return &testAgent{Agent: service, store: base.store, database: base.database, now: base.now}
 }
 
 func TestAgentRejectsBorrowedTypedNilProtector(t *testing.T) {
@@ -698,7 +738,7 @@ func (invalidDescriptionProtector) Open(context.Context, protect.Binding, protec
 	panic("Open must not run after an invalid description")
 }
 
-func openProtectedAgent(t *testing.T, path string, protectorConfig protectaead.Config) *Agent {
+func openProtectedAgent(t *testing.T, path string, protectorConfig protectaead.Config) *testAgent {
 	t.Helper()
 	return openProtectedAgentWithPolicy(t, path, protectorConfig, false)
 }
@@ -708,22 +748,16 @@ func openProtectedAgentWithPolicy(
 	path string,
 	protectorConfig protectaead.Config,
 	allowPlain bool,
-) *Agent {
+) *testAgent {
 	t.Helper()
 	resource, err := protectaead.Open(t.Context(), protectorConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 	config := DefaultConfig()
-	config.DatabasePath = path
 	config.Protector = resource
 	config.AllowPlaintextReads = allowPlain
-	service, err := Open(t.Context(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = service.Close() })
-	return service
+	return openTestAgentWithConfig(t, path, config)
 }
 
 func keyringConfig(version string, material []byte) protectaead.Config {
@@ -737,7 +771,11 @@ func testKey(value byte) []byte { return bytes.Repeat([]byte{value}, protectaead
 
 func createWorkingTaskWithText(
 	t *testing.T,
-	service *Agent,
+	service interface {
+		CreateTask(context.Context, CreateTaskCommand) (Task, error)
+		AcquireLease(context.Context, AcquireLeaseCommand) (LeaseAssignment, error)
+		AcceptTask(context.Context, WorkerTaskCommand) (Task, error)
+	},
 	contextRef ContextRef,
 	taskRef TaskRef,
 	suffix, text string,
@@ -760,6 +798,25 @@ func createWorkingTaskWithText(
 	return working
 }
 
+func digestArtifact(
+	ref ArtifactRef,
+	task TaskRef,
+	base, result workspace.Revision,
+	payload workspace.Digest,
+	mediaType string,
+) workspace.Digest {
+	encoded, _ := json.Marshal(struct {
+		Ref       ArtifactRef        `json:"ref"`
+		Task      TaskRef            `json:"task"`
+		Base      workspace.Revision `json:"base"`
+		Result    workspace.Revision `json:"result"`
+		Payload   workspace.Digest   `json:"payload"`
+		MediaType string             `json:"media_type"`
+	}{ref, task, base, result, payload, mediaType})
+	sum := sha256.Sum256(encoded)
+	return workspace.Digest("sha256:" + hex.EncodeToString(sum[:]))
+}
+
 func assertSealedAtRest(t *testing.T, encoded, plaintext []byte) {
 	t.Helper()
 	value, err := protect.UnmarshalStoredValue(encoded)
@@ -779,7 +836,7 @@ func assertSealedAtRest(t *testing.T, encoded, plaintext []byte) {
 	}
 }
 
-func assertStoredMessageKeyVersion(t *testing.T, service *Agent, message MessageID, version string) {
+func assertStoredMessageKeyVersion(t *testing.T, service *testAgent, message MessageID, version string) {
 	t.Helper()
 	var encoded []byte
 	if err := service.database.QueryRowContext(t.Context(), `SELECT parts FROM agent_messages WHERE message_id = ?`, message).Scan(&encoded); err != nil {

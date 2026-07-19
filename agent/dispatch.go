@@ -74,7 +74,11 @@ func (agent *Agent) ClaimLease(ctx context.Context, command ClaimLeaseCommand) (
 		}
 
 		nextFence := record.Lease.Fence + 1
-		now := timestampAtLeast(agent.now(), record.Task.UpdatedAt, previousGrantedAt)
+		now, err := checkedClockTime(agent.now)
+		if err != nil {
+			return err
+		}
+		now = timestampAtLeast(now, record.Task.UpdatedAt, previousGrantedAt)
 		assignment = LeaseAssignment{
 			Grant: LeaseGrant{Task: record.Task.Ref, Worker: command.Worker, Fence: nextFence},
 			Task:  cloneTask(record.Task), GrantedAt: now,

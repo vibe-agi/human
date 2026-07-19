@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -33,13 +32,13 @@ const (
 
 var stableID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
-// Config controls one durable HumanAgent domain instance. Exactly one of Store
-// and DatabasePath must be supplied. Store is the framework extension point;
-// DatabasePath composes the official built-in SQLite implementation for the
-// convenient local case.
+// Config controls one durable HumanAgent domain instance. Store is required and
+// is the persistence extension point. Physical drivers such as agent/sqlite are
+// composed by the caller and injected as borrowed or owned resources.
 type Config struct {
 	// Store injects a complete Agent persistence consistency domain. Borrowed
 	// resources remain caller-owned; owned resources are released by Shutdown.
+	// It is not a distributed live-owner lease; see agent.Store's contract.
 	Store framework.Resource[Store]
 	// Protector optionally seals static message and Artifact payloads before they
 	// enter Store callbacks. Borrowed Protectors remain caller-owned; owned
@@ -50,13 +49,12 @@ type Config struct {
 	// attacker from downgrading authenticated ciphertext to plaintext. Enable it
 	// only while reading records written by a deliberately unprotected runtime.
 	AllowPlaintextReads bool
-	// DatabasePath selects the dedicated HumanAgent SQLite identity. Missing
-	// parent directories are created privately; do not share this file with LLM.
-	// It is mutually exclusive with Store.
-	DatabasePath string
 	// MaxArtifactBytes limits newly frozen payloads. Reads continue to accept
 	// already committed payloads up to the schema hard limit of 64 MiB.
 	MaxArtifactBytes int64
+	// Clock supplies core-owned timestamps. It must be safe for concurrent use
+	// and return UTC-normalizable wall-clock values. Nil uses time.Now.
+	Clock func() time.Time
 	// ReleaseTimeout bounds each owned Protector and Store release independently.
 	// Shutdown's context only bounds the caller's wait; cleanup continues after a
 	// caller timeout and a broken adapter cannot prevent the next dependency's
@@ -64,25 +62,27 @@ type Config struct {
 	ReleaseTimeout time.Duration
 }
 
-// DefaultConfig returns Agent defaults without selecting a database identity.
+// DefaultConfig returns Agent defaults without selecting a Store resource.
 func DefaultConfig() Config {
 	return Config{MaxArtifactBytes: defaultArtifactMax, ReleaseTimeout: defaultReleaseTimeout}
 }
 
 func (config Config) withDefaults() (Config, error) {
-	config.DatabasePath = strings.TrimSpace(config.DatabasePath)
 	store, err := config.Store.Value()
 	if err != nil {
 		return Config{}, fmt.Errorf("inspect Agent Store resource: %w", err)
 	}
-	hasStore := !nilAgentStore(store)
-	if hasStore == (config.DatabasePath != "") {
-		return Config{}, fmt.Errorf(
-			"%w: exactly one of agent Store or database path is required", ErrInvalidArgument,
-		)
+	if nilAgentStore(store) {
+		return Config{}, fmt.Errorf("%w: agent Store is required", ErrInvalidArgument)
 	}
 	if config.MaxArtifactBytes == 0 {
 		config.MaxArtifactBytes = defaultArtifactMax
+	}
+	if config.Clock == nil {
+		config.Clock = time.Now
+	}
+	if _, err := checkedClockTime(config.Clock); err != nil {
+		return Config{}, err
 	}
 	if config.MaxArtifactBytes < 1 || config.MaxArtifactBytes > absoluteArtifactMax {
 		return Config{}, fmt.Errorf("%w: artifact byte limit must be 1..%d", ErrInvalidArgument, absoluteArtifactMax)
@@ -99,9 +99,6 @@ func (config Config) withDefaults() (Config, error) {
 // Agent owns the durable HumanAgent domain store. It does not own an HTTP
 // listener or worker transport; those are adapters over this lifecycle.
 type Agent struct {
-	// database remains only as a package-test corruption hook while the SQLite
-	// bridge moves to agent/sqlite. Core operations never read it.
-	database             *sql.DB
 	storeResource        framework.Resource[Store]
 	store                Store
 	protectorResource    protect.Resource
@@ -130,32 +127,18 @@ func Open(ctx context.Context, config Config) (*Agent, error) {
 		err := fmt.Errorf("%w: context is required", ErrInvalidArgument)
 		return nil, errors.Join(err, releaseAgentConfigResources(config))
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(err, releaseAgentConfigResources(config))
+	}
 	original := config
 	config, err := config.withDefaults()
 	if err != nil {
 		return nil, errors.Join(err, releaseAgentConfigResources(original))
 	}
-	if config.DatabasePath == "" {
-		return newAgent(
-			ctx, config.Store, config.Protector, config.AllowPlaintextReads,
-			config.MaxArtifactBytes, config.ReleaseTimeout,
-		)
-	}
-	resource, err := OpenSQLiteStore(ctx, config.DatabasePath)
-	if err != nil {
-		return nil, errors.Join(err, releaseAgentResource(config.ReleaseTimeout, config.Protector.Release))
-	}
-	result, err := newAgent(
-		ctx, resource, config.Protector, config.AllowPlaintextReads,
-		config.MaxArtifactBytes, config.ReleaseTimeout,
+	return newAgent(
+		ctx, config.Store, config.Protector, config.AllowPlaintextReads,
+		config.MaxArtifactBytes, config.ReleaseTimeout, config.Clock,
 	)
-	if err != nil {
-		return nil, err
-	}
-	if store, ok := result.store.(*sqliteStore); ok {
-		result.database = store.database
-	}
-	return result, nil
 }
 
 // New constructs an Agent from Config. It is equivalent to Open and exists so
@@ -169,6 +152,7 @@ func newAgent(
 	allowPlaintext bool,
 	maxArtifactBytes int64,
 	releaseTimeout time.Duration,
+	clock func() time.Time,
 ) (*Agent, error) {
 	store, err := resource.Value()
 	if err != nil {
@@ -218,7 +202,7 @@ func newAgent(
 		protector:            protector,
 		protectorDescription: protectorDescription,
 		allowPlaintext:       allowPlaintext,
-		now:                  time.Now,
+		now:                  clock,
 		maxArtifactBytes:     maxArtifactBytes,
 		releaseTimeout:       releaseTimeout,
 		drained:              make(chan struct{}),
@@ -433,7 +417,10 @@ func (agent *Agent) CreateTask(ctx context.Context, command CreateTaskCommand) (
 			return nil
 		}
 
-		now := agent.now().UTC()
+		now, err := checkedClockTime(agent.now)
+		if err != nil {
+			return err
+		}
 		task := Task{
 			Ref: command.Task, Context: command.Context, State: TaskSubmitted,
 			Revision: 1, MessageCount: 1, EventCount: 1,
@@ -681,7 +668,11 @@ func (agent *Agent) transition(
 			return fmt.Errorf("%w: task counters exhausted integer range", ErrRevisionConflict)
 		}
 
-		now := timestampAtLeast(agent.now(), current.UpdatedAt)
+		now, err := checkedClockTime(agent.now)
+		if err != nil {
+			return err
+		}
+		now = timestampAtLeast(now, current.UpdatedAt)
 		next := current
 		next.State = change.next
 		next.Revision++
@@ -1039,109 +1030,6 @@ func (agent *Agent) ReadEvents(ctx context.Context, ref TaskRef, request PageReq
 	return page, nil
 }
 
-type queryer interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}
-
-type rowScanner interface {
-	Scan(...any) error
-}
-
-func scanTask(scanner rowScanner, authority AuthorityID, includesRef bool, refs ...TaskRef) (Task, error) {
-	var task Task
-	if !includesRef {
-		if len(refs) != 1 {
-			return Task{}, fmt.Errorf("%w: internal task reference is missing", ErrCorruptStore)
-		}
-		task.Ref = refs[0]
-	}
-	var created, updated int64
-	var artifactID, artifactState, submissionID, finalMessageID, submissionArtifactID sql.NullString
-	var publishedAt sql.NullInt64
-	destinations := make([]any, 0, 12)
-	if includesRef {
-		destinations = append(destinations, &task.Ref.Workspace.ID, &task.Ref.ID)
-		task.Ref.Workspace.Authority = authority
-	}
-	destinations = append(destinations,
-		&task.Context.ID, &task.State, &task.Revision, &task.MessageCount,
-		&task.EventCount, &created, &updated,
-		&artifactID, &artifactState, &submissionID, &finalMessageID, &submissionArtifactID, &publishedAt,
-	)
-	if err := scanner.Scan(destinations...); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Task{}, sql.ErrNoRows
-		}
-		return Task{}, fmt.Errorf("scan Agent task: %w", err)
-	}
-	task.Context.Authority = authority
-	task.CreatedAt = fromUnixNano(created)
-	task.UpdatedAt = fromUnixNano(updated)
-	if artifactID.Valid {
-		task.Artifact = &ArtifactRef{Workspace: task.Ref.Workspace, ID: ArtifactID(artifactID.String)}
-	}
-	if artifactID.Valid != artifactState.Valid {
-		return Task{}, fmt.Errorf("%w: partial Artifact for task %q", ErrCorruptStore, task.Ref.ID)
-	}
-	if submissionID.Valid || finalMessageID.Valid || publishedAt.Valid {
-		if !submissionID.Valid || !finalMessageID.Valid || !publishedAt.Valid {
-			return Task{}, fmt.Errorf("%w: partial submission for task %q", ErrCorruptStore, task.Ref.ID)
-		}
-		task.Submission = &Submission{
-			ID: SubmissionID(submissionID.String), Task: task.Ref,
-			FinalMessage: MessageID(finalMessageID.String), PublishedAt: fromUnixNano(publishedAt.Int64),
-		}
-		if submissionArtifactID.Valid {
-			task.Submission.Artifact = &ArtifactRef{
-				Workspace: task.Ref.Workspace, ID: ArtifactID(submissionArtifactID.String),
-			}
-		}
-	} else if submissionArtifactID.Valid {
-		return Task{}, fmt.Errorf("%w: orphaned submission Artifact for task %q", ErrCorruptStore, task.Ref.ID)
-	}
-	if err := validateStoredTask(task); err != nil {
-		return Task{}, err
-	}
-	if artifactState.Valid {
-		state := ArtifactState(artifactState.String)
-		valid := (state == ArtifactFrozen && (task.State == TaskWorking || task.State == TaskInputRequired)) ||
-			(state == ArtifactPublished && task.State == TaskCompleted) ||
-			(state == ArtifactDiscarded && (task.State == TaskCanceled || task.State == TaskFailed))
-		if !valid {
-			return Task{}, fmt.Errorf("%w: Artifact state %q does not match task %q state %q", ErrCorruptStore, state, task.Ref.ID, task.State)
-		}
-	}
-	return task, nil
-}
-
-func loadTask(ctx context.Context, query queryer, ref TaskRef) (Task, error) {
-	row := query.QueryRowContext(ctx, `
-		SELECT t.context_id, t.state, t.revision, t.message_count, t.event_count,
-		       t.created_at, t.updated_at,
-		       a.artifact_id, a.state,
-		       s.submission_id, s.final_message_id, s.artifact_id, s.published_at
-		FROM agent_tasks AS t
-		LEFT JOIN agent_artifacts AS a
-		  ON a.authority_id = t.authority_id
-		 AND a.workspace_id = t.workspace_id
-		 AND a.task_id = t.task_id
-		LEFT JOIN agent_submissions AS s
-		  ON s.authority_id = t.authority_id
-		 AND s.workspace_id = t.workspace_id
-		 AND s.task_id = t.task_id
-		WHERE t.authority_id = ? AND t.workspace_id = ? AND t.task_id = ?`,
-		ref.Workspace.Authority, ref.Workspace.ID, ref.ID,
-	)
-	task, err := scanTask(row, ref.Workspace.Authority, false, ref)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Task{}, ErrNotFound
-		}
-		return Task{}, err
-	}
-	return cloneTask(task), nil
-}
-
 func validateStoredTask(task Task) error {
 	if err := validateTaskRef(task.Ref); err != nil {
 		return fmt.Errorf("%w: invalid task key: %v", ErrCorruptStore, err)
@@ -1232,112 +1120,6 @@ func validTaskState(state TaskState) bool {
 	}
 }
 
-func replayTaskCommand(
-	ctx context.Context,
-	tx *sql.Tx,
-	authority AuthorityID,
-	id CommandID,
-	kind, digest string,
-) (Task, bool, error) {
-	var storedKind, storedDigest, resultKind, storedResultDigest string
-	var result []byte
-	err := tx.QueryRowContext(ctx, `
-		SELECT kind, digest, result_kind, result, result_digest
-		FROM agent_commands
-		WHERE authority_id = ? AND command_id = ?`, authority, id,
-	).Scan(&storedKind, &storedDigest, &resultKind, &result, &storedResultDigest)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Task{}, false, nil
-	}
-	if err != nil {
-		return Task{}, false, fmt.Errorf("lookup Agent command: %w", err)
-	}
-	if byteDigest(result) != storedResultDigest {
-		return Task{}, false, fmt.Errorf("%w: Agent command result digest mismatch", ErrCorruptStore)
-	}
-	if storedKind != kind || storedDigest != digest || resultKind != "task" {
-		return Task{}, false, ErrIdempotencyConflict
-	}
-	var task Task
-	if err := json.Unmarshal(result, &task); err != nil {
-		return Task{}, false, fmt.Errorf("decode Agent command result: %w", err)
-	}
-	if err := validateStoredTask(task); err != nil {
-		return Task{}, false, fmt.Errorf("decode Agent command result: %w", err)
-	}
-	if task.Ref.Workspace.Authority != authority {
-		return Task{}, false, fmt.Errorf("%w: command result authority mismatch", ErrCorruptStore)
-	}
-	return cloneTask(task), true, nil
-}
-
-func recordTaskCommand(
-	ctx context.Context,
-	tx *sql.Tx,
-	authority AuthorityID,
-	id CommandID,
-	kind, digest string,
-	task Task,
-	now time.Time,
-) error {
-	result, err := json.Marshal(task)
-	if err != nil {
-		return fmt.Errorf("encode Agent command result: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO agent_commands (
-		  authority_id, command_id, kind, digest, result_kind, result, result_digest, created_at
-		) VALUES (?, ?, ?, ?, 'task', ?, ?, ?)`, authority, id, kind, digest,
-		result, byteDigest(result), unixNano(now)); err != nil {
-		if uniqueConstraint(err) {
-			return ErrIdempotencyConflict
-		}
-		return fmt.Errorf("record Agent command: %w", err)
-	}
-	return nil
-}
-
-func insertMessage(ctx context.Context, tx *sql.Tx, message Message) error {
-	parts, err := json.Marshal(message.Parts)
-	if err != nil {
-		return fmt.Errorf("encode Agent message: %w", err)
-	}
-	digest, err := contentDigest(message.Parts)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO agent_messages (
-		  authority_id, message_id, workspace_id, task_id, sequence,
-		  author, parts, digest, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		message.Task.Workspace.Authority, message.ID, message.Task.Workspace.ID,
-		message.Task.ID, message.Sequence, message.Author, parts, digest,
-		unixNano(message.CreatedAt),
-	); err != nil {
-		if uniqueConstraint(err) {
-			return ErrMessageConflict
-		}
-		return fmt.Errorf("insert Agent message: %w", err)
-	}
-	return nil
-}
-
-func insertEvent(ctx context.Context, tx *sql.Tx, event Event) error {
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO agent_events (
-		  authority_id, workspace_id, task_id, sequence, kind, state,
-		  revision, message_id, submission_id, artifact_id, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		event.Task.Workspace.Authority, event.Task.Workspace.ID, event.Task.ID,
-		event.Sequence, event.Type, event.State, event.Revision, event.Message,
-		event.Submission, event.Artifact, unixNano(event.OccurredAt),
-	); err != nil {
-		return fmt.Errorf("append Agent event: %w", err)
-	}
-	return nil
-}
-
 func validateCreateCommand(command CreateTaskCommand) error {
 	if err := validateMeta(command.Meta, true); err != nil {
 		return err
@@ -1373,14 +1155,14 @@ func normalizePageLimit(limit int) (int, error) {
 
 func normalizePageRequest(request PageRequest) (int, error) {
 	if request.After > math.MaxInt64 {
-		return 0, fmt.Errorf("%w: page cursor exceeds SQLite integer range", ErrInvalidArgument)
+		return 0, fmt.Errorf("%w: page cursor exceeds Store integer range", ErrInvalidArgument)
 	}
 	return normalizePageLimit(request.Limit)
 }
 
 func validateTaskCursor(cursor TaskPageCursor) error {
 	if cursor.CreatedAt.IsZero() || !fromUnixNano(unixNano(cursor.CreatedAt.UTC())).Equal(cursor.CreatedAt.UTC()) {
-		return fmt.Errorf("%w: task page cursor time is outside SQLite nanosecond range", ErrInvalidArgument)
+		return fmt.Errorf("%w: task page cursor time is outside Store nanosecond range", ErrInvalidArgument)
 	}
 	if err := validateStable("cursor workspace id", string(cursor.Workspace)); err != nil {
 		return err
@@ -1399,7 +1181,7 @@ func validateMeta(meta CommandMeta, create bool) error {
 		return fmt.Errorf("%w: expected revision must be positive", ErrInvalidArgument)
 	}
 	if meta.ExpectedRevision > math.MaxInt64 {
-		return fmt.Errorf("%w: expected revision exceeds SQLite integer range", ErrInvalidArgument)
+		return fmt.Errorf("%w: expected revision exceeds Store integer range", ErrInvalidArgument)
 	}
 	return nil
 }
@@ -1494,6 +1276,21 @@ func timestampAtLeast(candidate time.Time, floors ...time.Time) time.Time {
 		}
 	}
 	return candidate
+}
+
+func checkedClockTime(clock func() time.Time) (time.Time, error) {
+	if clock == nil {
+		return time.Time{}, fmt.Errorf("%w: Agent Clock is required", ErrInvalidArgument)
+	}
+	value := clock()
+	if value.IsZero() {
+		return time.Time{}, fmt.Errorf("%w: Agent Clock returned zero time", ErrInvalidArgument)
+	}
+	normalized := time.Unix(0, value.UnixNano()).UTC()
+	if !normalized.Equal(value.UTC()) {
+		return time.Time{}, fmt.Errorf("%w: Agent Clock returned time outside Store nanosecond range", ErrInvalidArgument)
+	}
+	return normalized, nil
 }
 
 func containsState(states []TaskState, candidate TaskState) bool {

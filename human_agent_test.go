@@ -8,13 +8,19 @@ import (
 
 	human "github.com/vibe-agi/human"
 	"github.com/vibe-agi/human/agent"
+	agentsqlite "github.com/vibe-agi/human/agent/sqlite"
 	llmsqlite "github.com/vibe-agi/human/llm/sqlite"
 )
 
 func TestNewAgentPersistsTaskLifecycle(t *testing.T) {
 	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "agent.db")
+	store, err := agentsqlite.Open(ctx, agentsqlite.Config{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
 	config := human.DefaultAgentConfig()
-	config.DatabasePath = filepath.Join(t.TempDir(), "agent.db")
+	config.Store = store
 
 	service, err := human.NewAgent(ctx, config)
 	if err != nil {
@@ -50,6 +56,11 @@ func TestNewAgentPersistsTaskLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	reopenedStore, err := agentsqlite.Open(ctx, agentsqlite.Config{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Store = reopenedStore
 	recovered, err := human.NewAgent(ctx, config)
 	if err != nil {
 		t.Fatal(err)
@@ -83,8 +94,12 @@ func TestAgentFacadeKeepsDomainTypeAndDefaults(t *testing.T) {
 func TestAgentAndLLMRequireSeparateDatabaseIdentities(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "human.db")
+	store, err := agentsqlite.Open(ctx, agentsqlite.Config{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
 	agentConfig := human.DefaultAgentConfig()
-	agentConfig.DatabasePath = path
+	agentConfig.Store = store
 	service, err := human.NewAgent(ctx, agentConfig)
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +108,7 @@ func TestAgentAndLLMRequireSeparateDatabaseIdentities(t *testing.T) {
 		t.Fatal(err)
 	}
 	llmConfig := human.DefaultLLMConfig()
-	store, openErr := llmsqlite.Open(ctx, llmsqlite.Config{Path: path})
+	llmStore, openErr := llmsqlite.Open(ctx, llmsqlite.Config{Path: path})
 	if openErr != nil {
 		// The official adapter normally rejects the foreign schema while opening.
 		return
@@ -101,7 +116,7 @@ func TestAgentAndLLMRequireSeparateDatabaseIdentities(t *testing.T) {
 	// A custom Store may defer schema validation until the core begins recovery;
 	// that constructor boundary must reject the same mixed identity as well.
 	llmConfig.DeploymentID = "separate-schema-test"
-	llmConfig.Store = store
+	llmConfig.Store = llmStore
 	if llm, err := human.NewLLM(ctx, llmConfig); err == nil {
 		_ = llm.Shutdown(ctx)
 		t.Fatal("NewLLM accepted a HumanAgent database")

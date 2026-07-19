@@ -1,11 +1,25 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 )
+
+func cloneStoreArtifactRecord(record StoreArtifactRecord) StoreArtifactRecord {
+	record.EncodedPayload = bytes.Clone(record.EncodedPayload)
+	if record.Artifact.PublishedAt != nil {
+		value := *record.Artifact.PublishedAt
+		record.Artifact.PublishedAt = &value
+	}
+	if record.Artifact.DiscardedAt != nil {
+		value := *record.Artifact.DiscardedAt
+		record.Artifact.DiscardedAt = &value
+	}
+	return record
+}
 
 func loadTaskFromStore(view StoreView, ref TaskRef) (Task, error) {
 	record, err := loadTaskRecordFromStore(view, ref)

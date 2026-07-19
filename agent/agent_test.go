@@ -1,29 +1,93 @@
-package agent
+package agent_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	. "github.com/vibe-agi/human/agent"
 	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
+	"time"
+
+	agentsqlite "github.com/vibe-agi/human/agent/sqlite"
 )
 
-func openTestAgent(t *testing.T) (*Agent, string) {
+type testAgent struct {
+	*Agent
+	store    Store
+	database *sql.DB
+	now      func() time.Time
+}
+
+func openTestAgent(t *testing.T) (*testAgent, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "agent.db")
-	config := DefaultConfig()
-	config.DatabasePath = path
+	return openTestAgentWithConfig(t, path, DefaultConfig()), path
+}
+
+func openTestAgentWithConfig(t *testing.T, path string, config Config) *testAgent {
+	t.Helper()
+	resource, err := agentsqlite.Open(t.Context(), agentsqlite.Config{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := resource.Value()
+	if err != nil {
+		_ = resource.Release(context.Background())
+		t.Fatal(err)
+	}
+	wrapper := &testAgent{store: store, now: time.Now}
+	config.Store = resource
+	config.Clock = func() time.Time { return wrapper.now() }
 	service, err := Open(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
+	wrapper.Agent = service
+	wrapper.database, err = sql.Open("sqlite", path)
+	if err != nil {
+		_ = service.Close()
+		t.Fatal(err)
+	}
+	wrapper.database.SetMaxOpenConns(1)
+	wrapper.database.SetMaxIdleConns(1)
+	if _, err := wrapper.database.ExecContext(t.Context(), "PRAGMA foreign_keys = ON"); err != nil {
+		_ = service.Close()
+		_ = wrapper.database.Close()
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
-		if err := service.Close(); err != nil {
+		if err := wrapper.Agent.Close(); err != nil {
 			t.Errorf("close Agent: %v", err)
 		}
+		if err := wrapper.database.Close(); err != nil {
+			t.Errorf("close Agent test database: %v", err)
+		}
 	})
-	return service, path
+	return wrapper
+}
+
+func openSQLiteStoreBridge(t *testing.T) Store {
+	t.Helper()
+	resource, err := agentsqlite.Open(t.Context(), agentsqlite.Config{
+		Path: filepath.Join(t.TempDir(), "agent-store.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := resource.Value()
+	if err != nil {
+		_ = resource.Release(context.Background())
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := resource.Release(context.Background()); err != nil {
+			t.Errorf("release Agent test Store: %v", err)
+		}
+	})
+	return store
 }
 
 func refs(authority, contextID, workspaceID, taskID string) (ContextRef, TaskRef) {
@@ -38,6 +102,8 @@ func textMessage(id, text string) MessageInput {
 	return MessageInput{ID: MessageID(id), Parts: []Part{{MediaType: "text/plain", Data: []byte(text)}}}
 }
 
+func unixNano(value time.Time) int64 { return value.UnixNano() }
+
 func createCommand(commandID string, contextRef ContextRef, taskRef TaskRef, messageID, text string) CreateTaskCommand {
 	return CreateTaskCommand{
 		Meta: CommandMeta{ID: CommandID(commandID)}, Task: taskRef, Context: contextRef,
@@ -45,7 +111,9 @@ func createCommand(commandID string, contextRef ContextRef, taskRef TaskRef, mes
 	}
 }
 
-func acquireTestLease(t *testing.T, service *Agent, task TaskRef) LeaseGrant {
+func acquireTestLease(t *testing.T, service interface {
+	AcquireLease(context.Context, AcquireLeaseCommand) (LeaseAssignment, error)
+}, task TaskRef) LeaseGrant {
 	t.Helper()
 	assignment, err := service.AcquireLease(context.Background(), AcquireLeaseCommand{
 		ID:   CommandID("lease-" + string(task.Workspace.ID) + "-" + string(task.ID)),
@@ -57,7 +125,9 @@ func acquireTestLease(t *testing.T, service *Agent, task TaskRef) LeaseGrant {
 	return assignment.Grant
 }
 
-func workerMeta(t *testing.T, service *Agent, task TaskRef, id CommandID, revision uint64) WorkerCommandMeta {
+func workerMeta(t *testing.T, service interface {
+	GetLease(context.Context, TaskRef) (LeaseAssignment, error)
+}, task TaskRef, id CommandID, revision uint64) WorkerCommandMeta {
 	t.Helper()
 	assignment, err := service.GetLease(context.Background(), task)
 	if err != nil {
@@ -175,13 +245,7 @@ func TestDurableTwoRoundConversationAndFreshFollowup(t *testing.T) {
 	if err := service.Close(); err != nil {
 		t.Fatal(err)
 	}
-	config := DefaultConfig()
-	config.DatabasePath = path
-	reopened, err := Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
+	reopened := openTestAgentWithConfig(t, path, DefaultConfig())
 	recovered, err := reopened.GetTask(ctx, taskRef)
 	if err != nil {
 		t.Fatal(err)
@@ -418,13 +482,11 @@ func TestTransitionsOwnerLockAndClose(t *testing.T) {
 		t.Fatalf("invalid transition changed task: %#v", unchanged)
 	}
 
-	config := DefaultConfig()
-	config.DatabasePath = path
-	if second, err := Open(ctx, config); second != nil || !errors.Is(err, ErrDatabaseInUse) {
-		if second != nil {
-			_ = second.Close()
+	if second, err := agentsqlite.Open(ctx, agentsqlite.Config{Path: path}); !errors.Is(err, agentsqlite.ErrDatabaseInUse) {
+		if err == nil {
+			_ = second.Release(ctx)
 		}
-		t.Fatalf("second owner = %#v, error = %v", second, err)
+		t.Fatalf("second SQLite owner error = %v, want ErrDatabaseInUse", err)
 	}
 	if err := service.Close(); err != nil {
 		t.Fatal(err)
@@ -435,11 +497,7 @@ func TestTransitionsOwnerLockAndClose(t *testing.T) {
 	if _, err := service.GetTask(ctx, taskRef); !errors.Is(err, ErrClosed) {
 		t.Fatalf("query closed Agent error = %v", err)
 	}
-	reopened, err := Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
+	reopened := openTestAgentWithConfig(t, path, DefaultConfig())
 	if _, err := reopened.GetTask(ctx, taskRef); err != nil {
 		t.Fatal(err)
 	}

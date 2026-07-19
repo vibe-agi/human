@@ -169,7 +169,11 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 			return fmt.Errorf("%w: task counters exhausted store integer range", ErrRevisionConflict)
 		}
 
-		now := timestampAtLeast(agent.now(), current.UpdatedAt)
+		now, err := checkedClockTime(agent.now)
+		if err != nil {
+			return err
+		}
+		now = timestampAtLeast(now, current.UpdatedAt)
 		workspaceRef := command.Task.Workspace
 		if _, err := tx.InsertWorkspaceHead(StoreWorkspaceHeadRecord{Head: WorkspaceHead{
 			Workspace: workspaceRef, ConfirmedRevision: command.ExpectedBaseRevision, UpdatedAt: now,
@@ -348,7 +352,11 @@ func (agent *Agent) RecordApplyReceipt(ctx context.Context, command RecordApplyR
 		if err != nil {
 			return err
 		}
-		now := timestampAtLeast(agent.now(), artifact.FrozenAt, *artifact.PublishedAt)
+		now, err := checkedClockTime(agent.now)
+		if err != nil {
+			return err
+		}
+		now = timestampAtLeast(now, artifact.FrozenAt, *artifact.PublishedAt)
 		receipt = ApplyReceipt{
 			ID: command.Receipt, Artifact: command.Artifact,
 			ArtifactDigest: command.ArtifactDigest, BaseRevision: command.BaseRevision,

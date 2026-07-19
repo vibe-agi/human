@@ -1,9 +1,10 @@
-package agent
+package agent_test
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	. "github.com/vibe-agi/human/agent"
 	"reflect"
 	"sync"
 	"testing"
@@ -151,17 +152,7 @@ func TestClaimLeaseExactReplaySurvivesProgressTerminalFenceAndReopen(t *testing.
 	if err := service.Close(); err != nil {
 		t.Fatal(err)
 	}
-	config := DefaultConfig()
-	config.DatabasePath = path
-	reopened, err := Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := reopened.Close(); err != nil {
-			t.Errorf("close reopened Agent: %v", err)
-		}
-	})
+	reopened := openTestAgentWithConfig(t, path, DefaultConfig())
 	for _, test := range []struct {
 		command ClaimLeaseCommand
 		want    LeaseAssignment

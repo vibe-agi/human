@@ -275,7 +275,7 @@ func validateTaskQueryCursor(cursor TaskQueryCursor) error {
 
 func validateQueryTime(label string, value time.Time) error {
 	if value.IsZero() || !fromUnixNano(unixNano(value.UTC())).Equal(value.UTC()) {
-		return fmt.Errorf("%w: %s is outside SQLite nanosecond range", ErrInvalidArgument, label)
+		return fmt.Errorf("%w: %s is outside Store nanosecond range", ErrInvalidArgument, label)
 	}
 	return nil
 }

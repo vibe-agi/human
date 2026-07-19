@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -72,7 +71,11 @@ func (agent *Agent) AcquireLease(ctx context.Context, command AcquireLeaseComman
 			return ErrLeaseFenceExhausted
 		}
 		nextFence := record.Lease.Fence + 1
-		now := timestampAtLeast(agent.now(), record.Task.UpdatedAt, previousGrantedAt)
+		now, err := checkedClockTime(agent.now)
+		if err != nil {
+			return err
+		}
+		now = timestampAtLeast(now, record.Task.UpdatedAt, previousGrantedAt)
 		assignment = LeaseAssignment{
 			Grant: LeaseGrant{Task: command.Task, Worker: command.Worker, Fence: nextFence},
 			Task:  cloneTask(record.Task), GrantedAt: now,
@@ -178,7 +181,10 @@ func (agent *Agent) FenceLease(ctx context.Context, command FenceLeaseCommand) e
 		if !changed {
 			return ErrStaleLease
 		}
-		now := agent.now().UTC()
+		now, err := checkedClockTime(agent.now)
+		if err != nil {
+			return err
+		}
 		return recordJSONCommandToStore(
 			tx, command.Grant.Task.Workspace.Authority, command.ID,
 			"fence_lease", digest, "lease_grant", command.Grant, now,
@@ -298,193 +304,6 @@ func (agent *Agent) ListLeases(
 		return LeasePage{}, err
 	}
 	return page, nil
-}
-
-func loadLeaseAssignment(ctx context.Context, tx *sql.Tx, ref TaskRef) (LeaseAssignment, error) {
-	task, err := loadTask(ctx, tx, ref)
-	if err != nil {
-		return LeaseAssignment{}, err
-	}
-	owner, fence, grantedAt, err := loadLeaseState(ctx, tx, ref)
-	if err != nil {
-		return LeaseAssignment{}, err
-	}
-	if owner == "" {
-		return LeaseAssignment{}, ErrLeaseNotFound
-	}
-	assignment := LeaseAssignment{
-		Grant: LeaseGrant{Task: ref, Worker: owner, Fence: fence},
-		Task:  task, GrantedAt: grantedAt,
-	}
-	if err := validateLeaseAssignment(assignment); err != nil {
-		return LeaseAssignment{}, err
-	}
-	return assignment, nil
-}
-
-func loadLeaseState(
-	ctx context.Context,
-	query queryer,
-	ref TaskRef,
-) (WorkerID, LeaseFence, time.Time, error) {
-	var ownerValue string
-	var fenceValue int64
-	var createdAtValue int64
-	if err := query.QueryRowContext(ctx, `
-		SELECT lease_owner, lease_fence, created_at
-		FROM agent_tasks
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ?`,
-		ref.Workspace.Authority, ref.Workspace.ID, ref.ID,
-	).Scan(&ownerValue, &fenceValue, &createdAtValue); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", 0, time.Time{}, ErrNotFound
-		}
-		return "", 0, time.Time{}, fmt.Errorf("load Agent lease state: %w", err)
-	}
-	if fenceValue < 0 {
-		return "", 0, time.Time{}, fmt.Errorf("%w: Agent lease fence is negative", ErrCorruptStore)
-	}
-	owner := WorkerID(ownerValue)
-	fence := LeaseFence(fenceValue)
-	if owner != "" {
-		if err := validateStable("worker id", ownerValue); err != nil {
-			return "", 0, time.Time{}, fmt.Errorf("%w: invalid Agent lease owner", ErrCorruptStore)
-		}
-	}
-	latestFence, err := loadLatestLeaseHistoryFence(ctx, query, ref)
-	if err != nil {
-		return "", 0, time.Time{}, err
-	}
-	if latestFence != fence {
-		return "", 0, time.Time{}, fmt.Errorf(
-			"%w: Agent lease fence differs from durable grant history", ErrCorruptStore,
-		)
-	}
-	if fence == 0 {
-		if owner != "" {
-			return "", 0, time.Time{}, fmt.Errorf("%w: Agent lease owner has zero fence", ErrCorruptStore)
-		}
-		return owner, fence, time.Time{}, nil
-	}
-	historyWorker, grantedAt, err := loadLeaseGrantHistory(ctx, query, ref, fence)
-	if err != nil {
-		return "", 0, time.Time{}, err
-	}
-	if owner != "" && historyWorker != owner {
-		return "", 0, time.Time{}, fmt.Errorf(
-			"%w: current Agent lease owner differs from durable grant", ErrCorruptStore,
-		)
-	}
-	if grantedAt.Before(fromUnixNano(createdAtValue)) {
-		return "", 0, time.Time{}, fmt.Errorf(
-			"%w: Agent lease predates its Task", ErrCorruptStore,
-		)
-	}
-	return owner, fence, grantedAt, nil
-}
-
-func requireCurrentLease(ctx context.Context, query queryer, grant LeaseGrant) error {
-	if err := validateLeaseGrant(grant); err != nil {
-		return err
-	}
-	owner, fence, _, err := loadLeaseState(ctx, query, grant.Task)
-	if err != nil {
-		return err
-	}
-	if owner != grant.Worker || fence != grant.Fence {
-		return ErrStaleLease
-	}
-	return nil
-}
-
-func verifyLeaseHistory(ctx context.Context, tx *sql.Tx, assignment LeaseAssignment) error {
-	grantedAt, err := verifyLeaseGrantHistory(ctx, tx, assignment.Grant)
-	if err != nil {
-		return err
-	}
-	if !grantedAt.Equal(assignment.GrantedAt) {
-		return fmt.Errorf("%w: replayed Agent lease differs from history", ErrCorruptStore)
-	}
-	return nil
-}
-
-func loadLatestLeaseHistoryFence(
-	ctx context.Context,
-	query queryer,
-	ref TaskRef,
-) (LeaseFence, error) {
-	var fenceValue int64
-	if err := query.QueryRowContext(ctx, `
-		SELECT COALESCE(MAX(fence), 0)
-		FROM agent_lease_grants
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ?`,
-		ref.Workspace.Authority, ref.Workspace.ID, ref.ID,
-	).Scan(&fenceValue); err != nil {
-		return 0, fmt.Errorf("load latest Agent lease history: %w", err)
-	}
-	if fenceValue < 0 {
-		return 0, fmt.Errorf("%w: Agent lease history has a negative fence", ErrCorruptStore)
-	}
-	return LeaseFence(fenceValue), nil
-}
-
-func loadLeaseGrantHistory(
-	ctx context.Context,
-	query queryer,
-	ref TaskRef,
-	fence LeaseFence,
-) (WorkerID, time.Time, error) {
-	var workerValue string
-	var grantedAtValue int64
-	if err := query.QueryRowContext(ctx, `
-		SELECT worker_id, granted_at
-		FROM agent_lease_grants
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND fence = ?`,
-		ref.Workspace.Authority, ref.Workspace.ID, ref.ID, fence,
-	).Scan(&workerValue, &grantedAtValue); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", time.Time{}, fmt.Errorf(
-				"%w: Agent lease has no durable grant history", ErrCorruptStore,
-			)
-		}
-		return "", time.Time{}, fmt.Errorf("load Agent lease grant history: %w", err)
-	}
-	if err := validateStable("worker id", workerValue); err != nil {
-		return "", time.Time{}, fmt.Errorf("%w: invalid Agent lease history worker", ErrCorruptStore)
-	}
-	return WorkerID(workerValue), fromUnixNano(grantedAtValue), nil
-}
-
-func verifyLeaseGrantHistory(
-	ctx context.Context,
-	query queryer,
-	grant LeaseGrant,
-) (time.Time, error) {
-	worker, grantedAt, err := loadLeaseGrantHistory(ctx, query, grant.Task, grant.Fence)
-	if err != nil {
-		return time.Time{}, err
-	}
-	if worker != grant.Worker {
-		return time.Time{}, fmt.Errorf(
-			"%w: Agent lease differs from durable grant history", ErrCorruptStore,
-		)
-	}
-	var createdAtValue int64
-	if err := query.QueryRowContext(ctx, `
-		SELECT created_at
-		FROM agent_tasks
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ?`,
-		grant.Task.Workspace.Authority, grant.Task.Workspace.ID, grant.Task.ID,
-	).Scan(&createdAtValue); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return time.Time{}, fmt.Errorf("%w: Agent lease Task is missing", ErrCorruptStore)
-		}
-		return time.Time{}, fmt.Errorf("load Agent lease Task timestamp: %w", err)
-	}
-	if grantedAt.Before(fromUnixNano(createdAtValue)) {
-		return time.Time{}, fmt.Errorf("%w: Agent lease predates its Task", ErrCorruptStore)
-	}
-	return grantedAt, nil
 }
 
 func validateLeaseGrant(grant LeaseGrant) error {

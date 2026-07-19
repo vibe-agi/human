@@ -20,8 +20,9 @@ import (
 
 // AgentStoreFactory opens a new, empty Agent Store for one conformance
 // subtest. Every invocation must return an independent Store. release must be
-// non-nil and release every resource opened by the factory; TestAgentStore
-// invokes it exactly once even when the subtest fails.
+// non-nil, idempotent, and release every resource opened by the factory.
+// TestAgentStore always invokes it during cleanup and may invoke it earlier to
+// verify the released Store's error classification.
 //
 // A provider normally exposes a test like:
 //
@@ -44,9 +45,10 @@ type AgentStoreFactory func(
 // TestAgentStore runs the mandatory Agent Store primitive conformance suite.
 // It verifies the major-contract foundations on which Agent commands depend:
 // metadata negotiation, callback cardinality, atomic rollback, transactional
-// read-your-writes, task CAS and lease fencing, immutable insert conflicts,
-// stable View snapshots, opaque-byte ownership and bounded reads, and strict
-// serialization under concurrent Updates.
+// read-your-writes, every StoreView/StoreTx primitive, scan ordering and
+// pagination, task/Artifact/Workspace CAS, lease fencing, typed immutable
+// insert conflicts, stable View snapshots, opaque-byte ownership and bounded
+// reads, and strict serialization under concurrent Updates.
 //
 // This is a black-box suite. Passing it is necessary but does not replace a
 // provider's durability, fault-injection, migration, and infrastructure tests.
@@ -58,19 +60,28 @@ func TestAgentStore(t *testing.T, factory AgentStoreFactory) {
 
 	tests := []struct {
 		name string
-		run  func(context.Context, *testing.T, agent.Store)
+		run  func(context.Context, *testing.T, agent.Store, framework.ReleaseFunc)
 	}{
-		{"description_and_contract", testAgentStoreDescription},
-		{"callback_exactly_once", testAgentStoreCallbackExactlyOnce},
-		{"update_rollback", testAgentStoreUpdateRollback},
-		{"read_your_writes", testAgentStoreReadYourWrites},
-		{"task_compare_and_swap", testAgentStoreTaskCAS},
-		{"immutable_insert_conflict", testAgentStoreImmutableConflict},
-		{"stable_view_snapshot", testAgentStoreSnapshot},
-		{"command_bytes_and_limit", testAgentStoreCommandBytes},
-		{"message_bytes_and_limit", testAgentStoreMessageBytes},
-		{"artifact_bytes_and_limit", testAgentStoreArtifactBytes},
-		{"concurrent_updates_are_serializable", testAgentStoreConcurrentUpdates},
+		{"description_and_contract", adaptAgentStoreTest(testAgentStoreDescription)},
+		{"callback_exactly_once", adaptAgentStoreTest(testAgentStoreCallbackExactlyOnce)},
+		{"context_and_callback_lifetime", adaptAgentStoreTest(testAgentStoreContextAndCallbackLifetime)},
+		{"empty_reads_and_limits", adaptAgentStoreTest(testAgentStoreEmptyReadsAndLimits)},
+		{"update_rollback", adaptAgentStoreTest(testAgentStoreUpdateRollback)},
+		{"read_your_writes", adaptAgentStoreTest(testAgentStoreReadYourWrites)},
+		{"task_compare_and_swap", adaptAgentStoreTest(testAgentStoreTaskCAS)},
+		{"immutable_insert_conflict", adaptAgentStoreTest(testAgentStoreImmutableConflict)},
+		{"typed_logical_constraints", adaptAgentStoreTest(testAgentStoreLogicalConstraints)},
+		{"task_resolution_and_scans", adaptAgentStoreTest(testAgentStoreTaskScans)},
+		{"message_and_event_scans", adaptAgentStoreTest(testAgentStoreMessageAndEventScans)},
+		{"lease_grants_claim_and_scan", adaptAgentStoreTest(testAgentStoreLeases)},
+		{"artifact_submission_and_receipt", adaptAgentStoreTest(testAgentStoreArtifactSubmissionReceipt)},
+		{"workspace_head_compare_and_swap", adaptAgentStoreTest(testAgentStoreWorkspaceHead)},
+		{"stable_view_snapshot", adaptAgentStoreTest(testAgentStoreSnapshot)},
+		{"command_bytes_and_limit", adaptAgentStoreTest(testAgentStoreCommandBytes)},
+		{"message_bytes_and_limit", adaptAgentStoreTest(testAgentStoreMessageBytes)},
+		{"artifact_bytes_and_limit", adaptAgentStoreTest(testAgentStoreArtifactBytes)},
+		{"concurrent_updates_are_serializable", adaptAgentStoreTest(testAgentStoreConcurrentUpdates)},
+		{"released_store_is_closed", testAgentStoreReleased},
 	}
 
 	for _, test := range tests {
@@ -98,8 +109,16 @@ func TestAgentStore(t *testing.T, factory AgentStoreFactory) {
 				t.Fatal("factory returned a nil release function")
 			}
 
-			test.run(ctx, t, store)
+			test.run(ctx, t, store, release)
 		})
+	}
+}
+
+func adaptAgentStoreTest(
+	test func(context.Context, *testing.T, agent.Store),
+) func(context.Context, *testing.T, agent.Store, framework.ReleaseFunc) {
+	return func(ctx context.Context, t *testing.T, store agent.Store, _ framework.ReleaseFunc) {
+		test(ctx, t, store)
 	}
 }
 

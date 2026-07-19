@@ -1,4 +1,4 @@
-package agent
+package sqlite
 
 import (
 	"context"
@@ -12,7 +12,9 @@ const (
 	agentSchemaFingerprint = "human-agent-v2-20260719a"
 )
 
-var errUnsupportedSchema = errors.New("unsupported HumanAgent sqlite schema; use a dedicated database")
+// ErrUnsupportedSchema reports a non-empty database that does not carry the
+// exact clean-break HumanAgent schema identity required by this adapter.
+var ErrUnsupportedSchema = errors.New("unsupported HumanAgent sqlite schema; use a dedicated database")
 
 const agentSchema = `
 PRAGMA foreign_keys = ON;
@@ -245,12 +247,12 @@ func requireCurrentOrEmptySchema(ctx context.Context, database *sql.DB) error {
 		SELECT version, fingerprint
 		FROM human_schema
 		WHERE component = 'agent'`).Scan(&version, &fingerprint); err != nil {
-		return fmt.Errorf("%w: missing agent schema marker", errUnsupportedSchema)
+		return fmt.Errorf("%w: missing agent schema marker", ErrUnsupportedSchema)
 	}
 	if version != agentSchemaVersion || fingerprint != agentSchemaFingerprint {
 		return fmt.Errorf(
 			"%w: version %d (%q), want %d (%q)",
-			errUnsupportedSchema, version, fingerprint,
+			ErrUnsupportedSchema, version, fingerprint,
 			agentSchemaVersion, agentSchemaFingerprint,
 		)
 	}

@@ -1,8 +1,9 @@
-package agent
+package agent_test
 
 import (
 	"context"
 	"errors"
+	. "github.com/vibe-agi/human/agent"
 	"testing"
 	"time"
 )
@@ -140,7 +141,9 @@ func TestTaskSnapshotProvidesNoGapEventCursor(t *testing.T) {
 
 func createQueryTask(
 	t *testing.T,
-	service *Agent,
+	service interface {
+		CreateTask(context.Context, CreateTaskCommand) (Task, error)
+	},
 	contextRef ContextRef,
 	ref TaskRef,
 	commandID,

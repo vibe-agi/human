@@ -1,9 +1,10 @@
-package agent
+package agent_test
 
 import (
 	"context"
 	"database/sql"
 	"errors"
+	. "github.com/vibe-agi/human/agent"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -12,7 +13,11 @@ import (
 	"github.com/vibe-agi/human/workspace"
 )
 
-func createWorkingTask(t *testing.T, service *Agent, contextRef ContextRef, taskRef TaskRef, suffix string) Task {
+func createWorkingTask(t *testing.T, service interface {
+	CreateTask(context.Context, CreateTaskCommand) (Task, error)
+	AcquireLease(context.Context, AcquireLeaseCommand) (LeaseAssignment, error)
+	AcceptTask(context.Context, WorkerTaskCommand) (Task, error)
+}, contextRef ContextRef, taskRef TaskRef, suffix string) Task {
 	t.Helper()
 	ctx := context.Background()
 	created, err := service.CreateTask(ctx, createCommand(
@@ -32,7 +37,9 @@ func createWorkingTask(t *testing.T, service *Agent, contextRef ContextRef, task
 	return working
 }
 
-func freezeCommand(t *testing.T, service *Agent, suffix string, task Task, base workspace.Revision, data []byte) FreezeArtifactCommand {
+func freezeCommand(t *testing.T, service interface {
+	GetLease(context.Context, TaskRef) (LeaseAssignment, error)
+}, suffix string, task Task, base workspace.Revision, data []byte) FreezeArtifactCommand {
 	t.Helper()
 	return FreezeArtifactCommand{
 		Meta: workerMeta(t, service, task.Ref, CommandID("freeze-"+suffix), task.Revision),
@@ -160,13 +167,7 @@ func TestArtifactFreezePublishReceiptAndRecovery(t *testing.T) {
 	if err := service.Close(); err != nil {
 		t.Fatal(err)
 	}
-	config := DefaultConfig()
-	config.DatabasePath = path
-	reopened, err := Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
+	reopened := openTestAgentWithConfig(t, path, DefaultConfig())
 	recovered, err := reopened.GetArtifact(ctx, frozen.Artifact.Ref)
 	if err != nil {
 		t.Fatal(err)
@@ -184,12 +185,8 @@ func TestFreezeReplayIgnoresLoweredAdmissionLimit(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "agent.db")
 	config := DefaultConfig()
-	config.DatabasePath = path
 	config.MaxArtifactBytes = 2
-	service, err := Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
+	service := openTestAgentWithConfig(t, path, config)
 	contextRef, taskRef := refs("tenant-a", "limit-context", "limit-workspace", "limit-task")
 	working := createWorkingTask(t, service, contextRef, taskRef, "limit")
 	command := freezeCommand(t, service, "limit", working, "limit-base", []byte("{}"))
@@ -202,11 +199,7 @@ func TestFreezeReplayIgnoresLoweredAdmissionLimit(t *testing.T) {
 	}
 
 	config.MaxArtifactBytes = 1
-	reopened, err := Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
+	reopened := openTestAgentWithConfig(t, path, config)
 	replayed, err := reopened.FreezeArtifact(ctx, command)
 	if err != nil {
 		t.Fatalf("exact replay after lowered admission limit: %v", err)
@@ -603,13 +596,7 @@ func TestReceiptReadAndReplayRejectArtifactIdentityDrift(t *testing.T) {
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	config := DefaultConfig()
-	config.DatabasePath = path
-	reopened, err := Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
+	reopened := openTestAgentWithConfig(t, path, DefaultConfig())
 	if _, err := reopened.GetApplyReceipt(ctx, artifactRef); !errors.Is(err, ErrCorruptStore) {
 		t.Fatalf("drifted receipt read error = %v", err)
 	}

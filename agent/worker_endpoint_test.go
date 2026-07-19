@@ -1,8 +1,9 @@
-package agent
+package agent_test
 
 import (
 	"context"
 	"errors"
+	. "github.com/vibe-agi/human/agent"
 	"reflect"
 	"strconv"
 	"sync"
@@ -22,7 +23,7 @@ func TestWorkerEndpointClaimsRecoversAndDoesNotFenceOnDisconnect(t *testing.T) {
 	)); err != nil {
 		t.Fatal(err)
 	}
-	endpoint := openTestWorkerEndpoint(t, service)
+	endpoint := openTestWorkerEndpoint(t, service.Agent)
 	principal := AuthenticatedWorker{Authority: "authority-a", Worker: "worker-a", Session: "session-a"}
 	connection := openTestWorkerConnection(t, endpoint, principal)
 
@@ -116,7 +117,7 @@ func TestWorkerEndpointMapsAllWorkerEventsAndReplaysCommittedACK(t *testing.T) {
 		grants[name] = assignment.Grant
 	}
 
-	endpoint := openTestWorkerEndpoint(t, service)
+	endpoint := openTestWorkerEndpoint(t, service.Agent)
 	principal := AuthenticatedWorker{
 		Authority: contextRef.Authority, Worker: "worker-events", Session: "session-events",
 	}
@@ -193,27 +194,6 @@ func TestWorkerEndpointMapsAllWorkerEventsAndReplaysCommittedACK(t *testing.T) {
 	if replay, err := reconnected.CommitEvent(ctx, accept); err != nil || replay.Decision != WorkerEventACK {
 		t.Fatalf("cross-reconnect committed ACK replay = %#v, %v", replay, err)
 	}
-	implementation := reconnected.(*agentWorkerConnection)
-	digest, err := workerEventDeliveryDigest(accept)
-	if err != nil {
-		t.Fatal(err)
-	}
-	implementation.commitMu.Lock()
-	for index := 0; index <= workerEventReceiptLimit; index++ {
-		id := WorkerDeliveryID("cache-fill-" + strconv.Itoa(index))
-		implementation.rememberEventReceipt(id, digest, WorkerEventReceipt{
-			Delivery: id, Event: accept.Event.ID, Decision: WorkerEventACK,
-		})
-	}
-	cacheSize := len(implementation.receipts)
-	_, originalStillCached := implementation.receipts[accept.ID]
-	implementation.commitMu.Unlock()
-	if cacheSize != workerEventReceiptLimit || originalStillCached {
-		t.Fatalf("receipt cache size=%d original_cached=%t", cacheSize, originalStillCached)
-	}
-	if replay, err := reconnected.CommitEvent(ctx, accept); err != nil || replay.Decision != WorkerEventACK {
-		t.Fatalf("durable ACK replay after cache eviction = %#v, %v", replay, err)
-	}
 	crossReconnectConflict := accept
 	crossReconnectConflict.ID = "delivery-cross-reconnect-conflict"
 	crossReconnectConflict.Event.Kind = WorkerEventFailTask
@@ -255,7 +235,7 @@ func TestWorkerEndpointNACKsDeterministicFailuresWithoutClosingConnection(t *tes
 		t.Fatal(err)
 	}
 
-	endpoint := openTestWorkerEndpoint(t, service)
+	endpoint := openTestWorkerEndpoint(t, service.Agent)
 	principal := AuthenticatedWorker{
 		Authority: contextRef.Authority, Worker: "worker-nack", Session: "session-nack",
 	}
@@ -442,7 +422,7 @@ func TestWorkerEndpointLeavesAmbiguousTransientAndCanceledEventsUnsettled(t *tes
 
 func TestWorkerEndpointRepeatedOpenShutdownHasNoStuckSession(t *testing.T) {
 	service, _ := openTestAgent(t)
-	endpoint := openTestWorkerEndpoint(t, service)
+	endpoint := openTestWorkerEndpoint(t, service.Agent)
 	ctx := context.Background()
 	for index := 0; index < 50; index++ {
 		connection, err := endpoint.OpenWorker(ctx, AuthenticatedWorker{

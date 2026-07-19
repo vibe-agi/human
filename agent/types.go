@@ -38,7 +38,6 @@ var (
 	ErrLeaseFenceExhausted = errors.New("agent task lease fence exhausted")
 	ErrCorruptStore        = errors.New("corrupt agent store")
 	ErrProtectionDowngrade = errors.New("agent protected record was replaced by plaintext")
-	ErrDatabaseInUse       = errors.New("agent database is already held by another running instance")
 	ErrClosed              = errors.New("agent is closed")
 )
 
@@ -70,8 +69,8 @@ type WorkspaceRef struct {
 }
 
 // TaskRef is the durable Agent task key. The "agent" surface discriminator is
-// implicit in this package and in the SQLite table namespace; it never aliases
-// a completion task key.
+// implicit in this package and in its Store namespace; it never aliases a
+// completion task key.
 type TaskRef struct {
 	Workspace WorkspaceRef `json:"workspace"`
 	ID        TaskID       `json:"id"`
@@ -212,7 +211,7 @@ type TaskQueryCursor struct {
 
 // TaskQuery filters an authenticated Authority's Tasks. Zero Context and State
 // values mean "any". UpdatedAtOrAfter is inclusive. TotalSize in the result is
-// evaluated in the same SQLite read transaction as the returned page.
+// evaluated in the same stable Store snapshot as the returned page.
 type TaskQuery struct {
 	Context          ContextID        `json:"context,omitempty"`
 	State            TaskState        `json:"state,omitempty"`
@@ -304,7 +303,7 @@ type FenceLeaseCommand struct {
 }
 
 // WorkerCommandMeta couples ordinary command idempotency/revision CAS with the
-// grant that must still be current at the exact SQLite commit boundary.
+// grant that must still be current at the exact Store commit boundary.
 type WorkerCommandMeta struct {
 	ID               CommandID  `json:"id"`
 	ExpectedRevision uint64     `json:"expected_revision"`

@@ -1,8 +1,9 @@
-package agent
+package agent_test
 
 import (
 	"context"
 	"errors"
+	. "github.com/vibe-agi/human/agent"
 	"testing"
 )
 

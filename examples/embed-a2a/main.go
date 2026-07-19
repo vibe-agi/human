@@ -9,7 +9,7 @@
 //
 // This example intentionally does not listen on a socket and does not create a
 // fake worker. A real host owns the HTTP server and connects a separately
-// authenticated HumanAgent worker transport when that product surface exists.
+// authenticated HumanAgent worker transport.
 package main
 
 import (
@@ -26,6 +26,7 @@ import (
 	human "github.com/vibe-agi/human"
 	"github.com/vibe-agi/human/a2a"
 	"github.com/vibe-agi/human/agent"
+	agentsqlite "github.com/vibe-agi/human/agent/sqlite"
 )
 
 const (
@@ -42,17 +43,23 @@ func main() {
 }
 
 func run() (resultErr error) {
-	config := human.DefaultAgentConfig()
-	config.DatabasePath = os.Getenv("HUMAN_EMBED_A2A_DB")
-	if config.DatabasePath == "" {
+	databasePath := os.Getenv("HUMAN_EMBED_A2A_DB")
+	if databasePath == "" {
 		userConfig, err := os.UserConfigDir()
 		if err != nil {
 			return err
 		}
-		config.DatabasePath = filepath.Join(userConfig, "human", "examples", "a2a-agent.db")
+		databasePath = filepath.Join(userConfig, "human", "examples", "a2a-agent.db")
 	}
 
-	service, err := human.NewAgent(context.Background(), config)
+	ctx := context.Background()
+	store, err := agentsqlite.Open(ctx, agentsqlite.Config{Path: databasePath})
+	if err != nil {
+		return fmt.Errorf("open embedded HumanAgent Store: %w", err)
+	}
+	config := human.DefaultAgentConfig()
+	config.Store = store
+	service, err := human.NewAgent(ctx, config)
 	if err != nil {
 		return fmt.Errorf("open embedded HumanAgent: %w", err)
 	}

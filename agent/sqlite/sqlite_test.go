@@ -49,7 +49,7 @@ func TestOwnedResourceReleaseAndReopen(t *testing.T) {
 		t.Fatalf("Store provider = %q, want sqlite", got)
 	}
 
-	if second, err := agentsqlite.Open(t.Context(), agentsqlite.Config{Path: path}); !errors.Is(err, agent.ErrDatabaseInUse) {
+	if second, err := agentsqlite.Open(t.Context(), agentsqlite.Config{Path: path}); !errors.Is(err, agentsqlite.ErrDatabaseInUse) {
 		if err == nil {
 			_ = second.Release(t.Context())
 		}
@@ -77,19 +77,11 @@ func TestOwnedResourceReleaseAndReopen(t *testing.T) {
 	}
 }
 
-func TestAgentDatabasePathUsesSameSQLiteOwnership(t *testing.T) {
+func TestAgentConsumesOwnedSQLiteStore(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agent.db")
 	resource, err := agentsqlite.Open(t.Context(), agentsqlite.Config{Path: path})
 	if err != nil {
 		t.Fatal(err)
-	}
-	config := agent.DefaultConfig()
-	config.DatabasePath = path
-	if service, err := agent.Open(t.Context(), config); !errors.Is(err, agent.ErrDatabaseInUse) {
-		if service != nil {
-			_ = service.Close()
-		}
-		t.Fatalf("Agent Open while adapter owns path = %v, want ErrDatabaseInUse", err)
 	}
 	composedConfig := agent.DefaultConfig()
 	composedConfig.Store = resource
@@ -105,13 +97,6 @@ func TestAgentDatabasePathUsesSameSQLiteOwnership(t *testing.T) {
 		t.Fatalf("Agent did not release owned SQLite Store: %v", err)
 	}
 
-	service, err := agent.Open(t.Context(), config)
-	if err != nil {
-		t.Fatalf("Agent Open after adapter release: %v", err)
-	}
-	if err := service.Close(); err != nil {
-		t.Fatal(err)
-	}
 	reopened, err := agentsqlite.Open(t.Context(), agentsqlite.Config{Path: path})
 	if err != nil {
 		t.Fatalf("adapter Open after Agent Close: %v", err)

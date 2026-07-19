@@ -6,10 +6,9 @@ import (
 	"github.com/vibe-agi/human/agent"
 )
 
-// AgentConfig configures the durable, task-oriented HumanAgent surface. Supply
-// exactly one of DatabasePath (the official SQLite adapter) or Store (a
-// borrowed/owned custom agent.Store resource). NewAgent never creates hidden
-// process-global state.
+// AgentConfig configures the durable, task-oriented HumanAgent surface. Store
+// is required and may be any implementation of agent.Store. NewAgent never
+// chooses a physical driver or creates hidden process-global state.
 type AgentConfig = agent.Config
 
 // Agent owns the durable HumanAgent task lifecycle. It does not start a
@@ -18,7 +17,7 @@ type AgentConfig = agent.Config
 type Agent = agent.Agent
 
 // DefaultAgentConfig returns the durable Agent defaults without selecting a
-// persistence identity. Set DatabasePath or Store before calling NewAgent.
+// persistence identity. Set Store before calling NewAgent.
 func DefaultAgentConfig() AgentConfig {
 	return agent.DefaultConfig()
 }
