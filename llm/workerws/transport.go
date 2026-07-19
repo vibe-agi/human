@@ -55,7 +55,10 @@ type Identity struct {
 
 // Authenticator belongs to this HTTP adapter, not to the HumanLLM domain. An
 // embedding host may inspect mTLS, bearer tokens, cookies, or its own user
-// system. Worker identity is never trusted from a WebSocket JSON body.
+// system. Worker identity is never trusted from a WebSocket JSON body. The
+// implementation is borrowed until the transport runtime reaches Done, called
+// concurrently, and must honor context cancellation. The request is borrowed
+// for the call and must not be retained or mutated.
 type Authenticator interface {
 	AuthenticateWorker(context.Context, *http.Request) (Identity, error)
 }

@@ -1209,6 +1209,11 @@ func llmConformanceJournalAssignment(id llm.WorkerDeliveryID) workerws.JournalAs
 			},
 			Lease:    llm.WorkerLease{ID: "lease-a", Owner: "worker-a"},
 			Boundary: llm.AssignmentAfterResponse,
+			Task: llm.TaskContext{
+				TaskID: "task-a", WorkspaceKey: "workspace-a", CapabilityTier: llm.TierWorkspace,
+				HarnessID: "harness-a", HarnessVersion: "1", HarnessSessionID: "session-a",
+				WorkspaceRoot: "/workspace/a",
+			},
 			Request: llm.Request{
 				Model: "human", Stream: true,
 				Messages: []llm.Message{{

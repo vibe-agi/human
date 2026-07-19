@@ -399,7 +399,7 @@ func appendItem(request *canonical.Request, item inputItem, raw json.RawMessage)
 			return errors.New("function_call_output requires output")
 		}
 		var output any
-		if err := json.Unmarshal(item.Output, &output); err != nil {
+		if err := dialect.DecodeJSON(item.Output, &output); err != nil {
 			return fmt.Errorf("function_call_output output: %w", err)
 		}
 		request.Messages = append(request.Messages, canonical.Message{
@@ -421,7 +421,7 @@ func decodeToolArguments(value string) (map[string]any, error) {
 		return map[string]any{}, nil
 	}
 	var input map[string]any
-	if err := json.Unmarshal([]byte(value), &input); err != nil {
+	if err := dialect.DecodeJSON([]byte(value), &input); err != nil {
 		return nil, err
 	}
 	if input == nil {

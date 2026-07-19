@@ -21,6 +21,44 @@ func (*store) Description() llm.StoreDescription {
 	}
 }
 
+func (store *store) Bind(ctx context.Context, binding llm.StoreBinding) error {
+	if ctx == nil {
+		return invalidArgument("binding context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := binding.Validate(); err != nil {
+		return err
+	}
+	if store == nil || store.database == nil || store.closed.Load() {
+		return llm.ErrStoreClosed
+	}
+	transaction, err := store.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return fmt.Errorf("begin HumanLLM Store binding: %w", err)
+	}
+	defer transaction.Rollback()
+	var existing string
+	err = transaction.QueryRowContext(ctx, `
+		SELECT deployment_id FROM llm_store_binding WHERE singleton = 1`).Scan(&existing)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err = transaction.ExecContext(ctx, `
+			INSERT INTO llm_store_binding(singleton, deployment_id) VALUES (1, ?)`, binding.DeploymentID); err != nil {
+			return fmt.Errorf("record HumanLLM Store binding: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("load HumanLLM Store binding: %w", err)
+	case existing != binding.DeploymentID:
+		return conflict(llm.StoreConstraintDeploymentBinding, binding.DeploymentID)
+	}
+	if err := transaction.Commit(); err != nil {
+		return &llm.StoreCommitUnknownError{Cause: err}
+	}
+	return nil
+}
+
 func (store *store) View(ctx context.Context, callback func(llm.StoreView) error) error {
 	if err := store.validateOperation(ctx, callback != nil); err != nil {
 		return err

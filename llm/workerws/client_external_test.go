@@ -791,6 +791,11 @@ func clientTestAssignment(id llm.WorkerDeliveryID) llm.WorkerAssignmentDelivery 
 		Assignment: llm.Assignment{
 			Identity: clientTestIdentity(), Lease: llm.WorkerLease{ID: "lease-a", Owner: "worker-a"},
 			Boundary: llm.AssignmentAfterResponse,
+			Task: llm.TaskContext{
+				TaskID: "task-a", WorkspaceKey: "workspace-a", CapabilityTier: llm.TierWorkspace,
+				HarnessID: "harness-a", HarnessVersion: "1", HarnessSessionID: "session-a",
+				WorkspaceRoot: "/workspace/a",
+			},
 			Request: llm.Request{
 				Model: "human", Stream: true,
 				Messages: []llm.Message{{Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "Help me."}}}},

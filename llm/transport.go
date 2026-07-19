@@ -150,7 +150,9 @@ func (principal AuthenticatedWorker) Validate() error {
 // OpenWorker is called only after transport authentication and policy checks.
 // Its context bounds initialization only; the returned connection has an
 // independent lifecycle. The transport shuts down that connection when the
-// wire session ends, but never shuts down the endpoint itself.
+// wire session ends, but never shuts down the endpoint itself. Implementations
+// are safe for concurrent OpenWorker calls. A failed call returns no live
+// connection and transfers no lifecycle obligation to the caller.
 type WorkerEndpoint interface {
 	OpenWorker(context.Context, AuthenticatedWorker) (WorkerConnection, error)
 }
@@ -268,7 +270,10 @@ type Assignment struct {
 	Identity CompletionIdentity `json:"identity"`
 	Lease    WorkerLease        `json:"lease"`
 	Boundary AssignmentBoundary `json:"boundary"`
-	Request  Request            `json:"request"`
+	// Task is authenticated workspace/capability context. It travels inside the
+	// assignment so WorkspaceRoot is covered by the worker payload gate.
+	Task    TaskContext `json:"task"`
+	Request Request     `json:"request"`
 }
 
 // ValidateFor verifies canonical request ownership and the admission/response
@@ -287,6 +292,17 @@ func (assignment Assignment) ValidateFor(principal AuthenticatedWorker) error {
 	}
 	if assignment.Lease.Owner != principal.WorkerID {
 		return fmt.Errorf("%w: assignment lease belongs to another worker", ErrWorkerDelivery)
+	}
+	task := normalizeTaskContext(assignment.Task)
+	if err := validateTaskContext(task); err != nil {
+		return fmt.Errorf("%w: invalid task context: %v", ErrWorkerDelivery, err)
+	}
+	if task.CapabilityTier == TierChat {
+		if assignment.Identity.WorkspaceKey != "" {
+			return fmt.Errorf("%w: chat assignment has a workspace identity", ErrWorkerDelivery)
+		}
+	} else if task.TaskID != assignment.Identity.TaskID || task.WorkspaceKey != assignment.Identity.WorkspaceKey {
+		return fmt.Errorf("%w: assignment task context does not match identity", ErrWorkerDelivery)
 	}
 	if err := assignment.Request.Validate(); err != nil {
 		return fmt.Errorf("%w: invalid canonical request: %v", ErrWorkerDelivery, err)

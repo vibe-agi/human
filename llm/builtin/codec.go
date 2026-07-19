@@ -156,10 +156,6 @@ func (encoder *encoder) Start() ([][]byte, error) {
 	return cloneFrames(frames), err
 }
 
-func (encoder *encoder) Heartbeat() []byte {
-	return bytes.Clone(encoder.inner.Heartbeat())
-}
-
 func (encoder *encoder) Encode(event llm.Event, seed llm.EventSeed) ([][]byte, bool, error) {
 	if err := seed.Validate(); err != nil {
 		return nil, false, err
@@ -363,6 +359,7 @@ func cloneJSONValue(value any) (any, error) {
 	}
 	var cloned any
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
 	if err := decoder.Decode(&cloned); err != nil {
 		return nil, err
 	}

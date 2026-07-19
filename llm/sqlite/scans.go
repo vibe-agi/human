@@ -26,7 +26,7 @@ func (view *view) ScanResponseEvents(
 		return nil, err
 	}
 	query := `
-		SELECT sequence, kind, worker_event_id, worker_event_digest,
+		SELECT sequence, kind, worker_id, worker_event_id, worker_event_digest,
 		       CASE WHEN length(data) <= ? THEN data ELSE NULL END,
 		       length(data), data_is_nil, length(data) <= ?, created_at
 		FROM llm_response_events
@@ -65,7 +65,7 @@ func (view *view) ScanResponseEvents(
 		var size, created int64
 		var dataIsNil, fits int
 		if err := rows.Scan(
-			&record.Sequence, &record.Kind, &record.WorkerEventID,
+			&record.Sequence, &record.Kind, &record.Worker, &record.WorkerEventID,
 			&record.WorkerEventDigest, &data, &size, &dataIsNil, &fits, &created,
 		); err != nil {
 			return nil, fmt.Errorf("materialize HumanLLM response event: %w", err)
@@ -175,8 +175,8 @@ func (view *view) ScanRecovery(scan llm.StoreRecoveryScan) ([]llm.StoreRecoveryR
 		FROM llm_requests AS r
 		JOIN llm_tasks AS t
 		  ON t.caller_id = r.task_caller_id AND t.task_id = r.task_id
-		WHERE (
-		  (r.recovery_quarantined = 0 AND r.response_complete = 0)
+		WHERE r.recovery_quarantined = 0 AND (
+		  r.response_complete = 0
 		  OR EXISTS (
 		    SELECT 1 FROM llm_response_events AS e
 		    WHERE e.caller_id = r.caller_id
@@ -187,6 +187,7 @@ func (view *view) ScanRecovery(scan llm.StoreRecoveryScan) ([]llm.StoreRecoveryR
 		        WHERE w.caller_id = e.caller_id
 		          AND w.idempotency_key = e.idempotency_key
 		          AND w.event_id = e.worker_event_id
+		          AND w.worker_id = e.worker_id
 		          AND w.digest = e.worker_event_digest
 		      )
 		  )
@@ -267,7 +268,7 @@ func (view *view) ScanRetention(scan llm.StoreRetentionScan) ([]llm.StoreRetenti
 		       response_complete, recovery_quarantined, last_event_sequence,
 		       revision, created_at, completed_at, payload_pruned_at,
 		       COALESCE(completed_at, created_at),
-		       EXISTS (
+		       CASE WHEN recovery_quarantined = 1 THEN 0 ELSE EXISTS (
 		         SELECT 1 FROM llm_response_events AS e
 		         WHERE e.caller_id = llm_requests.caller_id
 		           AND e.idempotency_key = llm_requests.idempotency_key
@@ -277,9 +278,10 @@ func (view *view) ScanRetention(scan llm.StoreRetentionScan) ([]llm.StoreRetenti
 		             WHERE w.caller_id = e.caller_id
 		               AND w.idempotency_key = e.idempotency_key
 		               AND w.event_id = e.worker_event_id
+		               AND w.worker_id = e.worker_id
 		               AND w.digest = e.worker_event_digest
 		           )
-		       )
+		       ) END
 		FROM llm_requests
 		WHERE response_complete = 1 AND payload_pruned_at IS NULL
 		  AND COALESCE(completed_at, created_at) <= ?`

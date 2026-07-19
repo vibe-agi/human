@@ -69,6 +69,24 @@ type StoreDescription struct {
 	Version  string
 }
 
+// StoreBinding permanently assigns one Store resource to one HumanLLM
+// deployment correctness namespace. DeploymentID is not repeated in every
+// logical key: applications that need multi-tenant sharing provide one isolated
+// Store resource per deployment (or an adapter which applies that namespace
+// internally).
+type StoreBinding struct {
+	DeploymentID string
+}
+
+// Validate lets custom Store implementations enforce the public binding shape
+// without importing an adapter-specific validator.
+func (binding StoreBinding) Validate() error {
+	if !workerStableKeyPattern.MatchString(binding.DeploymentID) {
+		return fmt.Errorf("%w: deployment id must be a stable key", ErrStoreInvalidArgument)
+	}
+	return nil
+}
+
 // Validate checks the implementation metadata and semantic contract.
 func (description StoreDescription) Validate() error {
 	if _, err := framework.Negotiate(description.Contract, StoreRequirements()); err != nil {
@@ -133,16 +151,17 @@ func (*StoreNotFoundError) Unwrap() error { return ErrStoreRecordNotFound }
 type StoreConstraint string
 
 const (
-	StoreConstraintTaskKey          StoreConstraint = "task_key"
-	StoreConstraintOpenAffinity     StoreConstraint = "open_task_affinity"
-	StoreConstraintRequestKey       StoreConstraint = "request_key"
-	StoreConstraintActiveRequest    StoreConstraint = "active_request_per_task"
-	StoreConstraintResponseSequence StoreConstraint = "response_event_sequence"
-	StoreConstraintWorkerEvent      StoreConstraint = "worker_event_identity"
-	StoreConstraintWorkerReceipt    StoreConstraint = "worker_receipt_identity"
-	StoreConstraintToolCall         StoreConstraint = "tool_call_identity"
-	StoreConstraintImmutableRecord  StoreConstraint = "immutable_record"
-	StoreConstraintCompareAndSwap   StoreConstraint = "compare_and_swap"
+	StoreConstraintDeploymentBinding StoreConstraint = "deployment_binding"
+	StoreConstraintTaskKey           StoreConstraint = "task_key"
+	StoreConstraintOpenAffinity      StoreConstraint = "open_task_affinity"
+	StoreConstraintRequestKey        StoreConstraint = "request_key"
+	StoreConstraintActiveRequest     StoreConstraint = "active_request_per_task"
+	StoreConstraintResponseSequence  StoreConstraint = "response_event_sequence"
+	StoreConstraintWorkerEvent       StoreConstraint = "worker_event_identity"
+	StoreConstraintWorkerReceipt     StoreConstraint = "worker_receipt_identity"
+	StoreConstraintToolCall          StoreConstraint = "tool_call_identity"
+	StoreConstraintImmutableRecord   StoreConstraint = "immutable_record"
+	StoreConstraintCompareAndSwap    StoreConstraint = "compare_and_swap"
 )
 
 // StoreConflictError reports a typed logical conflict and supports
@@ -264,10 +283,12 @@ func (failure *StoreCorruptError) Unwrap() []error {
 //   - retention: request tombstone, response-event deletion, and eligible
 //     terminal tool-result pruning.
 //
-// Successful Update effects are durable across process restart. View and Update
-// are safe for concurrent callers. Implementations own independent copies of
-// every byte slice, map, CodecSnapshot contract feature map, and nested mutable
-// value after a successful write and return caller-owned copies from reads.
+// Successful Update effects are durable across process restart. Bind, View, and
+// Update are safe for concurrent callers; Description is immutable and safe
+// throughout the borrowed resource lifetime. Implementations own independent
+// copies of every byte slice, map, CodecSnapshot contract feature map, and
+// nested mutable value after a successful write and return caller-owned copies
+// from reads.
 //
 // Store intentionally has no Close method. Composition receives it through a
 // framework.Resource[Store], making borrowed versus owned lifetime and release
@@ -276,6 +297,12 @@ type Store interface {
 	// Description is static, non-secret metadata. It must not perform I/O and
 	// remains safe to call while the containing resource is being released.
 	Description() StoreDescription
+	// Bind atomically records the first binding. Repeating the exact binding is
+	// idempotent; every different binding must return StoreConflictError with
+	// StoreConstraintDeploymentBinding and leave the first binding unchanged.
+	// It honors cancellation. A result which may have committed must match
+	// ErrStoreCommitUnknown; repeating the exact binding is its reconciliation.
+	Bind(context.Context, StoreBinding) error
 	View(context.Context, func(StoreView) error) error
 	Update(context.Context, func(StoreTx) error) error
 }

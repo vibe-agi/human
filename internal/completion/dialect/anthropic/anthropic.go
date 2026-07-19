@@ -70,7 +70,7 @@ type imageSource struct {
 
 func (Codec) Decode(payload []byte) (canonical.Request, error) {
 	var wire messagesRequest
-	if err := json.Unmarshal(payload, &wire); err != nil {
+	if err := dialect.DecodeJSON(payload, &wire); err != nil {
 		return canonical.Request{}, fmt.Errorf("decode Anthropic Messages request: %w", err)
 	}
 	if err := validateToolChoice(wire.ToolChoice); err != nil {
@@ -194,7 +194,7 @@ func parseContent(raw json.RawMessage, role canonical.Role) ([]canonical.Block, 
 		return []canonical.Block{{Type: canonical.BlockText, Text: text}}, nil
 	}
 	var wireBlocks []contentBlock
-	if err := json.Unmarshal(raw, &wireBlocks); err != nil {
+	if err := dialect.DecodeJSON(raw, &wireBlocks); err != nil {
 		return nil, err
 	}
 	blocks := make([]canonical.Block, 0, len(wireBlocks))

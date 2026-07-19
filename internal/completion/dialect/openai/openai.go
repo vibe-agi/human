@@ -68,7 +68,7 @@ type chatToolCall struct {
 
 func (Codec) Decode(payload []byte) (canonical.Request, error) {
 	var wire chatRequest
-	if err := json.Unmarshal(payload, &wire); err != nil {
+	if err := dialect.DecodeJSON(payload, &wire); err != nil {
 		return canonical.Request{}, fmt.Errorf("decode OpenAI chat request: %w", err)
 	}
 	if err := validateToolChoice(wire.ToolChoice); err != nil {
@@ -188,7 +188,7 @@ func decodeToolArguments(value string) (map[string]any, error) {
 		return map[string]any{}, nil
 	}
 	var input map[string]any
-	if err := json.Unmarshal([]byte(value), &input); err != nil {
+	if err := dialect.DecodeJSON([]byte(value), &input); err != nil {
 		return nil, err
 	}
 	if input == nil {

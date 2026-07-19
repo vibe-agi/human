@@ -115,13 +115,6 @@ func (encoder *exampleEncoder) Start() ([][]byte, error) {
 	))}, nil
 }
 
-func (encoder *exampleEncoder) Heartbeat() []byte {
-	if encoder.mode == "aggregate" {
-		return nil
-	}
-	return []byte("ping")
-}
-
 func (encoder *exampleEncoder) Encode(event llm.Event, seed llm.EventSeed) ([][]byte, bool, error) {
 	if !encoder.started || encoder.done {
 		return nil, encoder.done, errors.New("invalid encoder state")

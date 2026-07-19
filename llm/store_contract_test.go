@@ -10,8 +10,14 @@ import (
 )
 
 type storeContractStub struct {
-	views   int
-	updates int
+	bindings int
+	views    int
+	updates  int
+}
+
+func (store *storeContractStub) Bind(context.Context, StoreBinding) error {
+	store.bindings++
+	return nil
 }
 
 func (*storeContractStub) Description() StoreDescription {
@@ -145,16 +151,14 @@ func TestCodecSnapshotPinsFullNegotiatedIdentity(t *testing.T) {
 
 func TestTaskStateVocabularySeparatesTerminalStates(t *testing.T) {
 	for _, state := range []TaskState{
-		TaskAdmitted, TaskLeased, TaskAwaitingHuman, TaskResponded,
-		TaskAwaitingCaller, TaskToolsDispatched, TaskAwaitingResults,
-		TaskReconciled,
+		TaskLeased, TaskAwaitingHuman, TaskAwaitingCaller, TaskAwaitingResults,
 	} {
 		if !state.Valid() || state.Terminal() {
 			t.Fatalf("non-terminal state classification = %q", state)
 		}
 	}
 	for _, state := range []TaskState{
-		TaskCompleted, TaskCanceled, TaskRejected, TaskExpired, TaskFailed,
+		TaskCompleted, TaskRejected, TaskExpired, TaskFailed,
 	} {
 		if !state.Valid() || !state.Terminal() {
 			t.Fatalf("terminal state classification = %q", state)
@@ -162,6 +166,11 @@ func TestTaskStateVocabularySeparatesTerminalStates(t *testing.T) {
 	}
 	if TaskState("future-state").Valid() || TaskState("future-state").Terminal() {
 		t.Fatal("unknown state was accepted")
+	}
+	for _, dead := range []TaskState{"admitted", "responded", "tools_dispatched", "reconciled", "canceled"} {
+		if dead.Valid() || dead.Terminal() {
+			t.Fatalf("unreachable state remained public: %q", dead)
+		}
 	}
 }
 

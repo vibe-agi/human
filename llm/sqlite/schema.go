@@ -10,7 +10,7 @@ import (
 
 const (
 	schemaVersion     = 1
-	schemaFingerprint = "human-llm-store-v1-20260719c"
+	schemaFingerprint = "human-llm-store-v1-20260719f"
 )
 
 // ErrUnsupportedSchema rejects migrations and accidental database sharing.
@@ -26,8 +26,13 @@ CREATE TABLE IF NOT EXISTS human_schema (
   fingerprint TEXT NOT NULL
 );
 INSERT INTO human_schema (component, version, fingerprint)
-VALUES ('llm-store', 1, 'human-llm-store-v1-20260719c')
+VALUES ('llm-store', 1, 'human-llm-store-v1-20260719f')
 ON CONFLICT(component) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS llm_store_binding (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  deployment_id TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS llm_tasks (
   caller_id TEXT NOT NULL,
@@ -51,7 +56,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS llm_tasks_open_affinity_idx
     caller_id, workspace_key, harness_id, harness_version, harness_session_id
   )
   WHERE capability_tier IN ('remote_tools', 'workspace')
-    AND state NOT IN ('completed', 'canceled', 'rejected', 'expired', 'failed');
+    AND state NOT IN ('completed', 'rejected', 'expired', 'failed');
 
 CREATE TABLE IF NOT EXISTS llm_requests (
   caller_id TEXT NOT NULL,
@@ -96,6 +101,7 @@ CREATE TABLE IF NOT EXISTS llm_response_events (
   idempotency_key TEXT NOT NULL,
   sequence INTEGER NOT NULL CHECK(sequence > 0),
   kind TEXT NOT NULL CHECK(kind IN ('checkpoint', 'wire')),
+  worker_id TEXT NOT NULL,
   worker_event_id TEXT NOT NULL,
   worker_event_digest TEXT NOT NULL,
   data BLOB NOT NULL,
@@ -175,6 +181,7 @@ func requireCurrentOrEmptySchema(ctx context.Context, database *sql.DB) error {
 		"llm_requests_retention_idx",
 		"llm_response_events",
 		"llm_response_events_worker_idx",
+		"llm_store_binding",
 		"llm_tasks",
 		"llm_tasks_open_affinity_idx",
 		"llm_tool_executions",

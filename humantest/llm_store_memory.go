@@ -22,9 +22,10 @@ import (
 // Construct it with [NewMemoryLLMStore] so ownership and release remain
 // explicit. Store has no Close method by design.
 type MemoryLLMStore struct {
-	mu     sync.RWMutex
-	closed bool
-	state  memoryLLMState
+	mu      sync.RWMutex
+	closed  bool
+	binding *llm.StoreBinding
+	state   memoryLLMState
 }
 
 type memoryLLMReceiptKey struct {
@@ -67,6 +68,34 @@ func (*MemoryLLMStore) Description() llm.StoreDescription {
 		Contract: framework.Contract{ID: llm.StoreContractID, Major: llm.StoreContractMajor},
 		Provider: "humantest-memory-model", Version: "1",
 	}
+}
+
+func (store *MemoryLLMStore) Bind(ctx context.Context, binding llm.StoreBinding) error {
+	if ctx == nil {
+		return llm.ErrStoreInvalidArgument
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := binding.Validate(); err != nil {
+		return err
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return llm.ErrStoreClosed
+	}
+	if store.binding == nil {
+		stored := binding
+		store.binding = &stored
+		return nil
+	}
+	if *store.binding != binding {
+		return &llm.StoreConflictError{
+			Constraint: llm.StoreConstraintDeploymentBinding, Key: binding.DeploymentID,
+		}
+	}
+	return nil
 }
 
 func (store *MemoryLLMStore) View(ctx context.Context, callback func(llm.StoreView) error) error {
@@ -354,7 +383,10 @@ func (view memoryLLMView) ScanRecovery(scan llm.StoreRecoveryScan) ([]llm.StoreR
 	}
 	candidates := make([]llm.StoreRecoveryRecord, 0)
 	for _, request := range view.unit.state.requests {
-		if (request.RecoveryQuarantined || request.ResponseComplete) && !view.unacknowledged(request.Key) {
+		// Quarantine is itself the durable recovery decision. Never resurrect it
+		// merely because the corrupt history which caused quarantine still has no
+		// matching receipt.
+		if request.RecoveryQuarantined || request.ResponseComplete && !view.unacknowledged(request.Key) {
 			continue
 		}
 		if scan.After != nil && !memoryLLMRecoveryAfter(request, *scan.After) {
@@ -414,7 +446,7 @@ func (view memoryLLMView) ScanRetention(scan llm.StoreRetentionScan) ([]llm.Stor
 		}
 		result = append(result, llm.StoreRetentionCandidate{
 			Request: memoryLLMRequestHead(request), EffectiveCompletedAt: effective,
-			UnacknowledgedWorkerEvent: view.unacknowledged(request.Key),
+			UnacknowledgedWorkerEvent: !request.RecoveryQuarantined && view.unacknowledged(request.Key),
 		})
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -432,7 +464,7 @@ func (view memoryLLMView) unacknowledged(request llm.StoreRequestKey) bool {
 			continue
 		}
 		receipt, ok := view.unit.state.receipts[memoryLLMReceiptKey{request: request, eventID: event.WorkerEventID}]
-		if !ok || receipt.Digest != event.WorkerEventDigest {
+		if !ok || receipt.Worker != event.Worker || receipt.Digest != event.WorkerEventDigest {
 			return true
 		}
 	}
@@ -539,6 +571,10 @@ func (tx memoryLLMTx) InsertResponseEvent(record llm.StoreResponseEventRecord) e
 	if _, exists := tx.unit.state.requests[record.Request]; !exists {
 		return memoryLLMNotFound(llm.StoreRecordRequest, record.Request)
 	}
+	if (record.Worker == "") != (record.WorkerEventID == "") ||
+		(record.WorkerEventID == "") != (record.WorkerEventDigest == "") {
+		return llm.ErrStoreInvalidArgument
+	}
 	if tx.unit.state.events[record.Request] == nil {
 		tx.unit.state.events[record.Request] = make(map[uint64]llm.StoreResponseEventRecord)
 	}
@@ -547,7 +583,8 @@ func (tx memoryLLMTx) InsertResponseEvent(record llm.StoreResponseEventRecord) e
 	}
 	if record.WorkerEventID != "" {
 		for _, existing := range tx.unit.state.events[record.Request] {
-			if existing.WorkerEventID == record.WorkerEventID && existing.WorkerEventDigest != record.WorkerEventDigest {
+			if existing.WorkerEventID == record.WorkerEventID &&
+				(existing.Worker != record.Worker || existing.WorkerEventDigest != record.WorkerEventDigest) {
 				return memoryLLMConflict(llm.StoreConstraintWorkerEvent, record.WorkerEventID)
 			}
 		}

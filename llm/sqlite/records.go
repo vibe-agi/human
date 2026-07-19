@@ -137,7 +137,7 @@ func (view *view) FindOpenTask(affinity llm.StoreTaskAffinity) (llm.StoreTaskRec
 		WHERE caller_id = ? AND workspace_key = ? AND harness_id = ?
 		  AND harness_version = ? AND harness_session_id = ?
 		  AND capability_tier IN ('remote_tools', 'workspace')
-		  AND state NOT IN ('completed', 'canceled', 'rejected', 'expired', 'failed')`,
+		  AND state NOT IN ('completed', 'rejected', 'expired', 'failed')`,
 		affinity.Caller, affinity.WorkspaceKey, affinity.HarnessID,
 		affinity.HarnessVersion, affinity.HarnessSessionID,
 	).Scan(&encoded)
@@ -624,17 +624,18 @@ func (tx *tx) InsertResponseEvent(record llm.StoreResponseEventRecord) error {
 	}
 	if !validRequestKey(record.Request) || record.Sequence == 0 ||
 		(record.Kind != llm.StoreEventCheckpoint && record.Kind != llm.StoreEventWire) ||
-		record.CreatedAt.IsZero() || ((record.WorkerEventID == "") != (record.WorkerEventDigest == "")) {
+		record.CreatedAt.IsZero() || ((record.Worker == "") != (record.WorkerEventID == "")) ||
+		((record.WorkerEventID == "") != (record.WorkerEventDigest == "")) {
 		return invalidArgument("invalid response event record")
 	}
-	var existingDigest string
+	var existingWorker, existingDigest string
 	if record.WorkerEventID != "" {
 		err := tx.unit.tx.QueryRowContext(tx.unit.ctx, `
-			SELECT worker_event_digest FROM llm_response_events
-			WHERE caller_id = ? AND idempotency_key = ? AND worker_event_id = ?
-			LIMIT 1`, record.Request.Caller, record.Request.IdempotencyKey, record.WorkerEventID,
-		).Scan(&existingDigest)
-		if err == nil && existingDigest != string(record.WorkerEventDigest) {
+				SELECT worker_id, worker_event_digest FROM llm_response_events
+				WHERE caller_id = ? AND idempotency_key = ? AND worker_event_id = ?
+				LIMIT 1`, record.Request.Caller, record.Request.IdempotencyKey, record.WorkerEventID,
+		).Scan(&existingWorker, &existingDigest)
+		if err == nil && (existingWorker != string(record.Worker) || existingDigest != string(record.WorkerEventDigest)) {
 			return conflict(llm.StoreConstraintWorkerEvent, record.WorkerEventID)
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -655,11 +656,11 @@ func (tx *tx) InsertResponseEvent(record llm.StoreResponseEventRecord) error {
 	}
 	_, err = tx.unit.tx.ExecContext(tx.unit.ctx, `
 		INSERT INTO llm_response_events (
-		  caller_id, idempotency_key, sequence, kind, worker_event_id,
-		  worker_event_digest, data, data_is_nil, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  caller_id, idempotency_key, sequence, kind, worker_id,
+		  worker_event_id, worker_event_digest, data, data_is_nil, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.Request.Caller, record.Request.IdempotencyKey, record.Sequence,
-		record.Kind, record.WorkerEventID, record.WorkerEventDigest,
+		record.Kind, record.Worker, record.WorkerEventID, record.WorkerEventDigest,
 		nonNilBytes(record.Data), boolInt(record.Data == nil), unixNano(record.CreatedAt),
 	)
 	if err != nil {

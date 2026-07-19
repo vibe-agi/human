@@ -109,17 +109,23 @@ func NegotiateCodec(description CodecDescription) (CodecDescription, error) {
 	return description, nil
 }
 
-// Codec is a pure wire projection port. Implementations may parse and encode a
-// custom model API, but must not perform transport, persistence, authentication,
-// clock, random, or other external I/O through this interface. Description must
-// always report the same value. Decode and AdmissionError must be deterministic
-// functions of their arguments.
+// Codec is a pure wire projection port. Implementations are borrowed until
+// Service.Done and must allow concurrent calls to every Codec method. They may
+// parse and encode a custom model API, but must not perform transport,
+// persistence, authentication, clock, random, or other external I/O through
+// this interface. Description must always report the same value. Decode and
+// AdmissionError must be deterministic functions of their arguments.
 //
 // Decode borrows body only for the duration of the call. It must neither mutate
 // nor retain body, and the returned Request must own all mutable slices, maps,
 // and RawMessage values and pass Request.Validate. AdmissionError transfers
 // ownership of its returned body to the caller. Encoder factory arguments are
 // likewise borrowed; an encoder must copy any mutable value it retains.
+// A registered Codec is borrowed for the Service lifetime and every method may
+// be called concurrently. Each returned Encoder, however, belongs to exactly
+// one response and is driven serially; encoders need not support concurrent
+// Start/Encode calls. Any method error fails the current request/event and must
+// not hide externally visible side effects because codecs are pure.
 type Codec interface {
 	Description() CodecDescription
 	Decode(body []byte) (Request, error)
@@ -177,11 +183,11 @@ type EncoderSession struct {
 // and persists all three fields; a codec must never fill missing values from a
 // clock or random source.
 type SessionSeed struct {
-	CreatedAtUnix int64
-	Entropy       []byte
-	Opaque        json.RawMessage
+	CreatedAtUnix int64           `json:"created_at_unix"`
+	Entropy       []byte          `json:"entropy,omitempty"`
+	Opaque        json.RawMessage `json:"opaque,omitempty"`
 
-	ToolCallPolicy ToolCallPolicy
+	ToolCallPolicy ToolCallPolicy `json:"tool_call_policy,omitempty"`
 }
 
 // Validate checks the mode-independent encoder inputs. A codec must additionally
@@ -214,9 +220,9 @@ func (session EncoderSession) Validate() error {
 // that may affect observable bytes. It must be persisted with the event before
 // those bytes become visible.
 type EventSeed struct {
-	EncodedAtUnix int64
-	Entropy       []byte
-	Opaque        json.RawMessage
+	EncodedAtUnix int64           `json:"encoded_at_unix"`
+	Entropy       []byte          `json:"entropy,omitempty"`
+	Opaque        json.RawMessage `json:"opaque,omitempty"`
 }
 
 // Validate checks the generic event seed representation.
@@ -241,13 +247,12 @@ func (seed EventSeed) Validate() error {
 // ordered Events, and EventSeeds, a reconstructed encoder must return byte-for-
 // byte identical outputs without consulting a clock, random source, or I/O.
 //
-// For a stream encoder, Start and each Encode return zero or more frames and
-// Heartbeat returns a deterministic frame (nil disables heartbeats). For an
-// aggregate encoder, Start and non-terminal Encode calls return no bytes,
-// Heartbeat returns nil, and the terminal Encode returns exactly one body.
+// For a stream encoder, Start and each Encode return zero or more frames. For
+// an aggregate encoder, Start and non-terminal Encode calls return no bytes,
+// and the terminal Encode returns exactly one body. Transport-level keepalive
+// is deliberately outside this deterministic response projection.
 type Encoder interface {
 	Start() (frames [][]byte, err error)
-	Heartbeat() []byte
 	Encode(event Event, seed EventSeed) (frames [][]byte, done bool, err error)
 }
 
@@ -283,15 +288,6 @@ func (limits CodecLimits) CheckStreamFrames(frames [][]byte) error {
 		}
 	}
 	return nil
-}
-
-// CheckHeartbeat enforces the stream frame budget for the deterministic
-// heartbeat returned by an Encoder. Nil disables heartbeats.
-func (limits CodecLimits) CheckHeartbeat(frame []byte) error {
-	if frame == nil {
-		return validateLimits(limits)
-	}
-	return limits.CheckStreamFrames([][]byte{frame})
 }
 
 // CheckAggregateFrames enforces aggregate visibility and size invariants.

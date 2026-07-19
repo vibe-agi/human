@@ -44,6 +44,7 @@ func TestLLMStore(t *testing.T, factory LLMStoreFactory) {
 		name string
 		run  func(context.Context, *testing.T, llm.Store)
 	}{
+		{"deployment_binding_is_atomic_and_permanent", testLLMStoreBinding},
 		{"description_and_callback_lifetime", testLLMStoreDescriptionAndLifetime},
 		{"rollback_and_dirty_read_isolation", testLLMStoreRollback},
 		{"read_your_writes", testLLMStoreReadYourWrites},
@@ -84,8 +85,53 @@ func TestLLMStore(t *testing.T, factory LLMStoreFactory) {
 			if release == nil {
 				t.Fatal("factory returned a nil release function")
 			}
+			if test.name != "deployment_binding_is_atomic_and_permanent" {
+				if err := store.Bind(ctx, llm.StoreBinding{DeploymentID: "humantest-deployment"}); err != nil {
+					t.Fatalf("bind fresh HumanLLM Store: %v", err)
+				}
+			}
 			test.run(ctx, t, store)
 		})
+	}
+}
+
+func testLLMStoreBinding(ctx context.Context, t *testing.T, store llm.Store) {
+	t.Helper()
+	if err := store.Bind(nil, llm.StoreBinding{DeploymentID: "deployment-a"}); !errors.Is(err, llm.ErrStoreInvalidArgument) {
+		t.Fatalf("nil Bind context error = %v, want ErrStoreInvalidArgument", err)
+	}
+	if err := store.Bind(ctx, llm.StoreBinding{DeploymentID: "bad deployment"}); !errors.Is(err, llm.ErrStoreInvalidArgument) {
+		t.Fatalf("invalid Bind value error = %v, want ErrStoreInvalidArgument", err)
+	}
+
+	type result struct {
+		binding llm.StoreBinding
+		err     error
+	}
+	results := make(chan result, 2)
+	for _, binding := range []llm.StoreBinding{{DeploymentID: "deployment-a"}, {DeploymentID: "deployment-b"}} {
+		go func() { results <- result{binding: binding, err: store.Bind(ctx, binding)} }()
+	}
+	first, second := <-results, <-results
+	var winner, loser llm.StoreBinding
+	switch {
+	case first.err == nil && errors.Is(second.err, llm.ErrStoreConflict):
+		winner, loser = first.binding, second.binding
+	case second.err == nil && errors.Is(first.err, llm.ErrStoreConflict):
+		winner, loser = second.binding, first.binding
+	default:
+		t.Fatalf("concurrent Bind results = %#v / %#v, want one success and one conflict", first, second)
+	}
+	if err := store.Bind(ctx, winner); err != nil {
+		t.Fatalf("exact Bind replay for %#v: %v", winner, err)
+	}
+	err := store.Bind(ctx, loser)
+	var conflict *llm.StoreConflictError
+	if !errors.As(err, &conflict) || conflict.Constraint != llm.StoreConstraintDeploymentBinding {
+		t.Fatalf("divergent Bind error = %v, want deployment binding conflict", err)
+	}
+	if err := store.Bind(ctx, winner); err != nil {
+		t.Fatalf("conflicting Bind changed original namespace: %v", err)
 	}
 }
 
@@ -164,7 +210,7 @@ func testLLMStoreDescriptionAndLifetime(ctx context.Context, t *testing.T, store
 func testLLMStoreRollback(ctx context.Context, t *testing.T, store llm.Store) {
 	t.Helper()
 	rollback := errors.New("humantest requested rollback")
-	dirtyTask := llmConformanceTask("rolled-back", 1, llm.TaskAdmitted)
+	dirtyTask := llmConformanceTask("rolled-back", 1, llm.TaskAwaitingCaller)
 	dirtyRequest := llmConformanceRequest(dirtyTask, "rolled-back", []byte("must-not-commit"))
 	dirtyEvent := llmConformanceEvent(dirtyRequest.Key, 1, llm.StoreEventWire, "", "", []byte("must-not-commit-wire"))
 	err := store.Update(ctx, func(tx llm.StoreTx) error {
@@ -208,7 +254,7 @@ func testLLMStoreRollback(ctx context.Context, t *testing.T, store llm.Store) {
 
 	// An uncommitted transaction may block a View or let it observe the previous
 	// MVCC snapshot, but its staged identity must never become visible.
-	isolatedTask := llmConformanceTask("dirty-isolation", 1, llm.TaskAdmitted)
+	isolatedTask := llmConformanceTask("dirty-isolation", 1, llm.TaskAwaitingCaller)
 	staged := make(chan struct{})
 	finish := make(chan struct{})
 	updateDone := make(chan error, 1)
@@ -269,7 +315,7 @@ func testLLMStoreRollback(ctx context.Context, t *testing.T, store llm.Store) {
 
 func testLLMStoreReadYourWrites(ctx context.Context, t *testing.T, store llm.Store) {
 	t.Helper()
-	task := llmConformanceTask("read-own", 1, llm.TaskAdmitted)
+	task := llmConformanceTask("read-own", 1, llm.TaskAwaitingCaller)
 	request := llmConformanceRequest(task, "read-own", []byte("canonical-read-own"))
 	event := llmConformanceEvent(request.Key, 1, llm.StoreEventWire, "worker-event-read-own", llmDigest('e'), []byte("wire-read-own"))
 	receipt := llm.StoreWorkerReceiptRecord{
@@ -324,7 +370,7 @@ func testLLMStoreReadYourWrites(ctx context.Context, t *testing.T, store llm.Sto
 
 func testLLMStoreSnapshot(ctx context.Context, t *testing.T, store llm.Store) {
 	t.Helper()
-	initial := llmConformanceTask("snapshot", 1, llm.TaskAdmitted)
+	initial := llmConformanceTask("snapshot", 1, llm.TaskAwaitingCaller)
 	if err := store.Update(ctx, func(tx llm.StoreTx) error { return tx.InsertTask(initial) }); err != nil {
 		t.Fatalf("insert snapshot task: %v", err)
 	}
@@ -398,7 +444,7 @@ func testLLMStoreSnapshot(ctx context.Context, t *testing.T, store llm.Store) {
 
 func testLLMStoreConcurrentUpdates(ctx context.Context, t *testing.T, store llm.Store) {
 	t.Helper()
-	initial := llmConformanceTask("serialized", 1, llm.TaskAdmitted)
+	initial := llmConformanceTask("serialized", 1, llm.TaskAwaitingCaller)
 	if err := store.Update(ctx, func(tx llm.StoreTx) error { return tx.InsertTask(initial) }); err != nil {
 		t.Fatalf("insert serialization task: %v", err)
 	}
@@ -465,7 +511,7 @@ func testLLMStoreConcurrentUpdates(ctx context.Context, t *testing.T, store llm.
 
 func testLLMStoreTasks(ctx context.Context, t *testing.T, store llm.Store) {
 	t.Helper()
-	chatA := llmConformanceTask("chat-a", 1, llm.TaskAdmitted)
+	chatA := llmConformanceTask("chat-a", 1, llm.TaskAwaitingCaller)
 	chatA.WorkspaceKey, chatA.CapabilityTier = "", llm.TierChat
 	chatA.HarnessID, chatA.HarnessVersion, chatA.HarnessSessionID = "", "", ""
 	chatA.WorkspaceRoot, chatA.ExecAllowed = "", false
@@ -488,7 +534,7 @@ func testLLMStoreTasks(ctx context.Context, t *testing.T, store llm.Store) {
 		t.Fatalf("empty Chat affinity error = %v, want ErrStoreInvalidArgument", err)
 	}
 
-	initial := llmConformanceTask("task", 1, llm.TaskAdmitted)
+	initial := llmConformanceTask("task", 1, llm.TaskAwaitingCaller)
 	inputFeatures := initial.Codec.Contract.Features
 	if err := store.Update(ctx, func(tx llm.StoreTx) error { return tx.InsertTask(initial) }); err != nil {
 		t.Fatalf("insert task: %v", err)
@@ -517,7 +563,7 @@ func testLLMStoreTasks(ctx context.Context, t *testing.T, store llm.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conflicting := llmConformanceTask("task-same-affinity", 1, llm.TaskAdmitted)
+	conflicting := llmConformanceTask("task-same-affinity", 1, llm.TaskAwaitingCaller)
 	conflicting.WorkspaceKey = initial.WorkspaceKey
 	conflicting.HarnessID = initial.HarnessID
 	conflicting.HarnessVersion = initial.HarnessVersion
@@ -596,7 +642,7 @@ func testLLMStoreTasks(ctx context.Context, t *testing.T, store llm.Store) {
 
 func testLLMStoreRequests(ctx context.Context, t *testing.T, store llm.Store) {
 	t.Helper()
-	task := llmConformanceTask("request-task", 1, llm.TaskAdmitted)
+	task := llmConformanceTask("request-task", 1, llm.TaskAwaitingCaller)
 	canonical := []byte("canonical-request-bytes")
 	body := []byte("aggregate-decision-body")
 	request := llmConformanceRequest(task, "request-a", canonical)
@@ -740,7 +786,7 @@ func testLLMStoreRequests(ctx context.Context, t *testing.T, store llm.Store) {
 
 func testLLMStoreResponseEvents(ctx context.Context, t *testing.T, store llm.Store) {
 	t.Helper()
-	task := llmConformanceTask("events", 1, llm.TaskAdmitted)
+	task := llmConformanceTask("events", 1, llm.TaskAwaitingCaller)
 	request := llmConformanceRequest(task, "events", []byte("canonical"))
 	oneData := []byte("one")
 	events := []llm.StoreResponseEventRecord{
@@ -810,11 +856,16 @@ func testLLMStoreResponseEvents(ctx context.Context, t *testing.T, store llm.Sto
 	if err := store.Update(ctx, func(tx llm.StoreTx) error { return tx.InsertResponseEvent(wrongDigest) }); !errors.Is(err, llm.ErrStoreConflict) {
 		t.Fatalf("worker-event digest conflict error = %v, want ErrStoreConflict", err)
 	}
+	wrongWorker := llmConformanceEvent(request.Key, 6, llm.StoreEventWire, "worker-event-a", llmDigest('e'), []byte("six"))
+	wrongWorker.Worker = "worker-b"
+	if err := store.Update(ctx, func(tx llm.StoreTx) error { return tx.InsertResponseEvent(wrongWorker) }); !errors.Is(err, llm.ErrStoreConflict) {
+		t.Fatalf("worker-event owner conflict error = %v, want ErrStoreConflict", err)
+	}
 }
 
 func testLLMStoreWorkerReceipts(ctx context.Context, t *testing.T, store llm.Store) {
 	t.Helper()
-	task := llmConformanceTask("receipt", 1, llm.TaskAdmitted)
+	task := llmConformanceTask("receipt", 1, llm.TaskAwaitingCaller)
 	request := llmConformanceRequest(task, "receipt", []byte("canonical"))
 	receipt := llm.StoreWorkerReceiptRecord{
 		Request: request.Key, EventID: "event-receipt", Worker: "worker-a",
@@ -853,7 +904,7 @@ func testLLMStoreWorkerReceipts(ctx context.Context, t *testing.T, store llm.Sto
 
 func testLLMStoreToolLedger(ctx context.Context, t *testing.T, store llm.Store) {
 	t.Helper()
-	task := llmConformanceTask("tools", 1, llm.TaskAdmitted)
+	task := llmConformanceTask("tools", 1, llm.TaskAwaitingCaller)
 	aData := []byte("AAAA")
 	records := []llm.StoreToolExecutionRecord{
 		llmConformanceTool(task, "tool-b", llm.ToolExecutionPending, nil),
@@ -1064,13 +1115,13 @@ func testLLMStoreRecovery(ctx context.Context, t *testing.T, store llm.Store) {
 		request llm.StoreRequestRecord
 	}
 	fixtures := []fixture{
-		{llmConformanceTaskFor("caller-b", "recovery-first", 1, llm.TaskAdmitted), llm.StoreRequestRecord{}},
-		{llmConformanceTaskFor("caller-a", "recovery-unacked", 1, llm.TaskAdmitted), llm.StoreRequestRecord{}},
-		{llmConformanceTaskFor("caller-a", "recovery-incomplete", 1, llm.TaskAdmitted), llm.StoreRequestRecord{}},
-		{llmConformanceTaskFor("caller-c", "recovery-acked", 1, llm.TaskAdmitted), llm.StoreRequestRecord{}},
-		{llmConformanceTaskFor("caller-d", "recovery-quarantined", 1, llm.TaskAdmitted), llm.StoreRequestRecord{}},
-		{llmConformanceTaskFor("caller-e", "recovery-digest-mismatch", 1, llm.TaskAdmitted), llm.StoreRequestRecord{}},
-		{llmConformanceTaskFor("caller-z", "recovery-late", 1, llm.TaskAdmitted), llm.StoreRequestRecord{}},
+		{llmConformanceTaskFor("caller-b", "recovery-first", 1, llm.TaskAwaitingCaller), llm.StoreRequestRecord{}},
+		{llmConformanceTaskFor("caller-a", "recovery-unacked", 1, llm.TaskAwaitingCaller), llm.StoreRequestRecord{}},
+		{llmConformanceTaskFor("caller-a", "recovery-incomplete", 1, llm.TaskAwaitingCaller), llm.StoreRequestRecord{}},
+		{llmConformanceTaskFor("caller-c", "recovery-acked", 1, llm.TaskAwaitingCaller), llm.StoreRequestRecord{}},
+		{llmConformanceTaskFor("caller-d", "recovery-quarantined", 1, llm.TaskAwaitingCaller), llm.StoreRequestRecord{}},
+		{llmConformanceTaskFor("caller-e", "recovery-digest-mismatch", 1, llm.TaskAwaitingCaller), llm.StoreRequestRecord{}},
+		{llmConformanceTaskFor("caller-z", "recovery-late", 1, llm.TaskAwaitingCaller), llm.StoreRequestRecord{}},
 	}
 	for index := range fixtures {
 		fixtures[index].request = llmConformanceRequest(fixtures[index].task, strings.TrimPrefix(string(fixtures[index].task.Key.Task), "task-"), []byte(fmt.Sprintf("payload-%d", index)))
@@ -1093,6 +1144,7 @@ func testLLMStoreRecovery(ctx context.Context, t *testing.T, store llm.Store) {
 
 	unackedEvent := llmConformanceEvent(fixtures[1].request.Key, 1, llm.StoreEventWire, "unacked-event", llmDigest('u'), []byte("wire-u"))
 	ackedEvent := llmConformanceEvent(fixtures[3].request.Key, 1, llm.StoreEventWire, "acked-event", llmDigest('a'), []byte("wire-a"))
+	quarantinedEvent := llmConformanceEvent(fixtures[4].request.Key, 1, llm.StoreEventWire, "quarantined-event", llmDigest('q'), []byte("wire-q"))
 	mismatchedEvent := llmConformanceEvent(fixtures[5].request.Key, 1, llm.StoreEventWire, "mismatched-event", llmDigest('m'), []byte("wire-m"))
 	if err := store.Update(ctx, func(tx llm.StoreTx) error {
 		for _, fixture := range fixtures {
@@ -1107,6 +1159,9 @@ func testLLMStoreRecovery(ctx context.Context, t *testing.T, store llm.Store) {
 			return err
 		}
 		if err := tx.InsertResponseEvent(ackedEvent); err != nil {
+			return err
+		}
+		if err := tx.InsertResponseEvent(quarantinedEvent); err != nil {
 			return err
 		}
 		if err := tx.InsertResponseEvent(mismatchedEvent); err != nil {
@@ -1177,7 +1232,7 @@ func testLLMStoreRetention(ctx context.Context, t *testing.T, store llm.Store) {
 		request llm.StoreRequestRecord
 	}
 	makeFixture := func(caller, id string, created, completed int64) fixture {
-		task := llmConformanceTaskFor(llm.CallerID(caller), "retention-"+id, 1, llm.TaskAdmitted)
+		task := llmConformanceTaskFor(llm.CallerID(caller), "retention-"+id, 1, llm.TaskAwaitingCaller)
 		request := llmConformanceRequest(task, "retention-"+id, []byte("retention-"+id))
 		request.CreatedAt = llmConformanceTime(created)
 		request.ResponseComplete = true
@@ -1197,12 +1252,15 @@ func testLLMStoreRetention(ctx context.Context, t *testing.T, store llm.Store) {
 		makeFixture("caller-c", "future", 25, 40),
 		makeFixture("caller-d", "tombstoned", 26, 27),
 		makeFixture("caller-e", "incomplete", 27, 0),
+		makeFixture("caller-f", "quarantined-unacked", 28, 28),
 	}
 	fixtures[7].request.PayloadPrunedAt = func() *time.Time { value := llmConformanceTime(35); return &value }()
 	fixtures[7].request.CanonicalPayload = nil
 	fixtures[8].request.ResponseComplete = false
+	fixtures[9].request.RecoveryQuarantined = true
 	unacked := llmConformanceEvent(fixtures[1].request.Key, 1, llm.StoreEventWire, "retention-unacked", llmDigest('u'), []byte("u"))
 	acked := llmConformanceEvent(fixtures[2].request.Key, 1, llm.StoreEventWire, "retention-acked", llmDigest('a'), []byte("a"))
+	quarantinedUnacked := llmConformanceEvent(fixtures[9].request.Key, 1, llm.StoreEventWire, "retention-quarantined", llmDigest('q'), []byte("q"))
 	if err := store.Update(ctx, func(tx llm.StoreTx) error {
 		for _, fixture := range fixtures {
 			if err := tx.InsertTask(fixture.task); err != nil {
@@ -1218,6 +1276,9 @@ func testLLMStoreRetention(ctx context.Context, t *testing.T, store llm.Store) {
 		if err := tx.InsertResponseEvent(acked); err != nil {
 			return err
 		}
+		if err := tx.InsertResponseEvent(quarantinedUnacked); err != nil {
+			return err
+		}
 		return tx.InsertWorkerReceipt(llm.StoreWorkerReceiptRecord{
 			Request: acked.Request, EventID: acked.WorkerEventID, Worker: "worker-a",
 			Digest: acked.WorkerEventDigest, CreatedAt: llmConformanceTime(27),
@@ -1231,13 +1292,16 @@ func testLLMStoreRetention(ctx context.Context, t *testing.T, store llm.Store) {
 	})
 	want := []llm.StoreRequestKey{
 		fixtures[0].request.Key, fixtures[1].request.Key, fixtures[2].request.Key,
-		fixtures[3].request.Key, fixtures[4].request.Key, fixtures[5].request.Key,
+		fixtures[9].request.Key, fixtures[3].request.Key, fixtures[4].request.Key, fixtures[5].request.Key,
 	}
 	if got := llmRetentionKeys(candidates); !reflect.DeepEqual(got, want) {
 		t.Fatalf("retention order/selection = %v, want %v", got, want)
 	}
 	if !candidates[1].UnacknowledgedWorkerEvent || candidates[2].UnacknowledgedWorkerEvent {
 		t.Fatalf("retention unacknowledged markers = %#v", candidates)
+	}
+	if !candidates[3].Request.RecoveryQuarantined || candidates[3].UnacknowledgedWorkerEvent {
+		t.Fatalf("quarantined retention candidate must bypass orphan receipt pinning: %#v", candidates[3])
 	}
 	if !candidates[0].EffectiveCompletedAt.Equal(fixtures[0].request.CreatedAt) {
 		t.Fatalf("legacy effective completion = %v, want CreatedAt %v", candidates[0].EffectiveCompletedAt, fixtures[0].request.CreatedAt)
@@ -1253,14 +1317,14 @@ func testLLMStoreRetention(ctx context.Context, t *testing.T, store llm.Store) {
 		t.Fatalf("retention cursor = %v, want %v", got, want[2:])
 	}
 	tieCursor := llm.StoreRetentionCursor{
-		CompletedAt: candidates[3].EffectiveCompletedAt, Caller: candidates[3].Request.Key.Caller,
-		IdempotencyKey: candidates[3].Request.Key.IdempotencyKey,
+		CompletedAt: candidates[4].EffectiveCompletedAt, Caller: candidates[4].Request.Key.Caller,
+		IdempotencyKey: candidates[4].Request.Key.IdempotencyKey,
 	}
 	afterTie := llmScanRetention(ctx, t, store, llm.StoreRetentionScan{
 		CompletedBefore: llmConformanceTime(30), After: &tieCursor, Limit: 20,
 	})
-	if got := llmRetentionKeys(afterTie); !reflect.DeepEqual(got, want[4:]) {
-		t.Fatalf("retention tie cursor = %v, want %v", got, want[4:])
+	if got := llmRetentionKeys(afterTie); !reflect.DeepEqual(got, want[5:]) {
+		t.Fatalf("retention tie cursor = %v, want %v", got, want[5:])
 	}
 }
 
@@ -1403,6 +1467,12 @@ func llmConformanceEvent(
 ) llm.StoreResponseEventRecord {
 	return llm.StoreResponseEventRecord{
 		Request: request, Sequence: sequence, Kind: kind,
+		Worker: func() llm.WorkerID {
+			if workerEventID == "" {
+				return ""
+			}
+			return "worker-a"
+		}(),
 		WorkerEventID: workerEventID, WorkerEventDigest: workerDigest,
 		Data: data, CreatedAt: llmConformanceTime(int64(sequence) + 2),
 	}

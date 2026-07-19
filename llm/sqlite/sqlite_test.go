@@ -50,6 +50,10 @@ func TestOwnedResourcePersistsAndReopens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	binding := llm.StoreBinding{DeploymentID: "deployment-persistent"}
+	if err := store.Bind(t.Context(), binding); err != nil {
+		t.Fatalf("bind SQLite Store: %v", err)
+	}
 	task, request := sqliteFixture(t)
 	if err := store.Update(t.Context(), func(tx llm.StoreTx) error {
 		if err := tx.InsertTask(task); err != nil {
@@ -60,6 +64,7 @@ func TestOwnedResourcePersistsAndReopens(t *testing.T) {
 		}
 		if err := tx.InsertResponseEvent(llm.StoreResponseEventRecord{
 			Request: request.Key, Sequence: 1, Kind: llm.StoreEventWire,
+			Worker:        "worker-a",
 			WorkerEventID: "worker-event-a", WorkerEventDigest: "event-digest-a",
 			Data: []byte("data: first\n\n"), CreatedAt: task.CreatedAt.Add(time.Second),
 		}); err != nil {
@@ -96,6 +101,12 @@ func TestOwnedResourcePersistsAndReopens(t *testing.T) {
 	reopenedStore, err := reopened.Value()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := reopenedStore.Bind(t.Context(), binding); err != nil {
+		t.Fatalf("exact binding after reopen: %v", err)
+	}
+	if err := reopenedStore.Bind(t.Context(), llm.StoreBinding{DeploymentID: "deployment-other"}); !errors.Is(err, llm.ErrStoreConflict) {
+		t.Fatalf("divergent binding after reopen = %v, want ErrStoreConflict", err)
 	}
 	if err := reopenedStore.View(t.Context(), func(view llm.StoreView) error {
 		got, err := view.LoadRequest(request.Key, llm.StoreReadLimit{MaxBytes: 1 << 20})
@@ -216,6 +227,7 @@ func TestRecoveryReceiptRetentionAndTombstoneRoundTrip(t *testing.T) {
 		}
 		if err := tx.InsertResponseEvent(llm.StoreResponseEventRecord{
 			Request: request.Key, Sequence: 1, Kind: llm.StoreEventCheckpoint,
+			Worker:        "worker-a",
 			WorkerEventID: "event-a", WorkerEventDigest: "digest-a",
 			Data: []byte("checkpoint"), CreatedAt: eventTime,
 		}); err != nil {
@@ -223,6 +235,7 @@ func TestRecoveryReceiptRetentionAndTombstoneRoundTrip(t *testing.T) {
 		}
 		if err := tx.InsertResponseEvent(llm.StoreResponseEventRecord{
 			Request: request.Key, Sequence: 2, Kind: llm.StoreEventWire,
+			Worker:        "worker-a",
 			WorkerEventID: "event-a", WorkerEventDigest: "digest-a",
 			Data: []byte("wire"), CreatedAt: eventTime,
 		}); err != nil {
@@ -381,7 +394,7 @@ func sqliteFixture(t *testing.T) (llm.StoreTaskRecord, llm.StoreRequestRecord) {
 		Key:          llm.StoreTaskKey{Caller: "caller-a", Task: "task-a"},
 		WorkspaceKey: "workspace-a", CapabilityTier: llm.TierRemoteTools, Codec: codec,
 		HarnessID: "codex", HarnessVersion: "1", HarnessSessionID: "session-a",
-		WorkspaceRoot: "/workspace", State: llm.TaskAdmitted,
+		WorkspaceRoot: "/workspace", State: llm.TaskAwaitingCaller,
 		Revision: 1, CreatedAt: now, UpdatedAt: now,
 	}
 	request := llm.StoreRequestRecord{

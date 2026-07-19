@@ -32,21 +32,18 @@ const (
 	TierWorkspace   CapabilityTier = "workspace"
 )
 
-// TaskState is HumanLLM core's durable task state. Store implementations treat
-// it as data: the core, not the adapter, decides whether a transition is valid.
+// TaskState is HumanLLM core's reachable durable task state. The implementation
+// may atomically refine across conceptual protocol steps such as admitted or
+// reconciled when no crash/retry boundary can observe them; those TLA+ states
+// are intentionally not imposed on third-party Store implementations.
 type TaskState string
 
 const (
-	TaskAdmitted        TaskState = "admitted"
 	TaskLeased          TaskState = "leased"
 	TaskAwaitingHuman   TaskState = "awaiting_human"
-	TaskResponded       TaskState = "responded"
 	TaskAwaitingCaller  TaskState = "awaiting_caller"
-	TaskToolsDispatched TaskState = "tools_dispatched"
 	TaskAwaitingResults TaskState = "awaiting_results"
-	TaskReconciled      TaskState = "reconciled"
 	TaskCompleted       TaskState = "completed"
-	TaskCanceled        TaskState = "canceled"
 	TaskRejected        TaskState = "rejected"
 	TaskExpired         TaskState = "expired"
 	TaskFailed          TaskState = "failed"
@@ -55,10 +52,8 @@ const (
 // Valid reports whether state is part of the persisted HumanLLM vocabulary.
 func (state TaskState) Valid() bool {
 	switch state {
-	case TaskAdmitted, TaskLeased, TaskAwaitingHuman, TaskResponded,
-		TaskAwaitingCaller, TaskToolsDispatched, TaskAwaitingResults,
-		TaskReconciled, TaskCompleted, TaskCanceled, TaskRejected,
-		TaskExpired, TaskFailed:
+	case TaskLeased, TaskAwaitingHuman, TaskAwaitingCaller,
+		TaskAwaitingResults, TaskCompleted, TaskRejected, TaskExpired, TaskFailed:
 		return true
 	default:
 		return false
@@ -68,7 +63,7 @@ func (state TaskState) Valid() bool {
 // Terminal reports whether no new turn may be admitted for this Task.
 func (state TaskState) Terminal() bool {
 	switch state {
-	case TaskCompleted, TaskCanceled, TaskRejected, TaskExpired, TaskFailed:
+	case TaskCompleted, TaskRejected, TaskExpired, TaskFailed:
 		return true
 	default:
 		return false
@@ -140,25 +135,22 @@ type StoreTaskKey struct {
 
 // StoreTaskRecord is the durable multi-turn completion aggregate. Codec is
 // pinned for the Task lifetime; every Request must carry an equal snapshot.
-// RetryRequestDigest is non-empty only when a request failed before its HTTP
-// response boundary and grants one exact new-key retry.
 type StoreTaskRecord struct {
-	Key                StoreTaskKey
-	WorkspaceKey       string
-	CapabilityTier     CapabilityTier
-	Codec              CodecSnapshot
-	HarnessID          string
-	HarnessVersion     string
-	HarnessSessionID   string
-	WorkspaceRoot      string
-	ExecAllowed        bool
-	State              TaskState
-	LeaseOwner         WorkerID
-	LeaseID            WorkerLeaseID
-	RetryRequestDigest StoreDigest
-	Revision           uint64
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	Key              StoreTaskKey
+	WorkspaceKey     string
+	CapabilityTier   CapabilityTier
+	Codec            CodecSnapshot
+	HarnessID        string
+	HarnessVersion   string
+	HarnessSessionID string
+	WorkspaceRoot    string
+	ExecAllowed      bool
+	State            TaskState
+	LeaseOwner       WorkerID
+	LeaseID          WorkerLeaseID
+	Revision         uint64
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // StoreTaskAffinity names one exact non-chat harness conversation. Every field
@@ -190,7 +182,9 @@ const (
 // StoreResponseDecision is the immutable HTTP boundary for one request. A zero
 // StatusCode means no response is committed. Streaming normally commits a 200
 // with no Body before dispatch; aggregate mode commits status and Body together
-// at the terminal event. Body bytes are exact wire bytes.
+// at the terminal event. Body is the core-owned opaque at-rest representation
+// of exact wire bytes (plain or protected StoredValue framing); Store preserves
+// it without interpreting or encrypting it.
 type StoreResponseDecision struct {
 	StatusCode  int
 	ContentType string
@@ -199,8 +193,10 @@ type StoreResponseDecision struct {
 }
 
 // StoreRequestRecord owns the idempotency tombstone and exact replay material.
-// RequestDigest binds CanonicalPayload to Codec, including its full contract
-// snapshot; the Store preserves but never computes that digest. PayloadPrunedAt
+// RequestDigest binds the canonical plaintext represented by CanonicalPayload
+// to Codec, including its full contract snapshot. CanonicalPayload itself is a
+// core-owned opaque at-rest representation; Store preserves but never opens,
+// encrypts, or computes a digest from it. PayloadPrunedAt
 // is immutable once set, and then CanonicalPayload and Decision.Body are empty
 // while identity, status metadata, receipts, and the digest remain durable.
 type StoreRequestRecord struct {
@@ -249,9 +245,13 @@ type StoreRequestHead struct {
 }
 
 // StoreResponseEventKind identifies append-only exact-replay material. A
-// checkpoint contains core-owned deterministic encoder session metadata; wire
-// contains exact caller-visible bytes. WorkerEventID/Digest bind every frame
-// produced for one worker event to its durable ACK receipt.
+// checkpoint represents core-owned deterministic encoder session metadata;
+// wire represents exact caller-visible bytes. Data is a core-owned opaque
+// at-rest representation, so Store adapters never call a Protector.
+// Worker/WorkerEventID/WorkerEventDigest bind every frame produced for one
+// authenticated worker event to its durable ACK receipt. All three are empty
+// for session/start/quarantine material and all three are non-empty together
+// for worker-produced checkpoints and wire frames.
 type StoreResponseEventKind string
 
 const (
@@ -263,6 +263,7 @@ type StoreResponseEventRecord struct {
 	Request           StoreRequestKey
 	Sequence          uint64
 	Kind              StoreResponseEventKind
+	Worker            WorkerID
 	WorkerEventID     string
 	WorkerEventDigest StoreDigest
 	Data              []byte
@@ -294,8 +295,8 @@ const (
 )
 
 // StoreToolExecutionRecord is the task-wide at-most-once ledger. InputDigest
-// binds a ToolCallID to one canonical call. Result is canonical caller-reported
-// JSON owned as opaque bytes by Store. ResultPrunedAt distinguishes retention
+// binds a ToolCallID to one canonical call. Result is the core-owned opaque
+// at-rest representation of canonical caller-reported JSON. ResultPrunedAt distinguishes retention
 // from a legitimate empty result.
 type StoreToolExecutionRecord struct {
 	Key            StoreToolExecutionKey
@@ -375,8 +376,10 @@ type StoreRetentionCursor struct {
 
 // StoreRetentionScan selects complete, non-tombstoned requests whose effective
 // completion time (CompletedAt, otherwise CreatedAt for malformed legacy data)
-// is at or before CompletedBefore. The core must not tombstone a candidate with
-// UnacknowledgedWorkerEvent=true.
+// is at or before CompletedBefore. The core must not tombstone an ordinary
+// candidate with UnacknowledgedWorkerEvent=true. A RecoveryQuarantined request
+// is already a durable terminal adjudication: stores report its marker as false
+// so corrupt/orphan worker history cannot retain private payload forever.
 type StoreRetentionScan struct {
 	CompletedBefore time.Time
 	After           *StoreRetentionCursor

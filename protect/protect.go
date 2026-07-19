@@ -81,8 +81,10 @@ type Description struct {
 	MaxEnvelopeBytes  int64
 }
 
-// Protector seals and opens payloads. Implementations must not retain input or
-// return buffers. KMS/network work belongs outside Store transaction callbacks.
+// Protector seals and opens payloads. Implementations must be safe for
+// concurrent Describe, Seal, and Open calls using independent contexts. They
+// must not retain input or return buffers. KMS/network work belongs outside
+// Store transaction callbacks.
 type Protector interface {
 	Describe(context.Context) (Description, error)
 	Seal(context.Context, Binding, []byte) (Envelope, error)
@@ -92,13 +94,16 @@ type Protector interface {
 // Resource makes Protector ownership explicit at composition boundaries.
 // Borrowed Protectors remain caller-owned; owned Protectors (for example a KMS
 // client or an in-memory keyring) are released by the receiving Human runtime.
+// A borrowed Protector must remain valid and concurrency-safe until that
+// runtime reaches Done.
 // A runtime must acquire the value once during construction and must never call
 // Seal, Open, Describe, or Rewrap from inside a Store View/Update callback:
 // providers may perform network or hardware-KMS I/O.
 type Resource = framework.Resource[Protector]
 
 // Rewrapper optionally rotates an Envelope without changing its plaintext
-// identity. The returned envelope must still open under the exact same Binding.
+// identity. It follows Protector's concurrency and byte-ownership rules. The
+// returned envelope must still open under the exact same Binding.
 type Rewrapper interface {
 	Rewrap(context.Context, Binding, Envelope) (Envelope, error)
 }

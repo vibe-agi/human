@@ -415,9 +415,6 @@ func encodeTranscript(
 	} else if err := description.Limits.CheckStreamFrames(start); err != nil {
 		t.Fatalf("stream start: %v", err)
 	}
-	if err := description.Limits.CheckHeartbeat(encoder.Heartbeat()); err != nil {
-		t.Fatalf("heartbeat: %v", err)
-	}
 	output := cloneFrames(start)
 	for index, event := range events {
 		frames, done, err := encoder.Encode(event, seeds[index])
@@ -469,5 +466,88 @@ func TestPublicAPIConstructorsHaveStableDistinctIdentity(t *testing.T) {
 			t.Fatalf("duplicate codec id %q (%s and %s)", description.ID, previous, description.Fingerprint)
 		}
 		seen[description.ID] = description.Fingerprint
+	}
+}
+
+func TestToolCallInputPreservesIntegersBeyondFloat64Precision(t *testing.T) {
+	const exact = "9007199254740993"
+	for _, test := range builtinCodecCases() {
+		t.Run(test.name, func(t *testing.T) {
+			frames := encodeTranscript(t, test.newCodec(), false, test.model, []llm.Event{{
+				ID: "event-big-integer", Type: llm.EventToolCalls,
+				ToolCalls: []llm.ToolCall{{
+					ID: "call-big-integer", Name: "calculate",
+					Input: map[string]any{"value": json.Number(exact)},
+				}},
+			}}, []llm.EventSeed{{EncodedAtUnix: 1_700_000_002}})
+			if output := string(bytes.Join(frames, nil)); !strings.Contains(output, exact) {
+				t.Fatalf("encoded tool input lost exact integer: %s", output)
+			}
+		})
+	}
+}
+
+func TestBuiltinsDecodeToolJSONPreservesIntegersBeyondFloat64Precision(t *testing.T) {
+	const exact = "9007199254740993"
+	tests := []struct {
+		name       string
+		codec      llm.Codec
+		payload    string
+		inputAt    int
+		outputAt   int
+		wantOutput bool
+	}{
+		{
+			name: "OpenAI Chat arguments", codec: builtin.OpenAIChat(), inputAt: 1, outputAt: -1,
+			payload: `{
+				"model":"gpt-human","stream":true,
+				"messages":[
+					{"role":"user","content":"calculate"},
+					{"role":"assistant","tool_calls":[{"id":"call-big","type":"function","function":{"name":"calculate","arguments":"{\"value\":9007199254740993}"}}]}
+				],
+				"tools":[{"type":"function","function":{"name":"calculate","parameters":{"type":"object"}}}]
+			}`,
+		},
+		{
+			name: "Anthropic tool use", codec: builtin.AnthropicMessages(), inputAt: 1, outputAt: -1,
+			payload: `{
+				"model":"claude-human","stream":true,
+				"messages":[
+					{"role":"user","content":"calculate"},
+					{"role":"assistant","content":[{"type":"tool_use","id":"call-big","name":"calculate","input":{"value":9007199254740993}}]}
+				],
+				"tools":[{"name":"calculate","input_schema":{"type":"object"}}]
+			}`,
+		},
+		{
+			name: "OpenAI Responses arguments and output", codec: builtin.OpenAIResponses(),
+			inputAt: 0, outputAt: 1, wantOutput: true,
+			payload: `{
+				"model":"codex-human","stream":true,
+				"input":[
+					{"type":"function_call","call_id":"call-big","name":"calculate","arguments":"{\"value\":9007199254740993}"},
+					{"type":"function_call_output","call_id":"call-big","output":{"value":9007199254740993}}
+				],
+				"tools":[{"type":"function","name":"calculate","parameters":{"type":"object"}}]
+			}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := test.codec.Decode([]byte(test.payload))
+			if err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			input := request.Messages[test.inputAt].Blocks[0].Input["value"]
+			if number, ok := input.(json.Number); !ok || number.String() != exact {
+				t.Fatalf("tool input value = %T(%v), want json.Number(%s)", input, input, exact)
+			}
+			if test.wantOutput {
+				output := request.Messages[test.outputAt].Blocks[0].Output.(map[string]any)["value"]
+				if number, ok := output.(json.Number); !ok || number.String() != exact {
+					t.Fatalf("tool output value = %T(%v), want json.Number(%s)", output, output, exact)
+				}
+			}
+		})
 	}
 }

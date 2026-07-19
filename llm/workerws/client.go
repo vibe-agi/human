@@ -36,7 +36,9 @@ const (
 
 // HeaderProvider supplies per-dial authentication headers. It may refresh a
 // short-lived credential on every reconnect. Returned maps are cloned before
-// use and SessionHeader is always overwritten by Client.
+// use and SessionHeader is always overwritten by Client. The provider is
+// borrowed until Client.Done closes, is called by one connection loop, and
+// must honor context cancellation without retaining the returned Header.
 type HeaderProvider interface {
 	WorkerHeaders(context.Context) (http.Header, error)
 }
