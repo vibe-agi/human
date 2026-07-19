@@ -37,7 +37,10 @@ type Identity struct {
 // Authenticator belongs to this HTTP adapter, not the Agent domain. A host can
 // inspect mTLS, cookies, bearer tokens, or its own session and return canonical
 // authority/worker identity. Implementations must not trust identity fields in
-// a WebSocket message body.
+// a WebSocket message body. The implementation is borrowed until the transport
+// runtime reaches Done, called concurrently, and must honor context
+// cancellation. The request is borrowed for the call and must not be retained
+// or mutated.
 type Authenticator interface {
 	AuthenticateWorker(context.Context, *http.Request) (Identity, error)
 }

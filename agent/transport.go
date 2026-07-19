@@ -117,6 +117,7 @@ func (principal AuthenticatedWorker) Validate() error {
 // Its context bounds initialization only; after success the returned connection
 // has an independent lifecycle. The transport must call connection.Shutdown
 // when the wire session ends, but it never shuts down the endpoint itself.
+// Implementations must allow concurrent OpenWorker calls.
 type WorkerEndpoint interface {
 	OpenWorker(context.Context, AuthenticatedWorker) (WorkerConnection, error)
 }
