@@ -54,6 +54,7 @@ func (function AuthenticateFunc) AuthenticateWorker(
 // Config controls one official WebSocket adapter. The embedding application
 // owns the HTTP server/listener and mounts Transport as a handler.
 type Config struct {
+	GatewayID      GatewayID
 	Authenticator  Authenticator
 	ReadLimit      int64
 	WriteTimeout   time.Duration
@@ -63,6 +64,9 @@ type Config struct {
 }
 
 func (config Config) withDefaults() (Config, error) {
+	if err := config.GatewayID.Validate(); err != nil {
+		return Config{}, fmt.Errorf("%w: %v", ErrInvalidConfiguration, err)
+	}
 	if nilAuthenticator(config.Authenticator) {
 		return Config{}, fmt.Errorf("%w: authenticator is required", ErrInvalidConfiguration)
 	}
@@ -291,7 +295,8 @@ func (running *runtime) serveHTTP(response http.ResponseWriter, request *http.Re
 	go running.keepalive(ctx, connection, readErrors)
 
 	if err := running.write(ctx, connection, messageHello, hello{
-		Authority: string(principal.Authority), Worker: string(principal.Worker), Session: string(principal.Session),
+		Gateway: string(running.config.GatewayID), Authority: string(principal.Authority),
+		Worker: string(principal.Worker), Session: string(principal.Session),
 	}); err != nil {
 		return
 	}

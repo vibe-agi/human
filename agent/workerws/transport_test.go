@@ -18,6 +18,7 @@ import (
 func TestTransportBindsAuthenticationAndSettlesDeliveries(t *testing.T) {
 	endpoint := newFakeEndpoint()
 	transport, err := New(Config{
+		GatewayID: "gateway-a",
 		Authenticator: AuthenticateFunc(func(context.Context, *http.Request) (Identity, error) {
 			return Identity{Authority: "tenant-a", Worker: "worker-a"}, nil
 		}),
@@ -51,7 +52,8 @@ func TestTransportBindsAuthenticationAndSettlesDeliveries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotHello.Authority != "tenant-a" || gotHello.Worker != "worker-a" || gotHello.Session != "session-a" {
+	if gotHello.Gateway != "gateway-a" || gotHello.Authority != "tenant-a" ||
+		gotHello.Worker != "worker-a" || gotHello.Session != "session-a" {
 		t.Fatalf("hello = %#v", gotHello)
 	}
 
@@ -97,6 +99,7 @@ func TestTransportBindsAuthenticationAndSettlesDeliveries(t *testing.T) {
 func TestTransportNacksMalformedEventWithoutCallingEndpoint(t *testing.T) {
 	endpoint := newFakeEndpoint()
 	transport, err := New(Config{
+		GatewayID: "gateway-a",
 		Authenticator: AuthenticateFunc(func(context.Context, *http.Request) (Identity, error) {
 			return Identity{Authority: "tenant-a", Worker: "worker-a"}, nil
 		}),
@@ -142,12 +145,13 @@ func TestTransportNacksMalformedEventWithoutCallingEndpoint(t *testing.T) {
 
 func TestTransportRejectsTypedNilAuthenticatorAndUnknownWireFields(t *testing.T) {
 	var typedNil AuthenticateFunc
-	if _, err := New(Config{Authenticator: typedNil}); !errors.Is(err, ErrInvalidConfiguration) {
+	if _, err := New(Config{GatewayID: "gateway-a", Authenticator: typedNil}); !errors.Is(err, ErrInvalidConfiguration) {
 		t.Fatalf("typed nil authenticator error = %v", err)
 	}
 
 	endpoint := newFakeEndpoint()
 	transport, err := New(Config{
+		GatewayID: "gateway-a",
 		Authenticator: AuthenticateFunc(func(context.Context, *http.Request) (Identity, error) {
 			return Identity{Authority: "tenant-a", Worker: "worker-a"}, nil
 		}),
@@ -183,6 +187,7 @@ func TestTransportLeavesUnsettledEventForReconnect(t *testing.T) {
 	endpoint := newFakeEndpoint()
 	endpoint.commitError = agent.ErrWorkerDeliveryIndeterminate
 	transport, err := New(Config{
+		GatewayID: "gateway-a",
 		Authenticator: AuthenticateFunc(func(context.Context, *http.Request) (Identity, error) {
 			return Identity{Authority: "tenant-a", Worker: "worker-a"}, nil
 		}),

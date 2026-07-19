@@ -87,6 +87,7 @@ func decodeStrictJSON(encoded []byte, target any) error {
 }
 
 type hello struct {
+	Gateway   string `json:"gateway"`
 	Authority string `json:"authority"`
 	Worker    string `json:"worker"`
 	Session   string `json:"session"`
