@@ -465,6 +465,29 @@ func testLLMStoreConcurrentUpdates(ctx context.Context, t *testing.T, store llm.
 
 func testLLMStoreTasks(ctx context.Context, t *testing.T, store llm.Store) {
 	t.Helper()
+	chatA := llmConformanceTask("chat-a", 1, llm.TaskAdmitted)
+	chatA.WorkspaceKey, chatA.CapabilityTier = "", llm.TierChat
+	chatA.HarnessID, chatA.HarnessVersion, chatA.HarnessSessionID = "", "", ""
+	chatA.WorkspaceRoot, chatA.ExecAllowed = "", false
+	chatB := chatA
+	chatB.Key.Task = "task-chat-b"
+	chatB.CreatedAt = chatB.CreatedAt.Add(time.Nanosecond)
+	chatB.UpdatedAt = chatB.CreatedAt
+	if err := store.Update(ctx, func(tx llm.StoreTx) error {
+		if err := tx.InsertTask(chatA); err != nil {
+			return err
+		}
+		return tx.InsertTask(chatB)
+	}); err != nil {
+		t.Fatalf("insert concurrent same-caller Chat Tasks: %v", err)
+	}
+	if err := store.View(ctx, func(view llm.StoreView) error {
+		_, err := view.FindOpenTask(llm.StoreTaskAffinity{Caller: chatA.Key.Caller})
+		return err
+	}); !errors.Is(err, llm.ErrStoreInvalidArgument) {
+		t.Fatalf("empty Chat affinity error = %v, want ErrStoreInvalidArgument", err)
+	}
+
 	initial := llmConformanceTask("task", 1, llm.TaskAdmitted)
 	inputFeatures := initial.Codec.Contract.Features
 	if err := store.Update(ctx, func(tx llm.StoreTx) error { return tx.InsertTask(initial) }); err != nil {

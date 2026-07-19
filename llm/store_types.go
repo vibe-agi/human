@@ -161,8 +161,10 @@ type StoreTaskRecord struct {
 	UpdatedAt          time.Time
 }
 
-// StoreTaskAffinity names one exact harness conversation. It does not conflate
-// display conversation grouping with the HumanLLM correctness Task identity.
+// StoreTaskAffinity names one exact non-chat harness conversation. Every field
+// is required. Chat completions deliberately have no stable affinity and must
+// never be looked up or made unique through this type: each one owns a fresh
+// Task even when another completion from the same Caller remains active.
 type StoreTaskAffinity struct {
 	Caller           CallerID
 	WorkspaceKey     string
@@ -392,6 +394,9 @@ type StoreRetentionCandidate struct {
 // ErrStoreRecordNotFound; every returned mutable value belongs to the caller.
 type StoreView interface {
 	LoadTask(StoreTaskKey) (StoreTaskRecord, error)
+	// FindOpenTask resolves only TierRemoteTools/TierWorkspace Tasks. An empty or
+	// partial affinity returns ErrStoreInvalidArgument; absence returns
+	// ErrStoreRecordNotFound.
 	FindOpenTask(StoreTaskAffinity) (StoreTaskRecord, error)
 	FindActiveRequest(StoreTaskKey) (StoreRequestHead, error)
 	LoadRequestHead(StoreRequestKey) (StoreRequestHead, error)

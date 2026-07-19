@@ -127,7 +127,8 @@ func (view *view) FindOpenTask(affinity llm.StoreTaskAffinity) (llm.StoreTaskRec
 	if err := view.unit.ensureActive(); err != nil {
 		return llm.StoreTaskRecord{}, err
 	}
-	if affinity.Caller == "" {
+	if affinity.Caller == "" || affinity.WorkspaceKey == "" || affinity.HarnessID == "" ||
+		affinity.HarnessVersion == "" || affinity.HarnessSessionID == "" {
 		return llm.StoreTaskRecord{}, invalidArgument("invalid task affinity")
 	}
 	var encoded []byte
@@ -135,6 +136,7 @@ func (view *view) FindOpenTask(affinity llm.StoreTaskAffinity) (llm.StoreTaskRec
 		SELECT record FROM llm_tasks
 		WHERE caller_id = ? AND workspace_key = ? AND harness_id = ?
 		  AND harness_version = ? AND harness_session_id = ?
+		  AND capability_tier IN ('remote_tools', 'workspace')
 		  AND state NOT IN ('completed', 'canceled', 'rejected', 'expired', 'failed')`,
 		affinity.Caller, affinity.WorkspaceKey, affinity.HarnessID,
 		affinity.HarnessVersion, affinity.HarnessSessionID,
@@ -168,7 +170,8 @@ func (tx *tx) InsertTask(record llm.StoreTaskRecord) error {
 	} else if !errors.Is(err, llm.ErrStoreRecordNotFound) {
 		return err
 	}
-	if !record.State.Terminal() {
+	if !record.State.Terminal() &&
+		(record.CapabilityTier == llm.TierRemoteTools || record.CapabilityTier == llm.TierWorkspace) {
 		if _, err := tx.FindOpenTask(llm.StoreTaskAffinity{
 			Caller: record.Key.Caller, WorkspaceKey: record.WorkspaceKey,
 			HarnessID: record.HarnessID, HarnessVersion: record.HarnessVersion,

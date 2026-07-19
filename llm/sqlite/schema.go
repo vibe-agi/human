@@ -10,7 +10,7 @@ import (
 
 const (
 	schemaVersion     = 1
-	schemaFingerprint = "human-llm-store-v1-20260719b"
+	schemaFingerprint = "human-llm-store-v1-20260719c"
 )
 
 // ErrUnsupportedSchema rejects migrations and accidental database sharing.
@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS human_schema (
   fingerprint TEXT NOT NULL
 );
 INSERT INTO human_schema (component, version, fingerprint)
-VALUES ('llm-store', 1, 'human-llm-store-v1-20260719b')
+VALUES ('llm-store', 1, 'human-llm-store-v1-20260719c')
 ON CONFLICT(component) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS llm_tasks (
@@ -50,7 +50,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS llm_tasks_open_affinity_idx
   ON llm_tasks(
     caller_id, workspace_key, harness_id, harness_version, harness_session_id
   )
-  WHERE state NOT IN ('completed', 'canceled', 'rejected', 'expired', 'failed');
+  WHERE capability_tier IN ('remote_tools', 'workspace')
+    AND state NOT IN ('completed', 'canceled', 'rejected', 'expired', 'failed');
 
 CREATE TABLE IF NOT EXISTS llm_requests (
   caller_id TEXT NOT NULL,
