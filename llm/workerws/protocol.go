@@ -76,6 +76,9 @@ func decodePayload[T any](message envelope) (T, error) {
 func decodeStrictJSON(encoded []byte, target any) error {
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	decoder.DisallowUnknownFields()
+	// Canonical tool inputs are JSON values. UseNumber preserves integers and
+	// exponent spellings which float64 would round before core/journal digesting.
+	decoder.UseNumber()
 	if err := decoder.Decode(target); err != nil {
 		return err
 	}
