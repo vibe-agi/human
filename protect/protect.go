@@ -89,6 +89,14 @@ type Protector interface {
 	Open(context.Context, Binding, Envelope) ([]byte, error)
 }
 
+// Resource makes Protector ownership explicit at composition boundaries.
+// Borrowed Protectors remain caller-owned; owned Protectors (for example a KMS
+// client or an in-memory keyring) are released by the receiving Human runtime.
+// A runtime must acquire the value once during construction and must never call
+// Seal, Open, Describe, or Rewrap from inside a Store View/Update callback:
+// providers may perform network or hardware-KMS I/O.
+type Resource = framework.Resource[Protector]
+
 // Rewrapper optionally rotates an Envelope without changing its plaintext
 // identity. The returned envelope must still open under the exact same Binding.
 type Rewrapper interface {
