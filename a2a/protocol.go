@@ -18,6 +18,8 @@ import (
 	sdka2a "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/a2aproject/a2a-go/v2/errordetails"
+
+	"github.com/vibe-agi/human/framework"
 )
 
 type principalContextKey struct{}
@@ -52,11 +54,7 @@ type protocolHandler struct {
 func (handler *protocolHandler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	principal, err := handler.authenticate(request.Context(), request)
 	if err != nil {
-		if errors.Is(err, sdka2a.ErrUnauthorized) {
-			writeProtocolError(response, http.StatusForbidden, "PERMISSION_DENIED", sdka2a.ErrUnauthorized, "permission denied")
-			return
-		}
-		writeProtocolError(response, http.StatusUnauthorized, "UNAUTHENTICATED", sdka2a.ErrUnauthenticated, "authentication required")
+		writeAuthenticationError(response, err)
 		return
 	}
 	if err := validatePrincipal(principal); err != nil {
@@ -131,6 +129,35 @@ func (handler *protocolHandler) ServeHTTP(response http.ResponseWriter, request 
 		response.Header().Set(sdka2a.SvcParamExtensions, strings.Join(activated, ","))
 	}
 	handler.next.ServeHTTP(&protocolResponseWriter{ResponseWriter: response}, request)
+}
+
+func writeAuthenticationError(response http.ResponseWriter, err error) {
+	// A framework classification is the embedding application's explicit wire
+	// contract and therefore takes precedence over any sentinel retained as its
+	// Cause. The cause itself must never cross this authentication boundary.
+	if code, retry, classified := framework.FaultInfo(err); classified {
+		switch {
+		case code == framework.CodeUnauthenticated && retry == framework.RetryNever:
+			writeProtocolError(response, http.StatusUnauthorized, "UNAUTHENTICATED", sdka2a.ErrUnauthenticated, "authentication required")
+		case code == framework.CodeForbidden && retry == framework.RetryNever:
+			writeProtocolError(response, http.StatusForbidden, "PERMISSION_DENIED", sdka2a.ErrUnauthorized, "permission denied")
+		default:
+			writeProtocolError(response, http.StatusServiceUnavailable, "UNAVAILABLE", sdka2a.ErrServerError, "service unavailable")
+		}
+		return
+	}
+
+	// Preserve the official SDK sentinels accepted before framework.Fault was
+	// introduced. Any other error may be an authentication dependency failure;
+	// treating it as bad credentials would hide an outage and discourage retry.
+	switch {
+	case errors.Is(err, sdka2a.ErrUnauthorized):
+		writeProtocolError(response, http.StatusForbidden, "PERMISSION_DENIED", sdka2a.ErrUnauthorized, "permission denied")
+	case errors.Is(err, sdka2a.ErrUnauthenticated):
+		writeProtocolError(response, http.StatusUnauthorized, "UNAUTHENTICATED", sdka2a.ErrUnauthenticated, "authentication required")
+	default:
+		writeProtocolError(response, http.StatusServiceUnavailable, "UNAVAILABLE", sdka2a.ErrServerError, "service unavailable")
+	}
 }
 
 func validatePrincipal(principal Principal) error {

@@ -43,7 +43,11 @@ type Resolution struct {
 // system onto the transport-neutral HumanLLM identity boundary. It is borrowed
 // until the transport runtime reaches Done, called concurrently, and must honor
 // context cancellation. ResolutionRequest and all nested values are borrowed
-// for the call and must not be retained or mutated.
+// for the call and must not be retained or mutated. Invalid caller input may
+// return an error matching ErrResolution or a framework CodeInvalid/RetryNever
+// Fault. Authorization denial uses CodeForbidden/RetryNever; temporary routing
+// or identity-store failures use CodeUnavailable/RetryBackoff. Unclassified
+// errors are treated as infrastructure failures rather than client mistakes.
 type RequestResolver interface {
 	ResolveRequest(context.Context, ResolutionRequest) (Resolution, error)
 }

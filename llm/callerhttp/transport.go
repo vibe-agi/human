@@ -69,7 +69,11 @@ type Identity struct {
 // upstream-context identity system to HumanLLM. It is borrowed until the
 // transport runtime reaches Done, called concurrently, and must honor context
 // cancellation. The request is borrowed for the call and must not be retained
-// or mutated.
+// or mutated. Return a framework Fault with CodeUnauthenticated/CodeForbidden
+// and RetryNever only for a proved terminal credential decision. Return
+// CodeUnavailable with RetryBackoff for a temporary identity-provider failure;
+// an unclassified error is fail-closed as HTTP 503 rather than being
+// misrepresented as revoked credentials.
 type Authenticator interface {
 	AuthenticateCaller(context.Context, *http.Request) (Identity, error)
 }

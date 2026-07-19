@@ -786,6 +786,133 @@ func TestServiceHooksCannotMutateCanonicalOrDurableInputs(t *testing.T) {
 	}
 }
 
+func TestServiceToolAuthorizerFaultClassificationPreservesExactRetry(t *testing.T) {
+	secret := errors.New("private policy-provider failure")
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "provider unavailable",
+			err: framework.NewFault(
+				framework.CodeUnavailable, framework.RetryBackoff, "policy service unavailable", secret,
+			),
+		},
+		{name: "unclassified infrastructure error", err: secret},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, borrowed := openBorrowedRegressionStore(t)
+			var authorizationCalls atomic.Int32
+			authorizer := llm.ToolAuthorizerFunc(func(context.Context, llm.ToolAuthorization) error {
+				if authorizationCalls.Add(1) == 1 {
+					return test.err
+				}
+				return nil
+			})
+			service := newRegressionService(t, borrowed, regressionServiceOptions{
+				codecs: []llm.CodecRegistration{{
+					Codec: hookCodec{}, StreamContentType: "text/event-stream",
+					AggregateContentType: "application/json", SuccessStatus: 200,
+				}},
+				authorizer: authorizer,
+			})
+			worker := openTestWorker(t, service, "worker-a", "session-a")
+			result, err := service.Admit(t.Context(), llm.AdmissionRequest{
+				CallerID: "caller-a", IdempotencyKey: "tool-auth-retry", CodecID: hookCodecID,
+				Body: []byte(`{"stream":false}`), Task: testRemoteTask(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assignment := receiveServiceAssignment(t, worker)
+			if err := worker.AckAssignment(t.Context(), assignment.ID); err != nil {
+				t.Fatal(err)
+			}
+			delivery := workerDelivery(assignment, "delivery-tool-auth", llm.Event{
+				ID: "event-tool-auth", Type: llm.EventToolCalls,
+				ToolCalls: []llm.ToolCall{{
+					ID: "call-tool-auth", Name: "calculate", Input: map[string]any{"value": "original"},
+				}},
+			})
+
+			receipt, err := worker.CommitEvent(t.Context(), delivery)
+			var deliveryErr *llm.WorkerDeliveryError
+			if err == nil || !errors.As(err, &deliveryErr) || receipt.Decision != "" || !errors.Is(err, test.err) {
+				t.Fatalf("temporary authorization settlement = %+v, %v", receipt, err)
+			}
+			requestKey := llm.StoreRequestKey{Caller: "caller-a", IdempotencyKey: "tool-auth-retry"}
+			toolKey := llm.StoreToolExecutionKey{
+				Task:       llm.StoreTaskKey{Caller: "caller-a", Task: result.Identity.TaskID},
+				ToolCallID: "call-tool-auth",
+			}
+			if err := store.View(t.Context(), func(view llm.StoreView) error {
+				if _, loadErr := view.LoadWorkerReceipt(requestKey, delivery.Event.ID); !errors.Is(loadErr, llm.ErrStoreRecordNotFound) {
+					return fmt.Errorf("temporary authorization persisted worker receipt: %w", loadErr)
+				}
+				if _, loadErr := view.LoadToolExecution(toolKey, llm.StoreReadLimit{MaxBytes: 1 << 20}); !errors.Is(loadErr, llm.ErrStoreRecordNotFound) {
+					return fmt.Errorf("temporary authorization persisted tool execution: %w", loadErr)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			receipt, err = worker.CommitEvent(t.Context(), delivery)
+			if err != nil || receipt.Decision != llm.WorkerEventACK || authorizationCalls.Load() != 2 {
+				t.Fatalf("exact retry settlement = %+v, %v; authorization calls=%d", receipt, err, authorizationCalls.Load())
+			}
+			if err := store.View(t.Context(), func(view llm.StoreView) error {
+				if _, loadErr := view.LoadWorkerReceipt(requestKey, delivery.Event.ID); loadErr != nil {
+					return loadErr
+				}
+				_, loadErr := view.LoadToolExecution(toolKey, llm.StoreReadLimit{MaxBytes: 1 << 20})
+				return loadErr
+			}); err != nil {
+				t.Fatalf("exact retry did not durably settle tool event: %v", err)
+			}
+		})
+	}
+}
+
+func TestServiceToolAuthorizerExplicitForbiddenIsTerminalNACK(t *testing.T) {
+	_, borrowed := openBorrowedRegressionStore(t)
+	var authorizationCalls atomic.Int32
+	authorizer := llm.ToolAuthorizerFunc(func(context.Context, llm.ToolAuthorization) error {
+		authorizationCalls.Add(1)
+		return framework.NewFault(
+			framework.CodeForbidden, framework.RetryNever, "tool denied by policy", errors.New("private rule"),
+		)
+	})
+	service := newRegressionService(t, borrowed, regressionServiceOptions{
+		codecs: []llm.CodecRegistration{{
+			Codec: hookCodec{}, StreamContentType: "text/event-stream",
+			AggregateContentType: "application/json", SuccessStatus: 200,
+		}},
+		authorizer: authorizer,
+	})
+	worker := openTestWorker(t, service, "worker-a", "session-a")
+	_, err := service.Admit(t.Context(), llm.AdmissionRequest{
+		CallerID: "caller-a", IdempotencyKey: "tool-auth-forbidden", CodecID: hookCodecID,
+		Body: []byte(`{"stream":false}`), Task: testRemoteTask(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment := receiveServiceAssignment(t, worker)
+	if err := worker.AckAssignment(t.Context(), assignment.ID); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := worker.CommitEvent(t.Context(), workerDelivery(assignment, "delivery-tool-forbidden", llm.Event{
+		ID: "event-tool-forbidden", Type: llm.EventToolCalls,
+		ToolCalls: []llm.ToolCall{{ID: "call-tool-forbidden", Name: "calculate"}},
+	}))
+	if err != nil || receipt.Decision != llm.WorkerEventNACK || receipt.Code != llm.WorkerRejectForbidden ||
+		authorizationCalls.Load() != 1 {
+		t.Fatalf("explicit forbidden settlement = %+v, %v; authorization calls=%d", receipt, err, authorizationCalls.Load())
+	}
+}
+
 func TestServiceWorkerToolEventLargeIntegerExactReplayAfterRestart(t *testing.T) {
 	const exact = "9007199254740993"
 	store, borrowed := openBorrowedRegressionStore(t)
@@ -1210,6 +1337,14 @@ func (store *transientUnknownStore) View(ctx context.Context, callback func(llm.
 	for {
 		remaining := store.failViews.Load()
 		if remaining <= 0 {
+			return store.Store.View(ctx, callback)
+		}
+		// Both reconciliation paths deliberately replace the operation context
+		// with a fresh five-second deadline. Restrict the injected outage to those
+		// reads so an already-woken response waiter cannot race to consume the one
+		// failure intended for commit reconciliation.
+		deadline, hasDeadline := ctx.Deadline()
+		if !hasDeadline || time.Until(deadline) > 10*time.Second {
 			return store.Store.View(ctx, callback)
 		}
 		if store.failViews.CompareAndSwap(remaining, remaining-1) {

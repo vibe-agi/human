@@ -40,6 +40,11 @@ type Principal struct {
 // decoded. Implementations may inspect TLS state, headers, host routing, or an
 // embedding application's own session context. Non-anonymous requirements must
 // be declared consistently in the public Agent Card's security contract.
+// Return framework CodeUnauthenticated/CodeForbidden Faults with RetryNever for
+// terminal rejection and CodeUnavailable with a retryable mode for dependency
+// failure. The A2A SDK's unauthenticated/unauthorized sentinels are also
+// recognized; every unclassified error fails closed as 503 without exposing its
+// cause.
 type AuthenticateFunc func(context.Context, *http.Request) (Principal, error)
 
 // ResolveWorkspaceFunc maps a new A2A task to an authenticated Workspace. It
@@ -48,8 +53,10 @@ type AuthenticateFunc func(context.Context, *http.Request) (Principal, error)
 type ResolveWorkspaceFunc func(context.Context, Principal, *sdka2a.SendMessageRequest) (agent.WorkspaceID, error)
 
 // AuthorizeApplyReceiptFunc authorizes the caller-side CAS journal to report a
-// terminal outcome for one published Artifact. Returning an error denies the
-// operation.
+// terminal outcome for one published Artifact. A terminal denial must be a
+// framework CodeUnauthenticated or CodeForbidden Fault with RetryNever. Every
+// unavailable or unclassified error is projected as retryable service failure,
+// never as a permanent denial; cause text is not exposed on the wire.
 type AuthorizeApplyReceiptFunc func(context.Context, Principal, agent.Task, *RecordApplyReceiptRequest) error
 
 // Service is the transport-facing HumanAgent domain surface used by this A2A

@@ -181,7 +181,13 @@ type ToolAuthorization struct {
 // authorizer. Calls happen outside Store callbacks. Input is borrowed for the
 // call; implementations must not retain or mutate its nested mutable values.
 // Implementations must be concurrency-safe until Service.Done and honor
-// cancellation. Any error is a fail-closed denial, not a transient permission.
+// cancellation. Calls are retryable protocol work and may repeat when a prior
+// attempt produced no durable WorkerReceipt, so implementations must be
+// reentrant and must not consume one-shot authority as an untracked side
+// effect. Only a framework Fault with CodeForbidden and RetryNever is a proved
+// deterministic denial and produces a terminal worker NACK. CodeUnavailable,
+// cancellation, and unclassified infrastructure errors fail closed without
+// settling the durable worker outbox record, allowing an exact retry.
 type ToolAuthorizer interface {
 	AuthorizeTool(context.Context, ToolAuthorization) error
 }
@@ -201,6 +207,8 @@ func (authorizer ToolAuthorizerFunc) AuthorizeTool(ctx context.Context, input To
 // valid until Service.Done. Other ports are borrowed for the runtime lifetime
 // and must satisfy their documented concurrency contracts. No default database,
 // network transport, authentication provider, or key provider is selected here.
+// Store binding is namespace identity rather than an HA lease; without external
+// fencing, only one active Service may drive one Store/DeploymentID pair.
 type Config struct {
 	DeploymentID string
 	Store        framework.Resource[Store]

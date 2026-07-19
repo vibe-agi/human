@@ -40,7 +40,11 @@ type Identity struct {
 // a WebSocket message body. The implementation is borrowed until the transport
 // runtime reaches Done, called concurrently, and must honor context
 // cancellation. The request is borrowed for the call and must not be retained
-// or mutated.
+// or mutated. Return a framework Fault with
+// CodeUnauthenticated/CodeForbidden and RetryNever only for a proved terminal
+// credential decision. Temporary provider failures use
+// CodeUnavailable/RetryBackoff; unclassified errors fail closed as HTTP 503 so
+// a durable worker keeps reconnecting instead of treating the token as revoked.
 type Authenticator interface {
 	AuthenticateWorker(context.Context, *http.Request) (Identity, error)
 }
@@ -246,9 +250,22 @@ func (running *runtime) serveHTTP(response http.ResponseWriter, request *http.Re
 	}
 	defer running.handlers.Done()
 
-	identity, err := running.config.Authenticator.AuthenticateWorker(request.Context(), request)
+	// Bind authentication and endpoint initialization to both the HTTP peer and
+	// adapter lifetime. Shutdown can therefore drain a handler stuck in a custom
+	// authenticator as long as that implementation respects its context.
+	handlerCtx, cancelHandler := context.WithCancelCause(request.Context())
+	stopLifecycleCancel := context.AfterFunc(running.lifecycle, func() {
+		cancelHandler(context.Cause(running.lifecycle))
+	})
+	defer func() {
+		stopLifecycleCancel()
+		cancelHandler(nil)
+	}()
+	request = request.WithContext(handlerCtx)
+
+	identity, err := running.config.Authenticator.AuthenticateWorker(handlerCtx, request)
 	if err != nil {
-		http.Error(response, ErrAuthentication.Error(), http.StatusUnauthorized)
+		http.Error(response, ErrAuthentication.Error(), authenticationStatus(err))
 		return
 	}
 	session := strings.TrimSpace(request.Header.Get(SessionHeader))
@@ -279,7 +296,7 @@ func (running *runtime) serveHTTP(response http.ResponseWriter, request *http.Re
 		connection.CloseNow()
 	}()
 
-	coreConnection, err := running.endpoint.OpenWorker(request.Context(), principal)
+	coreConnection, err := running.endpoint.OpenWorker(handlerCtx, principal)
 	if err != nil {
 		_ = connection.Close(websocket.StatusPolicyViolation, safeConnectionMessage(err))
 		return
@@ -290,7 +307,7 @@ func (running *runtime) serveHTTP(response http.ResponseWriter, request *http.Re
 		_ = coreConnection.Shutdown(shutdownCtx)
 	}()
 
-	ctx, cancel := context.WithCancelCause(running.lifecycle)
+	ctx, cancel := context.WithCancelCause(handlerCtx)
 	defer cancel(nil)
 	incoming := make(chan envelope)
 	readErrors := make(chan error, 1)
@@ -332,6 +349,21 @@ func (running *runtime) serveHTTP(response http.ResponseWriter, request *http.Re
 				return
 			}
 		}
+	}
+}
+
+func authenticationStatus(err error) int {
+	code, retry, ok := framework.FaultInfo(err)
+	if !ok {
+		return http.StatusServiceUnavailable
+	}
+	switch {
+	case code == framework.CodeUnauthenticated && retry == framework.RetryNever:
+		return http.StatusUnauthorized
+	case code == framework.CodeForbidden && retry == framework.RetryNever:
+		return http.StatusForbidden
+	default:
+		return http.StatusServiceUnavailable
 	}
 }
 

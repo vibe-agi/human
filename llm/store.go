@@ -74,6 +74,12 @@ type StoreDescription struct {
 // logical key: applications that need multi-tenant sharing provide one isolated
 // Store resource per deployment (or an adapter which applies that namespace
 // internally).
+//
+// Binding is persistent namespace identity, not a live-owner lease or an HA
+// fencing token. Unless an embedding application adds external coordination,
+// exactly one active Service may drive a bound correctness namespace. A
+// serializable Store prevents duplicate commits but cannot by itself prevent two
+// Service processes from presenting the same assignment to two Humans.
 type StoreBinding struct {
 	DeploymentID string
 }
@@ -302,6 +308,7 @@ type Store interface {
 	// StoreConstraintDeploymentBinding and leave the first binding unchanged.
 	// It honors cancellation. A result which may have committed must match
 	// ErrStoreCommitUnknown; repeating the exact binding is its reconciliation.
+	// Bind does not acquire a live runtime lease; see StoreBinding.
 	Bind(context.Context, StoreBinding) error
 	View(context.Context, func(StoreView) error) error
 	Update(context.Context, func(StoreTx) error) error

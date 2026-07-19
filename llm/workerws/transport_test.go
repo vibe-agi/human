@@ -1,9 +1,11 @@
 package workerws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/llm"
 )
 
@@ -22,7 +25,9 @@ func TestTransportAuthenticatesIdentityAndUsesExactSettlementBoundaries(t *testi
 		GatewayID: "gateway-a",
 		Authenticator: AuthenticateFunc(func(_ context.Context, request *http.Request) (Identity, error) {
 			if request.Header.Get("Authorization") != "Bearer worker-secret" {
-				return Identity{}, errors.New("denied")
+				return Identity{}, framework.NewFault(
+					framework.CodeUnauthenticated, framework.RetryNever, "denied", nil,
+				)
 			}
 			return Identity{Worker: "worker-a"}, nil
 		}),
@@ -115,6 +120,67 @@ func TestTransportAuthenticatesIdentityAndUsesExactSettlementBoundaries(t *testi
 	if nack.Decision != llm.WorkerEventNACK || nack.Code != llm.WorkerRejectStateConflict ||
 		nack.Delivery != rejected.ID || nack.EventID != rejected.Event.ID {
 		t.Fatalf("endpoint NACK changed on wire: %#v", nack)
+	}
+}
+
+func TestTransportClassifiesAuthenticationFaultsWithoutLeakingCause(t *testing.T) {
+	secret := errors.New("secret worker identity-provider detail")
+	tests := []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{
+			name: "unauthenticated",
+			err: framework.NewFault(
+				framework.CodeUnauthenticated, framework.RetryNever, "do not expose", secret,
+			),
+			status: http.StatusUnauthorized,
+		},
+		{
+			name: "forbidden",
+			err: framework.NewFault(
+				framework.CodeForbidden, framework.RetryNever, "do not expose", secret,
+			),
+			status: http.StatusForbidden,
+		},
+		{
+			name: "provider unavailable",
+			err: framework.NewFault(
+				framework.CodeUnavailable, framework.RetryBackoff, "do not expose", secret,
+			),
+			status: http.StatusServiceUnavailable,
+		},
+		{name: "unclassified infrastructure error", err: secret, status: http.StatusServiceUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, server := startTestTransport(t, newFakeEndpoint(), Config{
+				GatewayID: "gateway-a",
+				Authenticator: AuthenticateFunc(func(context.Context, *http.Request) (Identity, error) {
+					return Identity{}, test.err
+				}),
+				PingInterval: time.Hour,
+			})
+			connection, response, err := dial(server.URL, "session-auth", "")
+			if connection != nil {
+				connection.CloseNow()
+			}
+			if err == nil || response == nil {
+				t.Fatalf("authentication dial = connection=%v response=%v err=%v", connection, response, err)
+			}
+			body, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if response.StatusCode != test.status {
+				t.Fatalf("authentication status = %d, want %d", response.StatusCode, test.status)
+			}
+			if bytes.Contains(body, []byte(secret.Error())) || bytes.Contains(body, []byte("do not expose")) {
+				t.Fatalf("authentication response leaked private diagnostics: %q", body)
+			}
+		})
 	}
 }
 

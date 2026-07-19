@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"iter"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
 	"github.com/vibe-agi/human/agent"
+	"github.com/vibe-agi/human/framework"
 )
 
 const testExtensionURI = "https://vibe-agi.example/extensions/workspace/v1"
@@ -178,6 +180,147 @@ func TestProtocolGuardRejectsBeforeDispatch(t *testing.T) {
 			}
 			if got := response.Header().Get("Content-Type"); got != "application/json" {
 				t.Fatalf("Content-Type = %q", got)
+			}
+		})
+	}
+}
+
+func TestProtocolGuardClassifiesAuthenticationErrorsWithoutLeakingCauses(t *testing.T) {
+	const secretCause = "postgres password=auth-secret"
+	newFault := func(t *testing.T, code framework.FaultCode, retry framework.RetryMode) error {
+		t.Helper()
+		err := framework.NewFault(code, retry, "embedding-only authentication detail", errors.New(secretCause))
+		if _, _, ok := framework.FaultInfo(err); !ok {
+			t.Fatalf("construct framework fault: %v", err)
+		}
+		return err
+	}
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantGRPC   string
+		wantReason string
+		wantBody   string
+	}{
+		{
+			name: "framework unauthenticated", err: newFault(t, framework.CodeUnauthenticated, framework.RetryNever),
+			wantStatus: http.StatusUnauthorized, wantGRPC: "UNAUTHENTICATED", wantReason: "UNAUTHENTICATED", wantBody: "authentication required",
+		},
+		{
+			name: "framework forbidden", err: newFault(t, framework.CodeForbidden, framework.RetryNever),
+			wantStatus: http.StatusForbidden, wantGRPC: "PERMISSION_DENIED", wantReason: "UNAUTHORIZED", wantBody: "permission denied",
+		},
+		{
+			name: "framework unavailable", err: newFault(t, framework.CodeUnavailable, framework.RetryBackoff),
+			wantStatus: http.StatusServiceUnavailable, wantGRPC: "UNAVAILABLE", wantReason: "SERVER_ERROR", wantBody: "service unavailable",
+		},
+		{
+			name: "unclassified infrastructure failure", err: errors.New(secretCause),
+			wantStatus: http.StatusServiceUnavailable, wantGRPC: "UNAVAILABLE", wantReason: "SERVER_ERROR", wantBody: "service unavailable",
+		},
+		{
+			name: "SDK unauthenticated remains compatible", err: fmt.Errorf("wrapped: %w", sdka2a.ErrUnauthenticated),
+			wantStatus: http.StatusUnauthorized, wantGRPC: "UNAUTHENTICATED", wantReason: "UNAUTHENTICATED", wantBody: "authentication required",
+		},
+		{
+			name: "SDK unauthorized remains compatible", err: fmt.Errorf("wrapped: %w", sdka2a.ErrUnauthorized),
+			wantStatus: http.StatusForbidden, wantGRPC: "PERMISSION_DENIED", wantReason: "UNAUTHORIZED", wantBody: "permission denied",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			authenticate := func(context.Context, *http.Request) (Principal, error) {
+				return Principal{}, test.err
+			}
+			fake := &fakeRequestHandler{sendMessage: func(context.Context, *sdka2a.SendMessageRequest) (sdka2a.SendMessageResult, error) {
+				calls++
+				return testTask(), nil
+			}}
+			handler := newHTTPHandler(testHandlerConfig(t, authenticate), fake)
+			request := sendRequest(t, "/message:send", 0)
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if calls != 0 {
+				t.Fatalf("request handler calls = %d, want 0", calls)
+			}
+			var envelope protocolErrorEnvelope
+			if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+				t.Fatalf("decode protocol error: %v; body=%s", err, response.Body.String())
+			}
+			if envelope.Error.Status != test.wantGRPC {
+				t.Errorf("gRPC status = %q, want %q", envelope.Error.Status, test.wantGRPC)
+			}
+			if envelope.Error.Message != test.wantBody {
+				t.Errorf("message = %q, want %q", envelope.Error.Message, test.wantBody)
+			}
+			if got := protocolErrorReason(t, response.Body.Bytes()); got != test.wantReason {
+				t.Errorf("error reason = %q, want %q", got, test.wantReason)
+			}
+			if body := response.Body.String(); strings.Contains(body, secretCause) || strings.Contains(body, "embedding-only authentication detail") || strings.Contains(body, "wrapped:") {
+				t.Fatalf("authentication response leaked internal error detail: %s", body)
+			}
+		})
+	}
+}
+
+func TestApplyReceiptAuthorizationClassifiesFaultsWithoutLeakingCauses(t *testing.T) {
+	const secretCause = "policy database password=receipt-secret"
+	newFault := func(t *testing.T, code framework.FaultCode, retry framework.RetryMode) error {
+		t.Helper()
+		err := framework.NewFault(code, retry, "embedding-only receipt policy detail", errors.New(secretCause))
+		if _, _, ok := framework.FaultInfo(err); !ok {
+			t.Fatalf("construct framework fault: %v", err)
+		}
+		return err
+	}
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantReason string
+		wantBody   string
+		wantRetry  bool
+	}{
+		{
+			name: "unauthenticated terminal denial", err: newFault(t, framework.CodeUnauthenticated, framework.RetryNever),
+			wantStatus: http.StatusUnauthorized, wantReason: "UNAUTHENTICATED", wantBody: "authentication required",
+		},
+		{
+			name: "forbidden terminal denial", err: newFault(t, framework.CodeForbidden, framework.RetryNever),
+			wantStatus: http.StatusForbidden, wantReason: "UNAUTHORIZED", wantBody: "permission denied",
+		},
+		{
+			name: "policy unavailable", err: newFault(t, framework.CodeUnavailable, framework.RetryBackoff),
+			wantStatus: http.StatusServiceUnavailable, wantReason: "SERVER_ERROR", wantBody: "authorization service unavailable", wantRetry: true,
+		},
+		{
+			name: "unclassified policy failure", err: errors.New(secretCause),
+			wantStatus: http.StatusServiceUnavailable, wantReason: "SERVER_ERROR", wantBody: "authorization service unavailable", wantRetry: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			writeApplyReceiptAuthorizationError(response, test.err)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if got := protocolErrorReason(t, response.Body.Bytes()); got != test.wantReason {
+				t.Fatalf("error reason = %q, want %q", got, test.wantReason)
+			}
+			if body := response.Body.String(); !strings.Contains(body, test.wantBody) || strings.Contains(body, secretCause) || strings.Contains(body, "embedding-only") {
+				t.Fatalf("unsafe or unexpected body: %s", body)
+			}
+			if got := response.Header().Get("Retry-After") != ""; got != test.wantRetry {
+				t.Fatalf("Retry-After present = %t, want %t", got, test.wantRetry)
 			}
 		})
 	}

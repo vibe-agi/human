@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/llm"
 )
 
@@ -105,7 +106,11 @@ func (running *runtime) serveHTTP(response http.ResponseWriter, request *http.Re
 	authRequest.ContentLength = int64(len(body))
 	identity, err := running.config.authenticator.AuthenticateCaller(handlerCtx, authRequest)
 	_ = authRequest.Body.Close()
-	if err != nil || !stableIdentity.MatchString(string(identity.CallerID)) {
+	if err != nil {
+		writeAdapterError(response, authenticationStatus(err), "caller authentication failed")
+		return
+	}
+	if !stableIdentity.MatchString(string(identity.CallerID)) {
 		writeAdapterError(response, http.StatusUnauthorized, "caller authentication failed")
 		return
 	}
@@ -119,7 +124,7 @@ func (running *runtime) serveHTTP(response http.ResponseWriter, request *http.Re
 		if handlerCtx.Err() != nil {
 			return
 		}
-		writeAdapterError(response, http.StatusBadRequest, "caller request identity could not be resolved")
+		writeAdapterError(response, resolutionStatus(err), "caller request identity could not be resolved")
 		return
 	}
 	if !stableIdentity.MatchString(string(resolution.IdempotencyKey)) {
@@ -161,6 +166,48 @@ func (running *runtime) serveHTTP(response http.ResponseWriter, request *http.Re
 	}
 	setIdentityHeaders(response.Header(), admission.Identity)
 	running.writeResponse(handlerCtx, response, admission)
+}
+
+// authenticationStatus deliberately treats an unclassified error as an
+// infrastructure failure. A custom authenticator must opt into a terminal
+// credential decision with a typed framework Fault; otherwise returning 401
+// would make a transient IAM/database outage look like revoked credentials.
+func authenticationStatus(err error) int {
+	code, retry, ok := framework.FaultInfo(err)
+	if !ok {
+		return http.StatusServiceUnavailable
+	}
+	switch {
+	case code == framework.CodeUnauthenticated && retry == framework.RetryNever:
+		return http.StatusUnauthorized
+	case code == framework.CodeForbidden && retry == framework.RetryNever:
+		return http.StatusForbidden
+	default:
+		return http.StatusServiceUnavailable
+	}
+}
+
+func resolutionStatus(err error) int {
+	code, retry, ok := framework.FaultInfo(err)
+	if ok {
+		if retry != framework.RetryNever {
+			return http.StatusServiceUnavailable
+		}
+		switch code {
+		case framework.CodeInvalid:
+			return http.StatusBadRequest
+		case framework.CodeUnauthenticated:
+			return http.StatusUnauthorized
+		case framework.CodeForbidden:
+			return http.StatusForbidden
+		default:
+			return http.StatusServiceUnavailable
+		}
+	}
+	if errors.Is(err, ErrResolution) {
+		return http.StatusBadRequest
+	}
+	return http.StatusServiceUnavailable
 }
 
 func readRequestBody(

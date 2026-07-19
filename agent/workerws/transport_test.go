@@ -1,8 +1,10 @@
 package workerws
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/vibe-agi/human/agent"
+	"github.com/vibe-agi/human/framework"
 )
 
 func TestTransportBindsAuthenticationAndSettlesDeliveries(t *testing.T) {
@@ -93,6 +96,127 @@ func TestTransportBindsAuthenticationAndSettlesDeliveries(t *testing.T) {
 	}
 	if committed := <-core.events; committed.Event.Task.Workspace.Authority != "tenant-a" {
 		t.Fatalf("committed event escaped authenticated authority: %#v", committed)
+	}
+}
+
+func TestTransportClassifiesAuthenticationFaultsWithoutLeakingCause(t *testing.T) {
+	secret := errors.New("secret Agent identity-provider detail")
+	tests := []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{
+			name: "unauthenticated",
+			err: framework.NewFault(
+				framework.CodeUnauthenticated, framework.RetryNever, "do not expose", secret,
+			),
+			status: http.StatusUnauthorized,
+		},
+		{
+			name: "forbidden",
+			err: framework.NewFault(
+				framework.CodeForbidden, framework.RetryNever, "do not expose", secret,
+			),
+			status: http.StatusForbidden,
+		},
+		{
+			name: "provider unavailable",
+			err: framework.NewFault(
+				framework.CodeUnavailable, framework.RetryBackoff, "do not expose", secret,
+			),
+			status: http.StatusServiceUnavailable,
+		},
+		{name: "unclassified infrastructure error", err: secret, status: http.StatusServiceUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport, err := New(Config{
+				GatewayID: "gateway-a",
+				Authenticator: AuthenticateFunc(func(context.Context, *http.Request) (Identity, error) {
+					return Identity{}, test.err
+				}),
+				PingInterval: time.Hour,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime, err := transport.Start(t.Context(), newFakeEndpoint())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer runtime.Shutdown(context.Background())
+			server := httptest.NewServer(transport)
+			defer server.Close()
+
+			header := http.Header{}
+			header.Set(SessionHeader, "session-auth")
+			connection, response, dialErr := websocket.Dial(
+				t.Context(), "ws"+strings.TrimPrefix(server.URL, "http"),
+				&websocket.DialOptions{HTTPHeader: header},
+			)
+			if connection != nil {
+				connection.CloseNow()
+			}
+			if dialErr == nil || response == nil {
+				t.Fatalf("authentication dial = connection=%v response=%v err=%v", connection, response, dialErr)
+			}
+			body, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if response.StatusCode != test.status {
+				t.Fatalf("authentication status = %d, want %d", response.StatusCode, test.status)
+			}
+			if bytes.Contains(body, []byte(secret.Error())) || bytes.Contains(body, []byte("do not expose")) {
+				t.Fatalf("authentication response leaked private diagnostics: %q", body)
+			}
+		})
+	}
+}
+
+func TestTransportShutdownCancelsAdmittedAuthenticationAndDrainsHandler(t *testing.T) {
+	entered := make(chan struct{})
+	var enteredOnce sync.Once
+	transport, err := New(Config{
+		GatewayID: "gateway-a",
+		Authenticator: AuthenticateFunc(func(ctx context.Context, _ *http.Request) (Identity, error) {
+			enteredOnce.Do(func() { close(entered) })
+			<-ctx.Done()
+			return Identity{}, ctx.Err()
+		}),
+		PingInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := transport.Start(t.Context(), newFakeEndpoint())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(transport)
+	defer server.Close()
+	requestDone := make(chan error, 1)
+	go func() {
+		response, requestErr := server.Client().Get(server.URL)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		requestDone <- requestErr
+	}()
+	waitSignal(t, entered, "blocking authenticator")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := runtime.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown with admitted authenticator: %v", err)
+	}
+	waitSignal(t, runtime.Done(), "transport with admitted authenticator")
+	select {
+	case <-requestDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("authentication handler survived transport shutdown")
 	}
 }
 
@@ -268,6 +392,15 @@ func writeEnvelope(t *testing.T, connection *websocket.Conn, kind messageType, p
 	defer cancel()
 	if err := wsjson.Write(ctx, connection, message); err != nil {
 		t.Fatalf("write worker message: %v", err)
+	}
+}
+
+func waitSignal(t *testing.T, done <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("%s did not stop", name)
 	}
 }
 

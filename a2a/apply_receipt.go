@@ -10,6 +10,7 @@ import (
 
 	sdk "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/vibe-agi/human/agent"
+	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/workspace"
 )
 
@@ -101,7 +102,7 @@ func (handler *applyReceiptHandler) ServeHTTP(response http.ResponseWriter, requ
 		return
 	}
 	if err := handler.authorize(request.Context(), principal, task, &payload); err != nil {
-		writeProtocolError(response, http.StatusForbidden, "PERMISSION_DENIED", sdk.ErrUnauthorized, "permission denied")
+		writeApplyReceiptAuthorizationError(response, err)
 		return
 	}
 	if task.State != agent.TaskCompleted || task.Artifact == nil || string(task.Artifact.ID) != payload.ArtifactID {
@@ -127,6 +128,22 @@ func (handler *applyReceiptHandler) ServeHTTP(response http.ResponseWriter, requ
 		ObservedRevision: receipt.ObservedRevision, Code: receipt.Code,
 		Message: receipt.Message, RecordedAt: receipt.RecordedAt,
 	})
+}
+
+func writeApplyReceiptAuthorizationError(response http.ResponseWriter, err error) {
+	code, retry, classified := framework.FaultInfo(err)
+	switch {
+	case classified && code == framework.CodeUnauthenticated && retry == framework.RetryNever:
+		writeProtocolError(response, http.StatusUnauthorized, "UNAUTHENTICATED", sdk.ErrUnauthenticated, "authentication required")
+	case classified && code == framework.CodeForbidden && retry == framework.RetryNever:
+		writeProtocolError(response, http.StatusForbidden, "PERMISSION_DENIED", sdk.ErrUnauthorized, "permission denied")
+	default:
+		// An unclassified policy error is an infrastructure failure, not proof that
+		// the caller is forbidden. Keep the receipt retryable and never expose the
+		// policy backend's cause or safe embedding-only Fault message.
+		response.Header().Set("Retry-After", "1")
+		writeProtocolError(response, http.StatusServiceUnavailable, "UNAVAILABLE", sdk.ErrServerError, "authorization service unavailable")
+	}
 }
 
 func extensionRequested(request *http.Request, uri string) bool {

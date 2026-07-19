@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/llm"
 	"github.com/vibe-agi/human/llm/callerhttp"
 )
@@ -197,7 +198,7 @@ func TestTransportAuthResolverRouteAndBodyFailuresAreFinite(t *testing.T) {
 		})
 		defer shutdownTransport(t, runtime, server)
 		response := doRequest(t, mustRequest(t, http.MethodPost, server.URL+"/chat", `{}`))
-		if response.StatusCode != http.StatusUnauthorized || endpoint.admitCalls.Load() != 0 {
+		if response.StatusCode != http.StatusServiceUnavailable || endpoint.admitCalls.Load() != 0 {
 			t.Fatalf("auth response=%d calls=%d", response.StatusCode, endpoint.admitCalls.Load())
 		}
 		_ = response.Body.Close()
@@ -218,7 +219,7 @@ func TestTransportAuthResolverRouteAndBodyFailuresAreFinite(t *testing.T) {
 		})
 		defer shutdownTransport(t, runtime, server)
 		response := doRequest(t, mustRequest(t, http.MethodPost, server.URL+"/chat", "payload"))
-		if response.StatusCode != http.StatusBadRequest || !observed.Load() || endpoint.admitCalls.Load() != 0 {
+		if response.StatusCode != http.StatusServiceUnavailable || !observed.Load() || endpoint.admitCalls.Load() != 0 {
 			t.Fatalf("resolver response=%d observed=%v calls=%d", response.StatusCode, observed.Load(), endpoint.admitCalls.Load())
 		}
 		_ = response.Body.Close()
@@ -261,6 +262,128 @@ func TestTransportAuthResolverRouteAndBodyFailuresAreFinite(t *testing.T) {
 		}
 		_ = response.Body.Close()
 	})
+}
+
+func TestTransportClassifiesAuthenticatorFaultsWithoutLeakingCause(t *testing.T) {
+	secret := errors.New("secret identity-provider detail")
+	tests := []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{
+			name: "unauthenticated",
+			err: framework.NewFault(
+				framework.CodeUnauthenticated, framework.RetryNever, "do not expose", secret,
+			),
+			status: http.StatusUnauthorized,
+		},
+		{
+			name: "forbidden",
+			err: framework.NewFault(
+				framework.CodeForbidden, framework.RetryNever, "do not expose", secret,
+			),
+			status: http.StatusForbidden,
+		},
+		{
+			name: "provider unavailable",
+			err: framework.NewFault(
+				framework.CodeUnavailable, framework.RetryBackoff, "do not expose", secret,
+			),
+			status: http.StatusServiceUnavailable,
+		},
+		{
+			name: "typed provider fault overrides wrapped invalid sentinel",
+			err: framework.NewFault(
+				framework.CodeUnavailable, framework.RetryBackoff, "do not expose",
+				errors.Join(callerhttp.ErrResolution, secret),
+			),
+			status: http.StatusServiceUnavailable,
+		},
+		{name: "unclassified infrastructure error", err: secret, status: http.StatusServiceUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			endpoint := &fakeEndpoint{}
+			_, runtime, server := startTransport(t, endpoint, callerhttp.Config{
+				Authenticator: callerhttp.AuthenticateFunc(func(context.Context, *http.Request) (callerhttp.Identity, error) {
+					return callerhttp.Identity{}, test.err
+				}),
+				Routes: []callerhttp.Route{{Method: http.MethodPost, Path: "/chat", CodecID: testCodec}},
+			})
+			defer shutdownTransport(t, runtime, server)
+			response := doRequest(t, mustRequest(t, http.MethodPost, server.URL+"/chat", `{}`))
+			body, err := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != test.status || endpoint.admitCalls.Load() != 0 {
+				t.Fatalf("auth response=%d calls=%d, want %d/0", response.StatusCode, endpoint.admitCalls.Load(), test.status)
+			}
+			if bytes.Contains(body, []byte(secret.Error())) || bytes.Contains(body, []byte("do not expose")) {
+				t.Fatalf("authentication response leaked private diagnostics: %q", body)
+			}
+		})
+	}
+}
+
+func TestTransportClassifiesResolverFaultsWithoutLeakingCause(t *testing.T) {
+	secret := errors.New("secret workspace-router detail")
+	tests := []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{name: "built-in invalid sentinel", err: callerhttp.ErrResolution, status: http.StatusBadRequest},
+		{
+			name: "typed invalid",
+			err: framework.NewFault(
+				framework.CodeInvalid, framework.RetryNever, "do not expose", secret,
+			),
+			status: http.StatusBadRequest,
+		},
+		{
+			name: "forbidden",
+			err: framework.NewFault(
+				framework.CodeForbidden, framework.RetryNever, "do not expose", secret,
+			),
+			status: http.StatusForbidden,
+		},
+		{
+			name: "provider unavailable",
+			err: framework.NewFault(
+				framework.CodeUnavailable, framework.RetryBackoff, "do not expose", secret,
+			),
+			status: http.StatusServiceUnavailable,
+		},
+		{name: "unclassified infrastructure error", err: secret, status: http.StatusServiceUnavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			endpoint := &fakeEndpoint{}
+			_, runtime, server := startTransport(t, endpoint, callerhttp.Config{
+				Authenticator: fixedAuth("caller-a"),
+				Resolver: callerhttp.ResolveFunc(func(context.Context, callerhttp.ResolutionRequest) (callerhttp.Resolution, error) {
+					return callerhttp.Resolution{}, test.err
+				}),
+				Routes: []callerhttp.Route{{Method: http.MethodPost, Path: "/chat", CodecID: testCodec}},
+			})
+			defer shutdownTransport(t, runtime, server)
+			response := doRequest(t, mustRequest(t, http.MethodPost, server.URL+"/chat", `{}`))
+			body, err := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != test.status || endpoint.admitCalls.Load() != 0 {
+				t.Fatalf("resolver response=%d calls=%d, want %d/0", response.StatusCode, endpoint.admitCalls.Load(), test.status)
+			}
+			if bytes.Contains(body, []byte(secret.Error())) || bytes.Contains(body, []byte("do not expose")) {
+				t.Fatalf("resolver response leaked private diagnostics: %q", body)
+			}
+		})
+	}
 }
 
 func TestCustomPortsCannotMutateCoreRequestSnapshot(t *testing.T) {

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/vibe-agi/human/framework"
 )
 
 type durableEventState struct {
@@ -210,7 +212,14 @@ func (service *Service) commitWorkerEvent(
 	if err != nil {
 		return WorkerEventReceipt{}, &WorkerDeliveryError{Delivery: delivery.ID, EventID: delivery.Event.ID, Cause: err}
 	}
-	nextState, toolRecords, rejection := service.planWorkerEvent(ctx, state.task, request, delivery.Event, now)
+	nextState, toolRecords, rejection, authorizationErr := service.planWorkerEvent(
+		ctx, state.task, request, delivery.Event, now,
+	)
+	if authorizationErr != nil {
+		return WorkerEventReceipt{}, &WorkerDeliveryError{
+			Delivery: delivery.ID, EventID: delivery.Event.ID, Cause: authorizationErr,
+		}
+	}
 	if rejection != "" {
 		return nackReceipt(delivery, rejection, "worker event conflicts with durable task state"), nil
 	}
@@ -540,41 +549,43 @@ func (service *Service) planWorkerEvent(
 	request Request,
 	event Event,
 	now time.Time,
-) (TaskState, []StoreToolExecutionRecord, WorkerRejectionCode) {
+) (TaskState, []StoreToolExecutionRecord, WorkerRejectionCode, error) {
 	state := task.State
 	switch event.Type {
 	case EventAccepted:
 		if state == TaskAwaitingHuman {
-			return state, nil, ""
+			return state, nil, "", nil
 		}
-		return state, nil, WorkerRejectStateConflict
+		return state, nil, WorkerRejectStateConflict, nil
 	case EventProgress:
 		if state != TaskAwaitingHuman {
-			return state, nil, WorkerRejectStateConflict
+			return state, nil, WorkerRejectStateConflict, nil
 		}
-		return state, nil, ""
+		return state, nil, "", nil
 	case EventFinal:
 		if state != TaskAwaitingHuman {
-			return state, nil, WorkerRejectStateConflict
+			return state, nil, WorkerRejectStateConflict, nil
 		}
-		return TaskCompleted, nil, ""
+		return TaskCompleted, nil, "", nil
 	case EventClarification:
 		if state != TaskAwaitingHuman {
-			return state, nil, WorkerRejectStateConflict
+			return state, nil, WorkerRejectStateConflict, nil
 		}
 		if task.CapabilityTier == TierChat {
-			return TaskCompleted, nil, ""
+			return TaskCompleted, nil, "", nil
 		}
-		return TaskAwaitingCaller, nil, ""
+		return TaskAwaitingCaller, nil, "", nil
 	case EventToolCalls:
 		if state != TaskAwaitingHuman {
-			return state, nil, WorkerRejectStateConflict
+			return state, nil, WorkerRejectStateConflict, nil
 		}
-		if rejection := service.validateAndAuthorizeToolCalls(ctx, task, request, event.ToolCalls); rejection != "" {
-			return state, nil, rejection
+		if rejection, err := service.validateAndAuthorizeToolCalls(ctx, task, request, event.ToolCalls); err != nil {
+			return state, nil, "", err
+		} else if rejection != "" {
+			return state, nil, rejection, nil
 		}
 		if task.CapabilityTier == TierChat {
-			return TaskCompleted, nil, ""
+			return TaskCompleted, nil, "", nil
 		}
 		records := make([]StoreToolExecutionRecord, 0, len(event.ToolCalls))
 		for _, call := range event.ToolCalls {
@@ -584,22 +595,22 @@ func (service *Service) planWorkerEvent(
 				Input     map[string]any `json:"input"`
 			}{call.Namespace, call.Name, call.Input})
 			if digestErr != nil {
-				return state, nil, WorkerRejectInvalid
+				return state, nil, WorkerRejectInvalid, nil
 			}
 			records = append(records, StoreToolExecutionRecord{
 				Key:         StoreToolExecutionKey{Task: task.Key, ToolCallID: ToolCallID(call.ID)},
 				InputDigest: digest, State: ToolExecutionPending, Revision: 1, CreatedAt: now,
 			})
 		}
-		return TaskAwaitingResults, records, ""
+		return TaskAwaitingResults, records, "", nil
 	case EventRejected:
-		return TaskRejected, nil, terminalEventAllowed(state)
+		return TaskRejected, nil, terminalEventAllowed(state), nil
 	case EventExpired:
-		return TaskExpired, nil, terminalEventAllowed(state)
+		return TaskExpired, nil, terminalEventAllowed(state), nil
 	case EventFailed, EventUnavailable:
-		return TaskFailed, nil, terminalEventAllowed(state)
+		return TaskFailed, nil, terminalEventAllowed(state), nil
 	default:
-		return state, nil, WorkerRejectInvalid
+		return state, nil, WorkerRejectInvalid, nil
 	}
 }
 
@@ -615,29 +626,33 @@ func (service *Service) validateAndAuthorizeToolCalls(
 	task StoreTaskRecord,
 	request Request,
 	calls []ToolCall,
-) WorkerRejectionCode {
+) (WorkerRejectionCode, error) {
 	declared := make(map[string]struct{}, len(request.Tools))
 	for _, tool := range request.Tools {
 		declared[tool.QualifiedName()] = struct{}{}
 	}
 	for _, call := range calls {
 		if _, ok := declared[call.QualifiedName()]; !ok {
-			return WorkerRejectForbidden
+			return WorkerRejectForbidden, nil
 		}
 		if task.CapabilityTier != TierChat {
 			if service.toolAuthorizer == nil {
-				return WorkerRejectForbidden
+				return WorkerRejectForbidden, nil
 			}
 			authorization := ToolAuthorization{
 				CallerID: task.Key.Caller, Task: cloneStoreTaskRecord(task),
 				Request: cloneTransportRequest(request), Call: cloneToolCall(call),
 			}
 			if err := service.toolAuthorizer.AuthorizeTool(ctx, authorization); err != nil {
-				return WorkerRejectForbidden
+				code, retry, classified := framework.FaultInfo(err)
+				if classified && code == framework.CodeForbidden && retry == framework.RetryNever {
+					return WorkerRejectForbidden, nil
+				}
+				return "", fmt.Errorf("authorize HumanLLM tool call: %w", err)
 			}
 		}
 	}
-	return ""
+	return "", nil
 }
 
 func workerEventDigest(delivery WorkerEventDelivery) (StoreDigest, error) {

@@ -58,7 +58,11 @@ type Identity struct {
 // system. Worker identity is never trusted from a WebSocket JSON body. The
 // implementation is borrowed until the transport runtime reaches Done, called
 // concurrently, and must honor context cancellation. The request is borrowed
-// for the call and must not be retained or mutated.
+// for the call and must not be retained or mutated. Return a framework Fault
+// with CodeUnauthenticated/CodeForbidden and RetryNever only for a proved
+// terminal credential decision. Temporary provider failures use
+// CodeUnavailable/RetryBackoff; unclassified errors fail closed as HTTP 503 so
+// a durable worker keeps reconnecting instead of treating the token as revoked.
 type Authenticator interface {
 	AuthenticateWorker(context.Context, *http.Request) (Identity, error)
 }
@@ -288,7 +292,7 @@ func (running *runtime) serveHTTP(response http.ResponseWriter, request *http.Re
 
 	identity, err := running.config.Authenticator.AuthenticateWorker(handlerCtx, request)
 	if err != nil {
-		http.Error(response, ErrAuthentication.Error(), http.StatusUnauthorized)
+		http.Error(response, ErrAuthentication.Error(), authenticationStatus(err))
 		return
 	}
 	values := request.Header.Values(SessionHeader)
@@ -398,6 +402,21 @@ func (running *runtime) serveHTTP(response http.ResponseWriter, request *http.Re
 				return
 			}
 		}
+	}
+}
+
+func authenticationStatus(err error) int {
+	code, retry, ok := framework.FaultInfo(err)
+	if !ok {
+		return http.StatusServiceUnavailable
+	}
+	switch {
+	case code == framework.CodeUnauthenticated && retry == framework.RetryNever:
+		return http.StatusUnauthorized
+	case code == framework.CodeForbidden && retry == framework.RetryNever:
+		return http.StatusForbidden
+	default:
+		return http.StatusServiceUnavailable
 	}
 }
 
