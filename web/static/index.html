@@ -50,11 +50,16 @@
   .entry.rejected .bubble { border-color: var(--danger); }
   #composer { border-top: 1px solid var(--line); padding: 12px 22px 16px; background: var(--panel); }
   #composer .inner { max-width: 760px; margin: 0 auto; }
-  textarea {
+  textarea, input[type="text"] {
     width: 100%; min-height: 72px; resize: vertical; border: 1px solid var(--line);
     border-radius: 10px; padding: 10px 12px; background: var(--bg); color: var(--text);
     font: inherit;
   }
+  input[type="text"] { min-height: 0; padding: 8px 12px; }
+  #todo-list .todo { display: flex; gap: 8px; align-items: center; padding: 4px 2px; }
+  #todo-list .todo.completed span { text-decoration: line-through; color: var(--muted); }
+  #todo-list .todo span { flex: 1; }
+  #todo-list .todo button { padding: 2px 8px; }
   #composer .row { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
   #phase { color: var(--muted); font-size: 12px; margin-left: auto; }
   #topbar { position: fixed; right: 14px; top: 10px; display: flex; gap: 10px; align-items: center; font-size: 12px; }
@@ -94,6 +99,19 @@
         <button id="send-final" class="ok"></button>
         <span id="phase"></span>
       </div>
+      <div class="row" id="command-row" hidden>
+        <input type="text" id="command">
+        <button id="send-command"></button>
+      </div>
+      <details id="todos-panel" hidden>
+        <summary id="todos-summary"></summary>
+        <div id="todo-list"></div>
+        <div class="row">
+          <input type="text" id="todo-new">
+          <button id="add-todo"></button>
+          <button id="send-todos" class="primary"></button>
+        </div>
+      </details>
       <details>
         <summary id="tools-summary"></summary>
         <textarea id="tool-calls" placeholder='[{"id":"call-1","name":"bash","input":{"command":"ls"}}]'></textarea>
@@ -115,6 +133,10 @@ const MESSAGES = {
     deliverSelected: "Deliver selected", discardSelected: "Discard selected",
     sendProgress: "Send progress", clarify: "Ask back", final: "Deliver final",
     toolsSummary: "Advanced: tool calls (JSON)", sendTools: "Send tool calls",
+    runCommand: "Run via agent", commandPlaceholder: "Command executed by the caller agent… (Ctrl+Enter)",
+    commandDanger: "This command looks destructive. Send it anyway?",
+    todosSummary: "Agent task plan (todos)", addTodo: "Add", sendTodos: "Send plan",
+    todoPlaceholder: "New task…",
     draftPlaceholder: "Write a reply… (Ctrl+Enter sends progress)",
     emptyHint: "Accept a request or pick a conversation on the left",
     connecting: "connecting…", connected: "connected", offline: "disconnected, retrying…",
@@ -142,6 +164,10 @@ const MESSAGES = {
     deliverSelected: "交付所选", discardSelected: "丢弃所选",
     sendProgress: "发送进度", clarify: "追问", final: "完成交付",
     toolsSummary: "高级:工具调用 (JSON)", sendTools: "发送工具调用",
+    runCommand: "由对方执行", commandPlaceholder: "由对方 Agent 执行的命令… (Ctrl+Enter)",
+    commandDanger: "该命令看起来有破坏性,确认发送?",
+    todosSummary: "Agent 任务计划 (todos)", addTodo: "添加", sendTodos: "发送计划",
+    todoPlaceholder: "新任务…",
     draftPlaceholder: "输入回复… (Ctrl+Enter 发送进度)",
     emptyHint: "从左侧接单或选择会话",
     connecting: "连接中…", connected: "已连接", offline: "连接断开,重连中…",
@@ -182,6 +208,12 @@ function applyStaticText() {
   $("send-final").textContent = t("final");
   $("tools-summary").textContent = t("toolsSummary");
   $("send-tools").textContent = t("sendTools");
+  $("send-command").textContent = t("runCommand");
+  $("command").placeholder = t("commandPlaceholder");
+  $("todos-summary").textContent = t("todosSummary");
+  $("add-todo").textContent = t("addTodo");
+  $("send-todos").textContent = t("sendTodos");
+  $("todo-new").placeholder = t("todoPlaceholder");
   $("draft").placeholder = t("draftPlaceholder");
   $("empty").textContent = t("emptyHint");
 }
@@ -314,6 +346,12 @@ function render() {
   $("send-clarify").disabled = !active;
   $("send-final").disabled = !active;
   $("send-tools").disabled = !active;
+  const tools = declaredTools(conversation);
+  $("command-row").hidden = !tools.includes("bash");
+  $("send-command").disabled = !active;
+  $("todos-panel").hidden = !tools.includes("todowrite");
+  $("send-todos").disabled = !active;
+  renderTodos(conversation);
   $("phase").textContent = tt("phase", conversation.phase);
   if (document.activeElement !== $("draft")) $("draft").value = conversation.draft || "";
 }
@@ -351,6 +389,96 @@ $("send-tools").onclick = async () => {
     $("tool-calls").value = "";
   } catch (error) { alert(t("sendFailed") + error.message); }
 };
+function declaredTools(conversation) {
+  const declared = conversation?.assignment?.assignment?.request?.tools || [];
+  return declared.map((tool) => tool.name);
+}
+
+let callSequence = 0;
+function newCallID(prefix) {
+  callSequence += 1;
+  return prefix + "-" + Date.now().toString(36) + "-" + callSequence;
+}
+
+async function sendCalls(conversation, calls) {
+  await api("/api/tool-calls", { ...keyOf(conversation), calls });
+}
+
+$("send-command").onclick = async () => {
+  const conversation = selectedConversation();
+  const command = $("command").value.trim();
+  if (!conversation || !command) return;
+  if (/(^|\s|;|&&)(rm\s|sudo\s|mkfs|dd\s|shutdown|reboot)/.test(command) && !confirm(t("commandDanger"))) return;
+  try {
+    await sendCalls(conversation, [{
+      id: newCallID("cmd"), name: "bash",
+      input: { command, description: "human console command" },
+    }]);
+    $("command").value = "";
+  } catch (error) { alert(t("sendFailed") + error.message); }
+};
+$("command").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) $("send-command").click();
+});
+
+// Todos are kept client-side per conversation until sent as one todowrite call.
+const todosByTask = new Map();
+function todosFor(conversation) {
+  const key = keyOf(conversation);
+  const id = key.caller + " " + key.task_id;
+  if (!todosByTask.has(id)) todosByTask.set(id, []);
+  return todosByTask.get(id);
+}
+function renderTodos(conversation) {
+  const todos = todosFor(conversation);
+  $("todo-list").replaceChildren(...todos.map((todo, index) => {
+    const row = document.createElement("div");
+    row.className = "todo" + (todo.status === "completed" ? " completed" : "");
+    const toggle = document.createElement("input");
+    toggle.type = "checkbox";
+    toggle.checked = todo.status === "completed";
+    toggle.onchange = () => {
+      todo.status = toggle.checked ? "completed" : "pending";
+      renderTodos(conversation);
+    };
+    const label = document.createElement("span");
+    label.textContent = todo.content;
+    const remove = document.createElement("button");
+    remove.textContent = "×";
+    remove.onclick = () => { todos.splice(index, 1); renderTodos(conversation); };
+    row.append(toggle, label, remove);
+    return row;
+  }));
+}
+$("add-todo").onclick = () => {
+  const conversation = selectedConversation();
+  const content = $("todo-new").value.trim();
+  if (!conversation || !content) return;
+  todosFor(conversation).push({ content, status: "pending", priority: "medium" });
+  $("todo-new").value = "";
+  renderTodos(conversation);
+};
+$("todo-new").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") $("add-todo").click();
+});
+$("send-todos").onclick = async () => {
+  const conversation = selectedConversation();
+  if (!conversation) return;
+  const todos = todosFor(conversation);
+  if (!todos.length) return;
+  try {
+    await sendCalls(conversation, [{
+      id: newCallID("todos"), name: "todowrite",
+      input: {
+        todos: todos.map((todo, index) => ({
+          id: "todo-" + (index + 1), content: todo.content,
+          status: todo.status, priority: todo.priority,
+        })),
+      },
+    }]);
+  } catch (error) { alert(t("sendFailed") + error.message); }
+};
+
 function checkedChangeIDs() {
   return [...document.querySelectorAll("#review input:checked")].map((box) => box.dataset.id);
 }
