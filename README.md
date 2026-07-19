@@ -84,6 +84,7 @@ HumanLLM 的公共内核与 ports 位于 `llm`，HumanAgent 独立领域位于 `
 | [08 部署与运维](docs/08-operations.md) | 远程 TLS/WSS 接入、token 生命周期、真实故障门、本机升级/回滚及拆分部署灾备边界 |
 | [09 TLA+ 模型与实现约束](docs/09-formal-model.md) | HumanLLM/HumanAgent 双 surface、共享 runtime/workspace、故障与活性假设、模型到 Go 的 refinement obligations |
 | [10 Human Framework 扩展合同](docs/10-framework-contract.md) | 正确性内核与 ports/adapters、Store 原子性、Transport、Protector、资源所有权和 conformance 约束 |
+| [11 人侧栈设计](docs/11-human-side.md) | workerkit headless 领域层、Human Web、Observer port 与 TUI 迁移路线(设计,未实现) |
 
 ## 安装
 
