@@ -36,8 +36,10 @@
 
 - 不做移动原生 app;Web 响应式即可。
 - 本设计不含 HumanAgent 的人侧装配;workerkit 的分层完成后另行复用。
-- TUI 不立即废弃:迁移到 workerkit 后作为与 web 等价的 adapter 保留,
-  真实 OpenCode 产品门继续以它验收,直至 web 通过同一门。
+- **不维护两个官方 UI。** TUI 的终态是删除,不是迁移:它从现在起冻结
+  (只修 bug,不加功能),在 web 通过同一真实 OpenCode 产品门之前继续作为
+  RC 的已验收产品面;过门之日,TUI、`internal/tui`、`internal/workerclient`
+  与旧 worker WS 方言整体删除。不存在"迁移 TUI 到 workerkit"的中间工程。
 
 ## 2. 分层架构
 
@@ -45,8 +47,8 @@
 ┌──────────────────────────────────────────────────┐
 │ L3  第三方 UI / 集成(Slack、工单系统、自研桌面) │ ← 消费 workerkit 公共 API
 ├──────────────────────────────────────────────────┤
-│ L2  官方 UI adapters                             │
-│     human web(新,推荐默认)· human TUI(迁移) │
+│ L2  官方 UI adapter                              │
+│     human web(唯一官方 UI;TUI 冻结待删)       │
 ├──────────────────────────────────────────────────┤
 │ L1  workerkit(新公共包,headless 领域层)       │
 │     接单/回复/final 状态机 · 草稿 · continuation │
@@ -142,7 +144,7 @@ durable 状态全部在 daemon;关浏览器不丢任务、不断连接。多个 
 
 | 第三方想做什么 | 用哪一层 |
 |---|---|
-| 直接用现成人侧产品 | `human web` / `human worker`(TUI) |
+| 直接用现成人侧产品 | `human web` |
 | 自己的 UI(Slack bot、工单、桌面) | workerkit 命令/订阅/快照 API |
 | 换草稿与状态存储 | `workerkit.StateStore` + conformance |
 | 换镜像实现(远程 IDE、虚拟工作区) | `workerkit.Mirror` |
@@ -163,17 +165,20 @@ durable 状态全部在 daemon;关浏览器不丢任务、不断连接。多个 
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
+| M0 TUI 冻结 | TUI 与 `internal/tui`/`internal/workerclient` 只修 bug,不加功能;人侧新功能一律进 workerkit/web | 立即生效;RC 继续以现有 TUI 真实门交付 |
 | M1 workerkit-core | 接单/回复/final/工具循环 + StateStore conformance + fake wire 故障注入(断线、重启、outbox 重放、commit 歧义) | custom-framework 示例以 workerkit 实现人侧,跑通嵌入内核完整闭环 |
 | M2 human web MVP | inbox/对话/final + SSE + 通知,无 Live Workspace | 真实 OpenCode 连嵌入内核 + web 人侧完成文本/工具闭环 |
 | M3 Mirror port 化 | mirror/review/save-ahead 迁入 workerkit,web 获得 Review 交付面板 | 现有 save-ahead 与拒单故障注入测试在 workerkit 层通过 |
-| M4 TUI 迁移 | TUI 改为 workerkit 的 adapter,`internal/workerclient` 退役 | 真实 OpenCode 产品门(`make real-opencode-tui-test`)在迁移后复跑通过;此为双栈收敛 worker 半边完成标志 |
+| M4 TUI 删除 | web 版真实 OpenCode 产品门(HTTP/SSE 驱动,替代 PTY 键值驱动)达到与 `make real-opencode-tui-test` 同覆盖;随后整体删除 TUI、`internal/tui`、`internal/workerclient` 与旧 worker WS 方言 | web 真实门连续通过后删除;此为双栈收敛 worker 半边完成标志 |
 
 Observer(§6)与 M1 并行落地。
 
 风险与诚实边界:
 
 - M3 之前 web 不宣称 Live Workspace;M2 只是文本/工具闭环。
-- 迁移期间 TUI 行为以现有真实门为准;任何"web 已等价"的宣称必须以同一
-  真实 OpenCode 门为证据,不以组件测试替代。
+- M4 之前 TUI 是唯一已验收产品面,`human local` 默认入口不变;web 的
+  "已等价"必须以 web 版真实 OpenCode 门为证据,不以组件测试替代。
+- web 版真实门预期比 PTY 键值门更易自动化(HTTP 命令替代原始键值),这是
+  删除 TUI 的维护收益之一,但覆盖范围必须先逐项对齐旧门再谈删除。
 - web 远程部署的认证/TLS 边界遵循 [08 运维](08-operations.md);本设计不
   引入新的默认公网暴露。
