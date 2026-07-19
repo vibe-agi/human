@@ -30,6 +30,14 @@ func TestCheckConfigSnapshotsAgentCard(t *testing.T) {
 	}
 }
 
+func TestCheckConfigRejectsTypedNilService(t *testing.T) {
+	config := testHandlerConfig(t, testAuthenticator).Config
+	config.Agent = (*agent.Agent)(nil)
+	if _, err := checkConfig(config); err == nil {
+		t.Fatal("checkConfig accepted a typed-nil Service")
+	}
+}
+
 func TestCheckConfigRejectsInaccurateAgentCard(t *testing.T) {
 	tests := []struct {
 		name   string

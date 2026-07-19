@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -50,170 +49,158 @@ func (agent *Agent) FreezeArtifact(ctx context.Context, command FreezeArtifactCo
 	if err != nil {
 		return FreezeArtifactResult{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return FreezeArtifactResult{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, nil)
-	if err != nil {
-		return FreezeArtifactResult{}, fmt.Errorf("begin freeze Agent Artifact: %w", err)
-	}
-	defer tx.Rollback()
-	var replay FreezeArtifactResult
-	if found, err := replayJSONCommand(
-		ctx, tx, command.Task.Workspace.Authority, command.Meta.ID,
-		"freeze_artifact", digest, "freeze_artifact", &replay,
-	); err != nil {
-		return FreezeArtifactResult{}, err
-	} else if found {
-		if err := validateFreezeResult(replay); err != nil {
-			return FreezeArtifactResult{}, err
+
+	var frozen FreezeArtifactResult
+	err = store.Update(ctx, func(tx StoreTx) error {
+		var replay FreezeArtifactResult
+		if found, err := replayJSONCommandFromStore(
+			tx, command.Task.Workspace.Authority, command.Meta.ID,
+			"freeze_artifact", digest, "freeze_artifact", &replay,
+		); err != nil {
+			return err
+		} else if found {
+			if err := validateFreezeResult(replay); err != nil {
+				return err
+			}
+			wantRef := ArtifactRef{Workspace: command.Task.Workspace, ID: command.Artifact}
+			if replay.Task.Ref != command.Task || replay.Artifact.Ref != wantRef {
+				return fmt.Errorf("%w: frozen command result identity mismatch", ErrCorruptStore)
+			}
+			if _, err := verifyArtifactLeaseGrantHistory(tx, command.Meta.Grant); err != nil {
+				return err
+			}
+			stored, err := loadArtifactContent(tx, replay.Artifact.Ref)
+			if err != nil || !sameArtifactIdentity(stored.Artifact, replay.Artifact) {
+				return fmt.Errorf("%w: frozen command result does not match Artifact", ErrCorruptStore)
+			}
+			frozen = cloneFreezeResult(replay)
+			return nil
 		}
-		wantRef := ArtifactRef{Workspace: command.Task.Workspace, ID: command.Artifact}
-		if replay.Task.Ref != command.Task || replay.Artifact.Ref != wantRef {
-			return FreezeArtifactResult{}, fmt.Errorf("%w: frozen command result identity mismatch", ErrCorruptStore)
+		if int64(len(command.Payload.Data)) > agent.maxArtifactBytes {
+			return fmt.Errorf(
+				"%w: Artifact payload must be 1..%d bytes", ErrInvalidArgument, agent.maxArtifactBytes,
+			)
 		}
-		if _, err := verifyLeaseGrantHistory(ctx, tx, command.Meta.Grant); err != nil {
-			return FreezeArtifactResult{}, err
+
+		currentRecord, err := loadTaskRecordFromStore(tx, command.Task)
+		if err != nil {
+			return err
 		}
-		stored, err := loadArtifactContent(ctx, tx, replay.Artifact.Ref)
-		if err != nil || !sameArtifactIdentity(stored.Artifact, replay.Artifact) {
-			return FreezeArtifactResult{}, fmt.Errorf("%w: frozen command result does not match Artifact", ErrCorruptStore)
+		if err := requireArtifactCurrentLease(tx, currentRecord, command.Meta.Grant); err != nil {
+			return err
 		}
-		return cloneFreezeResult(replay), nil
-	}
-	if int64(len(command.Payload.Data)) > agent.maxArtifactBytes {
-		return FreezeArtifactResult{}, fmt.Errorf(
-			"%w: Artifact payload must be 1..%d bytes", ErrInvalidArgument, agent.maxArtifactBytes,
+		current := currentRecord.Task
+		if current.Revision != command.Meta.ExpectedRevision {
+			return &RevisionConflictError{
+				Expected: command.Meta.ExpectedRevision, Actual: current.Revision,
+			}
+		}
+		if current.State.Terminal() {
+			return &TransitionError{Operation: "freeze_artifact", State: current.State, Terminal: true}
+		}
+		if current.State != TaskWorking {
+			return &TransitionError{Operation: "freeze_artifact", State: current.State}
+		}
+		if current.Artifact != nil || current.Submission != nil {
+			return ErrArtifactConflict
+		}
+		if current.Revision >= math.MaxInt64 || current.EventCount >= math.MaxInt64 {
+			return fmt.Errorf("%w: task counters exhausted store integer range", ErrRevisionConflict)
+		}
+
+		now := timestampAtLeast(agent.now(), current.UpdatedAt)
+		workspaceRef := command.Task.Workspace
+		if _, err := tx.InsertWorkspaceHead(StoreWorkspaceHeadRecord{Head: WorkspaceHead{
+			Workspace: workspaceRef, ConfirmedRevision: command.ExpectedBaseRevision, UpdatedAt: now,
+		}}); err != nil {
+			return fmt.Errorf("initialize Agent Workspace head: %w", err)
+		}
+		head, err := loadArtifactWorkspaceHead(tx, workspaceRef)
+		if err != nil {
+			return err
+		}
+		if head.ConfirmedRevision != command.ExpectedBaseRevision {
+			return fmt.Errorf(
+				"%w: expected %q, confirmed %q", ErrWorkspaceConflict,
+				command.ExpectedBaseRevision, head.ConfirmedRevision,
+			)
+		}
+
+		ref := ArtifactRef{Workspace: workspaceRef, ID: command.Artifact}
+		payloadDigest := digestPayload(command.Payload)
+		resultRevision := nextRevision(command.ExpectedBaseRevision, ref, payloadDigest)
+		artifactDigest := digestArtifact(
+			ref, command.Task, command.ExpectedBaseRevision, resultRevision,
+			payloadDigest, command.Payload.MediaType,
 		)
-	}
+		artifact := Artifact{
+			Ref: ref, Task: command.Task, State: ArtifactFrozen,
+			BaseRevision: command.ExpectedBaseRevision, ResultRevision: resultRevision,
+			Digest: artifactDigest, PayloadDigest: payloadDigest,
+			PayloadSize: int64(len(command.Payload.Data)), MediaType: command.Payload.MediaType,
+			FrozenAt: now,
+		}
+		content := ArtifactContent{Artifact: artifact, Payload: command.Payload}
+		if err := tx.InsertArtifact(StoreArtifactRecord{Content: cloneArtifactContent(content)}); err != nil {
+			if errors.Is(err, ErrStoreConflict) {
+				return ErrArtifactConflict
+			}
+			return fmt.Errorf("insert Agent Artifact: %w", err)
+		}
 
-	current, err := loadTask(ctx, tx, command.Task)
+		next := current
+		next.Revision++
+		next.EventCount++
+		next.UpdatedAt = now
+		next.Artifact = &ref
+		nextRecord := currentRecord
+		nextRecord.Task = next
+		state := ArtifactFrozen
+		nextRecord.ArtifactState = &state
+		expectedLease := StoreLeaseState{Owner: command.Meta.Grant.Worker, Fence: command.Meta.Grant.Fence}
+		changed, err := tx.CompareAndSwapTask(StoreTaskMutation{
+			Ref: command.Task,
+			Condition: StoreTaskCondition{
+				ExpectedRevision: command.Meta.ExpectedRevision,
+				ExpectedLease:    &expectedLease,
+			},
+			Next: nextRecord,
+		})
+		if err != nil {
+			return fmt.Errorf("update Task for frozen Artifact: %w", err)
+		}
+		if !changed {
+			latest, loadErr := loadTaskRecordFromStore(tx, command.Task)
+			if loadErr != nil {
+				return loadErr
+			}
+			if leaseErr := requireArtifactCurrentLease(tx, latest, command.Meta.Grant); leaseErr != nil {
+				return leaseErr
+			}
+			return &RevisionConflictError{Expected: command.Meta.ExpectedRevision, Actual: latest.Task.Revision}
+		}
+		if err := tx.InsertEvent(StoreEventRecord{Event: Event{
+			Task: command.Task, Sequence: next.EventCount, Type: EventArtifactFrozen,
+			State: TaskWorking, Revision: next.Revision, Artifact: ref.ID, OccurredAt: now,
+		}}); err != nil {
+			return fmt.Errorf("append Agent event: %w", err)
+		}
+		frozen = FreezeArtifactResult{Task: next, Artifact: artifact}
+		if err := recordJSONCommandToStore(
+			tx, ref.Workspace.Authority, command.Meta.ID, "freeze_artifact",
+			digest, "freeze_artifact", frozen, now,
+		); err != nil {
+			return err
+		}
+		return nil
+	})
 	if err != nil {
 		return FreezeArtifactResult{}, err
-	}
-	if err := requireCurrentLease(ctx, tx, command.Meta.Grant); err != nil {
-		return FreezeArtifactResult{}, err
-	}
-	if current.Revision != command.Meta.ExpectedRevision {
-		return FreezeArtifactResult{}, &RevisionConflictError{
-			Expected: command.Meta.ExpectedRevision, Actual: current.Revision,
-		}
-	}
-	if current.State.Terminal() {
-		return FreezeArtifactResult{}, &TransitionError{Operation: "freeze_artifact", State: current.State, Terminal: true}
-	}
-	if current.State != TaskWorking {
-		return FreezeArtifactResult{}, &TransitionError{Operation: "freeze_artifact", State: current.State}
-	}
-	if current.Artifact != nil || current.Submission != nil {
-		return FreezeArtifactResult{}, ErrArtifactConflict
-	}
-	if current.Revision >= math.MaxInt64 || current.EventCount >= math.MaxInt64 {
-		return FreezeArtifactResult{}, fmt.Errorf("%w: task counters exhausted SQLite integer range", ErrRevisionConflict)
-	}
-
-	now := timestampAtLeast(agent.now(), current.UpdatedAt)
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO agent_workspace_heads (
-		  authority_id, workspace_id, confirmed_revision, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(authority_id, workspace_id) DO NOTHING`,
-		command.Task.Workspace.Authority, command.Task.Workspace.ID,
-		command.ExpectedBaseRevision, unixNano(now), unixNano(now),
-	); err != nil {
-		return FreezeArtifactResult{}, fmt.Errorf("initialize Agent Workspace head: %w", err)
-	}
-	var confirmed workspace.Revision
-	if err := tx.QueryRowContext(ctx, `
-		SELECT confirmed_revision
-		FROM agent_workspace_heads
-		WHERE authority_id = ? AND workspace_id = ?`,
-		command.Task.Workspace.Authority, command.Task.Workspace.ID,
-	).Scan(&confirmed); err != nil {
-		return FreezeArtifactResult{}, fmt.Errorf("load Agent Workspace head: %w", err)
-	}
-	if confirmed != command.ExpectedBaseRevision {
-		return FreezeArtifactResult{}, fmt.Errorf(
-			"%w: expected %q, confirmed %q", ErrWorkspaceConflict,
-			command.ExpectedBaseRevision, confirmed,
-		)
-	}
-
-	ref := ArtifactRef{Workspace: command.Task.Workspace, ID: command.Artifact}
-	payloadDigest := digestPayload(command.Payload)
-	resultRevision := nextRevision(command.ExpectedBaseRevision, ref, payloadDigest)
-	artifactDigest := digestArtifact(
-		ref, command.Task, command.ExpectedBaseRevision, resultRevision,
-		payloadDigest, command.Payload.MediaType,
-	)
-	artifact := Artifact{
-		Ref: ref, Task: command.Task, State: ArtifactFrozen,
-		BaseRevision: command.ExpectedBaseRevision, ResultRevision: resultRevision,
-		Digest: artifactDigest, PayloadDigest: payloadDigest,
-		PayloadSize: int64(len(command.Payload.Data)), MediaType: command.Payload.MediaType,
-		FrozenAt: now,
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO agent_artifacts (
-		  authority_id, workspace_id, artifact_id, task_id, state,
-		  base_revision, result_revision, artifact_digest, payload_digest,
-		  media_type, payload, payload_size, frozen_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ref.Workspace.Authority, ref.Workspace.ID, ref.ID, command.Task.ID,
-		artifact.State, artifact.BaseRevision, artifact.ResultRevision,
-		artifact.Digest, artifact.PayloadDigest, artifact.MediaType,
-		command.Payload.Data, artifact.PayloadSize, unixNano(now),
-	); err != nil {
-		if uniqueConstraint(err) {
-			return FreezeArtifactResult{}, ErrArtifactConflict
-		}
-		return FreezeArtifactResult{}, fmt.Errorf("insert Agent Artifact: %w", err)
-	}
-
-	next := current
-	next.Revision++
-	next.EventCount++
-	next.UpdatedAt = now
-	next.Artifact = &ref
-	result, err := tx.ExecContext(ctx, `
-		UPDATE agent_tasks
-		SET revision = ?, event_count = ?, updated_at = ?
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?
-		  AND lease_owner = ? AND lease_fence = ?`,
-		next.Revision, next.EventCount, unixNano(now), command.Task.Workspace.Authority,
-		command.Task.Workspace.ID, command.Task.ID, command.Meta.ExpectedRevision,
-		command.Meta.Grant.Worker, command.Meta.Grant.Fence,
-	)
-	if err != nil {
-		return FreezeArtifactResult{}, fmt.Errorf("update Task for frozen Artifact: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return FreezeArtifactResult{}, fmt.Errorf("inspect frozen Artifact Task update: %w", err)
-	}
-	if affected != 1 {
-		if leaseErr := requireCurrentLease(ctx, tx, command.Meta.Grant); leaseErr != nil {
-			return FreezeArtifactResult{}, leaseErr
-		}
-		return FreezeArtifactResult{}, &RevisionConflictError{Expected: command.Meta.ExpectedRevision, Actual: current.Revision}
-	}
-	if err := insertEvent(ctx, tx, Event{
-		Task: command.Task, Sequence: next.EventCount, Type: EventArtifactFrozen,
-		State: TaskWorking, Revision: next.Revision, Artifact: ref.ID, OccurredAt: now,
-	}); err != nil {
-		return FreezeArtifactResult{}, err
-	}
-	frozen := FreezeArtifactResult{Task: next, Artifact: artifact}
-	if err := recordJSONCommand(
-		ctx, tx, ref.Workspace.Authority, command.Meta.ID, "freeze_artifact",
-		digest, "freeze_artifact", frozen, now,
-	); err != nil {
-		return FreezeArtifactResult{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return FreezeArtifactResult{}, fmt.Errorf("commit frozen Agent Artifact: %w", err)
 	}
 	return cloneFreezeResult(frozen), nil
 }
@@ -225,12 +212,20 @@ func (agent *Agent) GetArtifact(ctx context.Context, ref ArtifactRef) (ArtifactC
 	if err := validateArtifactRef(ref); err != nil {
 		return ArtifactContent{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return ArtifactContent{}, err
 	}
 	defer release()
-	content, err := loadArtifactContent(ctx, database, ref)
+	var content ArtifactContent
+	err = store.View(ctx, func(view StoreView) error {
+		loaded, err := loadArtifactContent(view, ref)
+		if err != nil {
+			return err
+		}
+		content = loaded
+		return nil
+	})
 	if err != nil {
 		return ArtifactContent{}, err
 	}
@@ -239,7 +234,7 @@ func (agent *Agent) GetArtifact(ctx context.Context, ref ArtifactRef) (ArtifactC
 
 // RecordApplyReceipt records the caller-side durable decision. It never
 // invokes filesystem code. Success advances the confirmed Workspace head only
-// when the exact frozen base still matches in the same SQLite transaction.
+// when the exact frozen base still matches in the same Store transaction.
 func (agent *Agent) RecordApplyReceipt(ctx context.Context, command RecordApplyReceiptCommand) (ApplyReceipt, error) {
 	if err := validateCallContext(ctx); err != nil {
 		return ApplyReceipt{}, err
@@ -251,110 +246,97 @@ func (agent *Agent) RecordApplyReceipt(ctx context.Context, command RecordApplyR
 	if err != nil {
 		return ApplyReceipt{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return ApplyReceipt{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, nil)
-	if err != nil {
-		return ApplyReceipt{}, fmt.Errorf("begin Agent apply receipt: %w", err)
-	}
-	defer tx.Rollback()
-	var replay ApplyReceipt
-	if found, err := replayJSONCommand(
-		ctx, tx, command.Artifact.Workspace.Authority, command.CommandID,
-		"record_apply_receipt", digest, "apply_receipt", &replay,
-	); err != nil {
-		return ApplyReceipt{}, err
-	} else if found {
-		if err := validateStoredReceipt(replay); err != nil {
-			return ApplyReceipt{}, err
-		}
-		if replay.Artifact != command.Artifact || replay.ID != command.Receipt {
-			return ApplyReceipt{}, fmt.Errorf("%w: receipt command result identity mismatch", ErrCorruptStore)
-		}
-		authoritative, exists, err := loadVerifiedApplyReceipt(ctx, tx, replay.Artifact)
-		if err != nil {
-			return ApplyReceipt{}, err
-		}
-		if !exists || !sameReceipt(replay, authoritative) {
-			return ApplyReceipt{}, fmt.Errorf("%w: receipt command result does not match durable receipt", ErrCorruptStore)
-		}
-		return replay, nil
-	}
 
-	content, err := loadArtifactContent(ctx, tx, command.Artifact)
-	if err != nil {
-		return ApplyReceipt{}, err
-	}
-	artifact := content.Artifact
-	if artifact.State != ArtifactPublished {
-		return ApplyReceipt{}, fmt.Errorf("%w: receipt requires a published Artifact", ErrArtifactState)
-	}
-	if command.ArtifactDigest != artifact.Digest || command.BaseRevision != artifact.BaseRevision ||
-		command.ResultRevision != artifact.ResultRevision {
-		return ApplyReceipt{}, fmt.Errorf("%w: receipt does not identify the exact published Artifact", ErrReceiptConflict)
-	}
-	existing, found, err := loadVerifiedApplyReceipt(ctx, tx, command.Artifact)
-	if err != nil {
-		return ApplyReceipt{}, err
-	}
-	now := timestampAtLeast(agent.now(), artifact.FrozenAt, *artifact.PublishedAt)
-	receipt := ApplyReceipt{
-		ID: command.Receipt, Artifact: command.Artifact,
-		ArtifactDigest: command.ArtifactDigest, BaseRevision: command.BaseRevision,
-		ResultRevision: command.ResultRevision, Decision: command.Decision,
-		ObservedRevision: command.ObservedRevision, Code: command.Code,
-		Message: command.Message, RecordedAt: now,
-	}
-	if found {
-		if !sameReceiptDecision(existing, receipt) {
-			return ApplyReceipt{}, ErrReceiptConflict
-		}
-		receipt = existing
-	} else {
-		if command.Decision == workspace.ApplySuccess {
-			result, err := tx.ExecContext(ctx, `
-				UPDATE agent_workspace_heads
-				SET confirmed_revision = ?, updated_at = ?
-				WHERE authority_id = ? AND workspace_id = ? AND confirmed_revision = ?`,
-				artifact.ResultRevision, unixNano(now), artifact.Ref.Workspace.Authority,
-				artifact.Ref.Workspace.ID, artifact.BaseRevision,
-			)
-			if err != nil {
-				return ApplyReceipt{}, fmt.Errorf("advance Agent Workspace head: %w", err)
-			}
-			affected, err := result.RowsAffected()
-			if err != nil || affected != 1 {
-				return ApplyReceipt{}, fmt.Errorf("%w: success receipt base is no longer confirmed", ErrWorkspaceConflict)
-			}
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO agent_apply_receipts (
-			  authority_id, workspace_id, artifact_id, receipt_id, decision,
-			  artifact_digest, base_revision, result_revision, observed_revision,
-			  code, message, recorded_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			receipt.Artifact.Workspace.Authority, receipt.Artifact.Workspace.ID,
-			receipt.Artifact.ID, receipt.ID, receipt.Decision, receipt.ArtifactDigest,
-			receipt.BaseRevision, receipt.ResultRevision, receipt.ObservedRevision,
-			receipt.Code, receipt.Message, unixNano(now),
+	var receipt ApplyReceipt
+	err = store.Update(ctx, func(tx StoreTx) error {
+		var replay ApplyReceipt
+		if found, err := replayJSONCommandFromStore(
+			tx, command.Artifact.Workspace.Authority, command.CommandID,
+			"record_apply_receipt", digest, "apply_receipt", &replay,
 		); err != nil {
-			if uniqueConstraint(err) {
-				return ApplyReceipt{}, ErrReceiptConflict
+			return err
+		} else if found {
+			if err := validateStoredReceipt(replay); err != nil {
+				return err
 			}
-			return ApplyReceipt{}, fmt.Errorf("insert Agent apply receipt: %w", err)
+			if replay.Artifact != command.Artifact || replay.ID != command.Receipt {
+				return fmt.Errorf("%w: receipt command result identity mismatch", ErrCorruptStore)
+			}
+			authoritative, exists, err := loadVerifiedApplyReceipt(tx, replay.Artifact)
+			if err != nil {
+				return err
+			}
+			if !exists || !sameReceipt(replay, authoritative) {
+				return fmt.Errorf("%w: receipt command result does not match durable receipt", ErrCorruptStore)
+			}
+			receipt = replay
+			return nil
 		}
-	}
-	if err := recordJSONCommand(
-		ctx, tx, command.Artifact.Workspace.Authority, command.CommandID,
-		"record_apply_receipt", digest, "apply_receipt", receipt, now,
-	); err != nil {
+
+		content, err := loadArtifactContent(tx, command.Artifact)
+		if err != nil {
+			return err
+		}
+		artifact := content.Artifact
+		if artifact.State != ArtifactPublished {
+			return fmt.Errorf("%w: receipt requires a published Artifact", ErrArtifactState)
+		}
+		if command.ArtifactDigest != artifact.Digest || command.BaseRevision != artifact.BaseRevision ||
+			command.ResultRevision != artifact.ResultRevision {
+			return fmt.Errorf("%w: receipt does not identify the exact published Artifact", ErrReceiptConflict)
+		}
+		existing, found, err := loadVerifiedApplyReceipt(tx, command.Artifact)
+		if err != nil {
+			return err
+		}
+		now := timestampAtLeast(agent.now(), artifact.FrozenAt, *artifact.PublishedAt)
+		receipt = ApplyReceipt{
+			ID: command.Receipt, Artifact: command.Artifact,
+			ArtifactDigest: command.ArtifactDigest, BaseRevision: command.BaseRevision,
+			ResultRevision: command.ResultRevision, Decision: command.Decision,
+			ObservedRevision: command.ObservedRevision, Code: command.Code,
+			Message: command.Message, RecordedAt: now,
+		}
+		if found {
+			if !sameReceiptDecision(existing, receipt) {
+				return ErrReceiptConflict
+			}
+			receipt = existing
+		} else {
+			if command.Decision == workspace.ApplySuccess {
+				changed, err := tx.CompareAndSwapWorkspaceHead(StoreWorkspaceHeadMutation{
+					Workspace:        artifact.Ref.Workspace,
+					ExpectedRevision: artifact.BaseRevision,
+					Next: StoreWorkspaceHeadRecord{Head: WorkspaceHead{
+						Workspace: artifact.Ref.Workspace, ConfirmedRevision: artifact.ResultRevision, UpdatedAt: now,
+					}},
+				})
+				if err != nil {
+					return fmt.Errorf("advance Agent Workspace head: %w", err)
+				}
+				if !changed {
+					return fmt.Errorf("%w: success receipt base is no longer confirmed", ErrWorkspaceConflict)
+				}
+			}
+			if err := tx.InsertApplyReceipt(StoreApplyReceiptRecord{Receipt: receipt}); err != nil {
+				if errors.Is(err, ErrStoreConflict) {
+					return ErrReceiptConflict
+				}
+				return fmt.Errorf("insert Agent apply receipt: %w", err)
+			}
+		}
+		return recordJSONCommandToStore(
+			tx, command.Artifact.Workspace.Authority, command.CommandID,
+			"record_apply_receipt", digest, "apply_receipt", receipt, now,
+		)
+	})
+	if err != nil {
 		return ApplyReceipt{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return ApplyReceipt{}, fmt.Errorf("commit Agent apply receipt: %w", err)
 	}
 	return receipt, nil
 }
@@ -366,12 +348,18 @@ func (agent *Agent) GetApplyReceipt(ctx context.Context, ref ArtifactRef) (Apply
 	if err := validateArtifactRef(ref); err != nil {
 		return ApplyReceipt{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return ApplyReceipt{}, err
 	}
 	defer release()
-	receipt, found, err := loadVerifiedApplyReceipt(ctx, database, ref)
+	var receipt ApplyReceipt
+	var found bool
+	err = store.View(ctx, func(view StoreView) error {
+		var err error
+		receipt, found, err = loadVerifiedApplyReceipt(view, ref)
+		return err
+	})
 	if err != nil {
 		return ApplyReceipt{}, err
 	}
@@ -388,68 +376,37 @@ func (agent *Agent) GetWorkspaceHead(ctx context.Context, ref WorkspaceRef) (Wor
 	if err := validateWorkspaceRef(ref); err != nil {
 		return WorkspaceHead{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return WorkspaceHead{}, err
 	}
 	defer release()
 	var head WorkspaceHead
-	var updated int64
-	head.Workspace = ref
-	if err := database.QueryRowContext(ctx, `
-		SELECT confirmed_revision, updated_at
-		FROM agent_workspace_heads
-		WHERE authority_id = ? AND workspace_id = ?`, ref.Authority, ref.ID,
-	).Scan(&head.ConfirmedRevision, &updated); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return WorkspaceHead{}, ErrWorkspaceNotFound
-		}
-		return WorkspaceHead{}, fmt.Errorf("load Agent Workspace head: %w", err)
-	}
-	head.UpdatedAt = fromUnixNano(updated)
-	if err := validateRevision("stored confirmed revision", head.ConfirmedRevision); err != nil || head.UpdatedAt.IsZero() {
-		return WorkspaceHead{}, fmt.Errorf("%w: invalid Workspace head", ErrCorruptStore)
+	err = store.View(ctx, func(view StoreView) error {
+		var err error
+		head, err = loadArtifactWorkspaceHead(view, ref)
+		return err
+	})
+	if err != nil {
+		return WorkspaceHead{}, err
 	}
 	return head, nil
 }
 
-func loadArtifactContent(ctx context.Context, query queryer, ref ArtifactRef) (ArtifactContent, error) {
-	var content ArtifactContent
-	var frozen int64
-	var published, discarded sql.NullInt64
-	content.Artifact.Ref = ref
-	if err := query.QueryRowContext(ctx, `
-		SELECT task_id, state, base_revision, result_revision, artifact_digest,
-		       payload_digest, media_type,
-		       CASE WHEN payload_size <= ? AND length(payload) = payload_size
-		            THEN payload ELSE NULL END,
-		       payload_size,
-		       frozen_at, published_at, discarded_at
-		FROM agent_artifacts
-		WHERE authority_id = ? AND workspace_id = ? AND artifact_id = ?`,
-		absoluteArtifactMax, ref.Workspace.Authority, ref.Workspace.ID, ref.ID,
-	).Scan(
-		&content.Artifact.Task.ID, &content.Artifact.State,
-		&content.Artifact.BaseRevision, &content.Artifact.ResultRevision,
-		&content.Artifact.Digest, &content.Artifact.PayloadDigest,
-		&content.Artifact.MediaType, &content.Payload.Data, &content.Artifact.PayloadSize,
-		&frozen, &published, &discarded,
-	); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return ArtifactContent{}, ErrArtifactNotFound
-		}
+func loadArtifactContent(view StoreView, ref ArtifactRef) (ArtifactContent, error) {
+	record, err := view.LoadArtifact(ref, StoreReadLimit{MaxBytes: absoluteArtifactMax})
+	if errors.Is(err, ErrStoreRecordNotFound) {
+		return ArtifactContent{}, ErrArtifactNotFound
+	}
+	if errors.Is(err, ErrStoreRecordTooLarge) {
+		return ArtifactContent{}, fmt.Errorf("%w: Agent Artifact exceeds the absolute read limit", ErrCorruptStore)
+	}
+	if err != nil {
 		return ArtifactContent{}, fmt.Errorf("load Agent Artifact: %w", err)
 	}
-	content.Artifact.Task.Workspace = ref.Workspace
-	content.Payload.MediaType = content.Artifact.MediaType
-	content.Artifact.FrozenAt = fromUnixNano(frozen)
-	if published.Valid {
-		value := fromUnixNano(published.Int64)
-		content.Artifact.PublishedAt = &value
-	}
-	if discarded.Valid {
-		value := fromUnixNano(discarded.Int64)
-		content.Artifact.DiscardedAt = &value
+	content := cloneArtifactContent(record.Content)
+	if content.Artifact.Ref != ref {
+		return ArtifactContent{}, fmt.Errorf("%w: loaded Artifact identity mismatch", ErrCorruptStore)
 	}
 	if err := validateStoredArtifact(content); err != nil {
 		return ArtifactContent{}, err
@@ -457,40 +414,30 @@ func loadArtifactContent(ctx context.Context, query queryer, ref ArtifactRef) (A
 	return content, nil
 }
 
-func loadApplyReceipt(ctx context.Context, query queryer, ref ArtifactRef) (ApplyReceipt, bool, error) {
-	var receipt ApplyReceipt
-	var recorded int64
-	receipt.Artifact = ref
-	err := query.QueryRowContext(ctx, `
-		SELECT receipt_id, decision, artifact_digest, base_revision,
-		       result_revision, observed_revision, code, message, recorded_at
-		FROM agent_apply_receipts
-		WHERE authority_id = ? AND workspace_id = ? AND artifact_id = ?`,
-		ref.Workspace.Authority, ref.Workspace.ID, ref.ID,
-	).Scan(
-		&receipt.ID, &receipt.Decision, &receipt.ArtifactDigest,
-		&receipt.BaseRevision, &receipt.ResultRevision, &receipt.ObservedRevision,
-		&receipt.Code, &receipt.Message, &recorded,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
+func loadApplyReceipt(view StoreView, ref ArtifactRef) (ApplyReceipt, bool, error) {
+	record, err := view.LoadApplyReceipt(ref)
+	if errors.Is(err, ErrStoreRecordNotFound) {
 		return ApplyReceipt{}, false, nil
 	}
 	if err != nil {
 		return ApplyReceipt{}, false, fmt.Errorf("load Agent apply receipt: %w", err)
 	}
-	receipt.RecordedAt = fromUnixNano(recorded)
+	receipt := record.Receipt
+	if receipt.Artifact != ref {
+		return ApplyReceipt{}, false, fmt.Errorf("%w: loaded apply receipt identity mismatch", ErrCorruptStore)
+	}
 	if err := validateStoredReceipt(receipt); err != nil {
 		return ApplyReceipt{}, false, err
 	}
 	return receipt, true, nil
 }
 
-func loadVerifiedApplyReceipt(ctx context.Context, query queryer, ref ArtifactRef) (ApplyReceipt, bool, error) {
-	receipt, found, err := loadApplyReceipt(ctx, query, ref)
+func loadVerifiedApplyReceipt(view StoreView, ref ArtifactRef) (ApplyReceipt, bool, error) {
+	receipt, found, err := loadApplyReceipt(view, ref)
 	if err != nil || !found {
 		return receipt, found, err
 	}
-	content, err := loadArtifactContent(ctx, query, ref)
+	content, err := loadArtifactContent(view, ref)
 	if err != nil {
 		return ApplyReceipt{}, false, err
 	}
@@ -503,64 +450,96 @@ func loadVerifiedApplyReceipt(ctx context.Context, query queryer, ref ArtifactRe
 	return receipt, true, nil
 }
 
-func replayJSONCommand(
-	ctx context.Context,
-	tx *sql.Tx,
-	authority AuthorityID,
-	id CommandID,
-	kind, digest, resultKind string,
-	result any,
-) (bool, error) {
-	var storedKind, storedDigest, storedResultKind, storedResultDigest string
-	var encoded []byte
-	err := tx.QueryRowContext(ctx, `
-		SELECT kind, digest, result_kind, result, result_digest
-		FROM agent_commands
-		WHERE authority_id = ? AND command_id = ?`, authority, id,
-	).Scan(&storedKind, &storedDigest, &storedResultKind, &encoded, &storedResultDigest)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+func verifyArtifactLeaseGrantHistory(view StoreView, grant LeaseGrant) (time.Time, error) {
+	if err := validateLeaseGrant(grant); err != nil {
+		return time.Time{}, err
+	}
+	taskRecord, err := loadTaskRecordFromStore(view, grant.Task)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return time.Time{}, fmt.Errorf("%w: Agent lease Task is missing", ErrCorruptStore)
+		}
+		return time.Time{}, err
+	}
+	record, err := view.LoadLeaseGrant(grant.Task, grant.Fence)
+	if errors.Is(err, ErrStoreRecordNotFound) {
+		return time.Time{}, fmt.Errorf("%w: Agent lease has no durable grant history", ErrCorruptStore)
 	}
 	if err != nil {
-		return false, fmt.Errorf("lookup Agent command: %w", err)
+		return time.Time{}, fmt.Errorf("load Agent lease grant history: %w", err)
 	}
-	if byteDigest(encoded) != storedResultDigest {
-		return false, fmt.Errorf("%w: Agent command result digest mismatch", ErrCorruptStore)
+	if record.Grant != grant || !validLeaseTimestamp(record.GrantedAt) {
+		return time.Time{}, fmt.Errorf("%w: Agent lease differs from durable grant history", ErrCorruptStore)
 	}
-	if storedKind != kind || storedDigest != digest || storedResultKind != resultKind {
-		return false, ErrIdempotencyConflict
+	if record.GrantedAt.Before(taskRecord.Task.CreatedAt) {
+		return time.Time{}, fmt.Errorf("%w: Agent lease predates its Task", ErrCorruptStore)
 	}
-	if err := json.Unmarshal(encoded, result); err != nil {
-		return false, fmt.Errorf("%w: decode Agent command result: %v", ErrCorruptStore, err)
-	}
-	return true, nil
+	return record.GrantedAt, nil
 }
 
-func recordJSONCommand(
-	ctx context.Context,
-	tx *sql.Tx,
-	authority AuthorityID,
-	id CommandID,
-	kind, digest, resultKind string,
-	result any,
-	now time.Time,
-) error {
-	encoded, err := json.Marshal(result)
-	if err != nil {
-		return fmt.Errorf("encode Agent command result: %w", err)
+func requireArtifactCurrentLease(view StoreView, task StoreTaskRecord, grant LeaseGrant) error {
+	if err := validateLeaseGrant(grant); err != nil {
+		return err
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO agent_commands (
-		  authority_id, command_id, kind, digest, result_kind, result, result_digest, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, authority, id, kind, digest,
-		resultKind, encoded, byteDigest(encoded), unixNano(now),
-	); err != nil {
-		if uniqueConstraint(err) {
-			return ErrIdempotencyConflict
+	if task.Task.Ref != grant.Task {
+		return fmt.Errorf("%w: Agent lease Task identity mismatch", ErrCorruptStore)
+	}
+	if task.Lease.Fence > LeaseFence(math.MaxInt64) || (task.Lease.Fence == 0 && task.Lease.Owner != "") {
+		return fmt.Errorf("%w: invalid current Agent lease", ErrCorruptStore)
+	}
+	if task.Lease.Owner != "" && validateStable("worker id", string(task.Lease.Owner)) != nil {
+		return fmt.Errorf("%w: invalid Agent lease owner", ErrCorruptStore)
+	}
+	latest, err := view.LoadLatestLeaseGrant(grant.Task)
+	if errors.Is(err, ErrStoreRecordNotFound) {
+		if task.Lease.Fence != 0 {
+			return fmt.Errorf("%w: Agent lease fence has no durable grant history", ErrCorruptStore)
 		}
-		return fmt.Errorf("record Agent command: %w", err)
+		return ErrStaleLease
+	}
+	if err != nil {
+		return fmt.Errorf("load latest Agent lease history: %w", err)
+	}
+	if validateLeaseGrant(latest.Grant) != nil || latest.Grant.Task != grant.Task || latest.Grant.Fence != task.Lease.Fence ||
+		!validLeaseTimestamp(latest.GrantedAt) || latest.GrantedAt.Before(task.Task.CreatedAt) {
+		return fmt.Errorf("%w: Agent lease fence differs from durable grant history", ErrCorruptStore)
+	}
+	if task.Lease.Owner != "" && latest.Grant.Worker != task.Lease.Owner {
+		return fmt.Errorf("%w: current Agent lease owner differs from durable grant", ErrCorruptStore)
+	}
+	if task.Lease.Owner != grant.Worker || task.Lease.Fence != grant.Fence {
+		return ErrStaleLease
+	}
+	if latest.Grant != grant {
+		return fmt.Errorf("%w: current Agent lease differs from durable grant", ErrCorruptStore)
+	}
+	exact, err := view.LoadLeaseGrant(grant.Task, grant.Fence)
+	if errors.Is(err, ErrStoreRecordNotFound) {
+		return fmt.Errorf("%w: Agent lease has no durable grant history", ErrCorruptStore)
+	}
+	if err != nil {
+		return fmt.Errorf("load Agent lease grant history: %w", err)
+	}
+	if exact.Grant != latest.Grant || !exact.GrantedAt.Equal(latest.GrantedAt) {
+		return fmt.Errorf("%w: latest Agent lease differs from exact grant history", ErrCorruptStore)
 	}
 	return nil
+}
+
+func loadArtifactWorkspaceHead(view StoreView, ref WorkspaceRef) (WorkspaceHead, error) {
+	record, err := view.LoadWorkspaceHead(ref)
+	if errors.Is(err, ErrStoreRecordNotFound) {
+		return WorkspaceHead{}, ErrWorkspaceNotFound
+	}
+	if err != nil {
+		return WorkspaceHead{}, fmt.Errorf("load Agent Workspace head: %w", err)
+	}
+	head := record.Head
+	if head.Workspace != ref || validateRevision("stored confirmed revision", head.ConfirmedRevision) != nil ||
+		head.UpdatedAt.IsZero() {
+		return WorkspaceHead{}, fmt.Errorf("%w: invalid Workspace head", ErrCorruptStore)
+	}
+	return head, nil
 }
 
 func validateArtifactPayloadShape(payload workspace.Payload) error {

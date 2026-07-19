@@ -29,95 +29,87 @@ func (agent *Agent) AcquireLease(ctx context.Context, command AcquireLeaseComman
 	if err != nil {
 		return LeaseAssignment{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return LeaseAssignment{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, nil)
-	if err != nil {
-		return LeaseAssignment{}, fmt.Errorf("begin Agent lease acquisition: %w", err)
-	}
-	defer tx.Rollback()
-
-	var replay LeaseAssignment
-	if found, err := replayJSONCommand(
-		ctx, tx, command.Task.Workspace.Authority, command.ID,
-		"acquire_lease", digest, "lease_assignment", &replay,
-	); err != nil {
-		return LeaseAssignment{}, err
-	} else if found {
-		if err := validateLeaseAssignment(replay); err != nil ||
-			replay.Grant.Task != command.Task || replay.Grant.Worker != command.Worker {
-			return LeaseAssignment{}, fmt.Errorf("%w: invalid replayed Agent lease assignment", ErrCorruptStore)
+	var assignment LeaseAssignment
+	err = store.Update(ctx, func(tx StoreTx) error {
+		var replay LeaseAssignment
+		if found, err := replayJSONCommandFromStore(
+			tx, command.Task.Workspace.Authority, command.ID,
+			"acquire_lease", digest, "lease_assignment", &replay,
+		); err != nil {
+			return err
+		} else if found {
+			if err := validateLeaseAssignment(replay); err != nil ||
+				replay.Grant.Task != command.Task || replay.Grant.Worker != command.Worker {
+				return fmt.Errorf("%w: invalid replayed Agent lease assignment", ErrCorruptStore)
+			}
+			if err := verifyLeaseAssignmentFromStore(tx, replay); err != nil {
+				return err
+			}
+			assignment = cloneLeaseAssignment(replay)
+			return nil
 		}
-		if err := verifyLeaseHistory(ctx, tx, replay); err != nil {
-			return LeaseAssignment{}, err
-		}
-		return cloneLeaseAssignment(replay), nil
-	}
 
-	task, err := loadTask(ctx, tx, command.Task)
-	if err != nil {
-		return LeaseAssignment{}, err
-	}
-	owner, fence, previousGrantedAt, err := loadLeaseState(ctx, tx, command.Task)
-	if err != nil {
-		return LeaseAssignment{}, err
-	}
-	if task.State.Terminal() {
-		return LeaseAssignment{}, &TransitionError{Operation: "acquire_lease", State: task.State, Terminal: true}
-	}
-	if owner != "" {
-		return LeaseAssignment{}, ErrLeaseUnavailable
-	}
-	if fence >= LeaseFence(math.MaxInt64) {
-		return LeaseAssignment{}, ErrLeaseFenceExhausted
-	}
-	nextFence := fence + 1
-	now := timestampAtLeast(agent.now(), task.UpdatedAt, previousGrantedAt)
-	grant := LeaseGrant{Task: command.Task, Worker: command.Worker, Fence: nextFence}
-	assignment := LeaseAssignment{Grant: grant, Task: task, GrantedAt: now}
-
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO agent_lease_grants (
-		  authority_id, workspace_id, task_id, fence, worker_id, granted_at
-		) VALUES (?, ?, ?, ?, ?, ?)`,
-		command.Task.Workspace.Authority, command.Task.Workspace.ID, command.Task.ID,
-		nextFence, command.Worker, unixNano(now),
-	); err != nil {
-		if uniqueConstraint(err) {
-			return LeaseAssignment{}, fmt.Errorf("%w: duplicate Agent lease generation", ErrCorruptStore)
+		record, err := loadTaskRecordFromStore(tx, command.Task)
+		if err != nil {
+			return err
 		}
-		return LeaseAssignment{}, fmt.Errorf("record Agent lease grant: %w", err)
-	}
-	result, err := tx.ExecContext(ctx, `
-		UPDATE agent_tasks
-		SET lease_owner = ?, lease_fence = ?
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ?
-		  AND lease_owner = '' AND lease_fence = ?
-		  AND state NOT IN ('completed', 'canceled', 'rejected', 'failed')`,
-		command.Worker, nextFence, command.Task.Workspace.Authority,
-		command.Task.Workspace.ID, command.Task.ID, fence,
-	)
+		previousGrantedAt, err := validateLeaseHistoryHeadFromStore(tx, record)
+		if err != nil {
+			return err
+		}
+		if record.Task.State.Terminal() {
+			return &TransitionError{Operation: "acquire_lease", State: record.Task.State, Terminal: true}
+		}
+		if record.Lease.Owner != "" {
+			return ErrLeaseUnavailable
+		}
+		if record.Lease.Fence >= LeaseFence(math.MaxInt64) {
+			return ErrLeaseFenceExhausted
+		}
+		nextFence := record.Lease.Fence + 1
+		now := timestampAtLeast(agent.now(), record.Task.UpdatedAt, previousGrantedAt)
+		assignment = LeaseAssignment{
+			Grant: LeaseGrant{Task: command.Task, Worker: command.Worker, Fence: nextFence},
+			Task:  cloneTask(record.Task), GrantedAt: now,
+		}
+		if err := tx.InsertLeaseGrant(StoreLeaseGrantRecord{
+			Grant: assignment.Grant, GrantedAt: now,
+		}); err != nil {
+			if errors.Is(err, ErrStoreConflict) {
+				return fmt.Errorf("%w: duplicate Agent lease generation", ErrCorruptStore)
+			}
+			return fmt.Errorf("record Agent lease grant: %w", err)
+		}
+		expectedLease := record.Lease
+		next := record
+		next.Task = cloneTask(record.Task)
+		next.Lease = StoreLeaseState{Owner: command.Worker, Fence: nextFence}
+		changed, err := tx.CompareAndSwapTask(StoreTaskMutation{
+			Ref: command.Task,
+			Condition: StoreTaskCondition{
+				ExpectedRevision: record.Task.Revision,
+				ExpectedLease:    &expectedLease,
+			},
+			Next: next,
+		})
+		if err != nil {
+			return fmt.Errorf("acquire Agent lease: %w", err)
+		}
+		if !changed {
+			return ErrLeaseUnavailable
+		}
+		return recordJSONCommandToStore(
+			tx, command.Task.Workspace.Authority, command.ID,
+			"acquire_lease", digest, "lease_assignment", assignment, now,
+		)
+	})
 	if err != nil {
-		return LeaseAssignment{}, fmt.Errorf("acquire Agent lease: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return LeaseAssignment{}, fmt.Errorf("inspect Agent lease acquisition: %w", err)
-	}
-	if affected != 1 {
-		return LeaseAssignment{}, ErrLeaseUnavailable
-	}
-	if err := recordJSONCommand(
-		ctx, tx, command.Task.Workspace.Authority, command.ID,
-		"acquire_lease", digest, "lease_assignment", assignment, now,
-	); err != nil {
 		return LeaseAssignment{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return LeaseAssignment{}, fmt.Errorf("commit Agent lease acquisition: %w", err)
 	}
 	return cloneLeaseAssignment(assignment), nil
 }
@@ -139,64 +131,60 @@ func (agent *Agent) FenceLease(ctx context.Context, command FenceLeaseCommand) e
 	if err != nil {
 		return err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin Agent lease fence: %w", err)
-	}
-	defer tx.Rollback()
-
-	var replay LeaseGrant
-	if found, err := replayJSONCommand(
-		ctx, tx, command.Grant.Task.Workspace.Authority, command.ID,
-		"fence_lease", digest, "lease_grant", &replay,
-	); err != nil {
-		return err
-	} else if found {
-		if replay != command.Grant || validateLeaseGrant(replay) != nil {
-			return fmt.Errorf("%w: invalid replayed Agent lease fence", ErrCorruptStore)
-		}
-		if _, err := verifyLeaseGrantHistory(ctx, tx, replay); err != nil {
+	err = store.Update(ctx, func(tx StoreTx) error {
+		var replay LeaseGrant
+		if found, err := replayJSONCommandFromStore(
+			tx, command.Grant.Task.Workspace.Authority, command.ID,
+			"fence_lease", digest, "lease_grant", &replay,
+		); err != nil {
+			return err
+		} else if found {
+			if replay != command.Grant || validateLeaseGrant(replay) != nil {
+				return fmt.Errorf("%w: invalid replayed Agent lease fence", ErrCorruptStore)
+			}
+			_, err := verifyLeaseGrantHistoryFromStore(tx, replay)
+			if errors.Is(err, ErrStaleLease) {
+				return fmt.Errorf("%w: replayed Agent lease fence has no durable grant history", ErrCorruptStore)
+			}
 			return err
 		}
-		return nil
-	}
-	if err := requireCurrentLease(ctx, tx, command.Grant); err != nil {
-		return err
-	}
-	result, err := tx.ExecContext(ctx, `
-		UPDATE agent_tasks
-		SET lease_owner = ''
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ?
-		  AND lease_owner = ? AND lease_fence = ?`,
-		command.Grant.Task.Workspace.Authority, command.Grant.Task.Workspace.ID,
-		command.Grant.Task.ID, command.Grant.Worker, command.Grant.Fence,
-	)
-	if err != nil {
-		return fmt.Errorf("fence Agent lease: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("inspect Agent lease fence: %w", err)
-	}
-	if affected != 1 {
-		return ErrStaleLease
-	}
-	now := agent.now().UTC()
-	if err := recordJSONCommand(
-		ctx, tx, command.Grant.Task.Workspace.Authority, command.ID,
-		"fence_lease", digest, "lease_grant", command.Grant, now,
-	); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit Agent lease fence: %w", err)
-	}
-	return nil
+		record, err := loadTaskRecordFromStore(tx, command.Grant.Task)
+		if err != nil {
+			return err
+		}
+		if err := requireCurrentLeaseFromStore(tx, command.Grant); err != nil {
+			return err
+		}
+		expectedLease := record.Lease
+		next := record
+		next.Task = cloneTask(record.Task)
+		next.Lease = StoreLeaseState{Fence: command.Grant.Fence}
+		changed, err := tx.CompareAndSwapTask(StoreTaskMutation{
+			Ref: command.Grant.Task,
+			Condition: StoreTaskCondition{
+				ExpectedRevision: record.Task.Revision,
+				ExpectedLease:    &expectedLease,
+			},
+			Next: next,
+		})
+		if err != nil {
+			return fmt.Errorf("fence Agent lease: %w", err)
+		}
+		if !changed {
+			return ErrStaleLease
+		}
+		now := agent.now().UTC()
+		return recordJSONCommandToStore(
+			tx, command.Grant.Task.Workspace.Authority, command.ID,
+			"fence_lease", digest, "lease_grant", command.Grant, now,
+		)
+	})
+	return err
 }
 
 // GetLease returns the current committed assignment for a Task. An unleased
@@ -208,22 +196,19 @@ func (agent *Agent) GetLease(ctx context.Context, ref TaskRef) (LeaseAssignment,
 	if err := validateTaskRef(ref); err != nil {
 		return LeaseAssignment{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return LeaseAssignment{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return LeaseAssignment{}, fmt.Errorf("begin Agent lease read: %w", err)
-	}
-	defer tx.Rollback()
-	assignment, err := loadLeaseAssignment(ctx, tx, ref)
+	var assignment LeaseAssignment
+	err = store.View(ctx, func(view StoreView) error {
+		var err error
+		assignment, err = loadLeaseAssignmentFromStore(view, ref)
+		return err
+	})
 	if err != nil {
 		return LeaseAssignment{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return LeaseAssignment{}, fmt.Errorf("commit Agent lease read: %w", err)
 	}
 	return cloneLeaseAssignment(assignment), nil
 }
@@ -258,120 +243,59 @@ func (agent *Agent) ListLeases(
 			return LeasePage{}, fmt.Errorf("%w: invalid lease page cursor", ErrInvalidArgument)
 		}
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return LeasePage{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return LeasePage{}, fmt.Errorf("begin Agent lease list: %w", err)
-	}
-	defer tx.Rollback()
-
-	query := `
-		SELECT t.workspace_id, t.task_id, t.lease_fence, g.worker_id, g.granted_at
-		FROM agent_tasks AS t
-		LEFT JOIN agent_lease_grants AS g
-		  ON g.authority_id = t.authority_id
-		 AND g.workspace_id = t.workspace_id
-		 AND g.task_id = t.task_id
-		 AND g.fence = t.lease_fence
-		WHERE t.authority_id = ? AND t.lease_owner = ?`
-	arguments := []any{authority, worker}
-	if request.After != nil {
-		cursorTime := unixNano(request.After.GrantedAt.UTC())
-		query += ` AND (g.granted_at > ? OR
-		  (g.granted_at = ? AND (t.workspace_id > ? OR
-		    (t.workspace_id = ? AND (t.task_id > ? OR
-		      (t.task_id = ? AND t.lease_fence > ?))))))`
-		arguments = append(
-			arguments,
-			cursorTime, cursorTime,
-			request.After.Workspace, request.After.Workspace,
-			request.After.Task, request.After.Task, request.After.Fence,
-		)
-	}
-	query += ` ORDER BY g.granted_at, t.workspace_id, t.task_id, t.lease_fence LIMIT ?`
-	arguments = append(arguments, limit+1)
-	rows, err := tx.QueryContext(ctx, query, arguments...)
-	if err != nil {
-		return LeasePage{}, fmt.Errorf("list Agent leases: %w", err)
-	}
-	type leaseRow struct {
-		ref       TaskRef
-		fence     LeaseFence
-		grantedAt time.Time
-	}
-	listed := make([]leaseRow, 0, limit+1)
-	for rows.Next() {
-		var row leaseRow
-		var historyWorker sql.NullString
-		var grantedAt sql.NullInt64
-		row.ref.Workspace.Authority = authority
-		if err := rows.Scan(
-			&row.ref.Workspace.ID, &row.ref.ID, &row.fence,
-			&historyWorker, &grantedAt,
-		); err != nil {
-			_ = rows.Close()
-			return LeasePage{}, fmt.Errorf("scan Agent lease: %w", err)
-		}
-		if !historyWorker.Valid || !grantedAt.Valid || WorkerID(historyWorker.String) != worker {
-			_ = rows.Close()
-			return LeasePage{}, fmt.Errorf(
-				"%w: current Agent lease differs from durable grant", ErrCorruptStore,
-			)
-		}
-		row.grantedAt = fromUnixNano(grantedAt.Int64)
-		listed = append(listed, row)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return LeasePage{}, fmt.Errorf("list Agent leases: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return LeasePage{}, fmt.Errorf("close Agent lease list: %w", err)
-	}
-
-	page := LeasePage{Items: make([]LeaseAssignment, 0, min(len(listed), limit))}
-	if len(listed) > limit {
-		page.HasMore = true
-		listed = listed[:limit]
-	}
-	for _, row := range listed {
-		owner, fence, grantedAt, err := loadLeaseState(ctx, tx, row.ref)
+	page := LeasePage{}
+	err = store.View(ctx, func(view StoreView) error {
+		listed, err := view.ScanLeases(StoreLeaseScan{
+			Authority: authority,
+			Worker:    worker,
+			After:     request.After,
+			Limit:     limit + 1,
+		})
 		if err != nil {
-			return LeasePage{}, err
+			return fmt.Errorf("list Agent leases: %w", err)
 		}
-		if owner != worker || fence != row.fence || !grantedAt.Equal(row.grantedAt) {
-			return LeasePage{}, fmt.Errorf(
-				"%w: listed Agent lease differs from current durable state", ErrCorruptStore,
-			)
+		page.Items = make([]LeaseAssignment, 0, min(len(listed), limit))
+		if len(listed) > limit {
+			page.HasMore = true
+			listed = listed[:limit]
 		}
-		task, err := loadTask(ctx, tx, row.ref)
-		if err != nil {
-			return LeasePage{}, err
+		for _, assignment := range listed {
+			if err := validateLeaseAssignment(assignment); err != nil ||
+				assignment.Grant.Task.Workspace.Authority != authority ||
+				assignment.Grant.Worker != worker {
+				return fmt.Errorf("%w: invalid listed Agent lease", ErrCorruptStore)
+			}
+			if err := verifyLeaseAssignmentFromStore(view, assignment); err != nil {
+				return err
+			}
+			record, err := loadTaskRecordFromStore(view, assignment.Grant.Task)
+			if err != nil {
+				return err
+			}
+			if record.Lease.Owner != worker || record.Lease.Fence != assignment.Grant.Fence ||
+				record.Task.Revision != assignment.Task.Revision {
+				return fmt.Errorf("%w: listed Agent lease differs from current durable state", ErrCorruptStore)
+			}
+			page.Items = append(page.Items, cloneLeaseAssignment(assignment))
 		}
-		assignment := LeaseAssignment{
-			Grant: LeaseGrant{Task: row.ref, Worker: worker, Fence: row.fence},
-			Task:  task, GrantedAt: row.grantedAt,
+		if page.HasMore && len(page.Items) > 0 {
+			last := page.Items[len(page.Items)-1]
+			page.Next = &LeasePageCursor{
+				GrantedAt: last.GrantedAt,
+				Workspace: last.Grant.Task.Workspace.ID,
+				Task:      last.Grant.Task.ID,
+				Fence:     last.Grant.Fence,
+			}
 		}
-		if err := validateLeaseAssignment(assignment); err != nil {
-			return LeasePage{}, err
-		}
-		page.Items = append(page.Items, cloneLeaseAssignment(assignment))
-	}
-	if page.HasMore && len(page.Items) > 0 {
-		last := page.Items[len(page.Items)-1]
-		page.Next = &LeasePageCursor{
-			GrantedAt: last.GrantedAt,
-			Workspace: last.Grant.Task.Workspace.ID,
-			Task:      last.Grant.Task.ID,
-			Fence:     last.Grant.Fence,
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return LeasePage{}, fmt.Errorf("commit Agent lease list: %w", err)
+		return nil
+	})
+	if err != nil {
+		return LeasePage{}, err
 	}
 	return page, nil
 }

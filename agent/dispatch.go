@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -28,116 +27,94 @@ func (agent *Agent) ClaimLease(ctx context.Context, command ClaimLeaseCommand) (
 	if err != nil {
 		return LeaseAssignment{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return LeaseAssignment{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, nil)
-	if err != nil {
-		return LeaseAssignment{}, fmt.Errorf("begin Agent lease claim: %w", err)
-	}
-	defer tx.Rollback()
+	var assignment LeaseAssignment
+	err = store.Update(ctx, func(tx StoreTx) error {
+		var replay LeaseAssignment
+		if found, err := replayJSONCommandFromStore(
+			tx, command.Authority, command.ID,
+			"claim_lease", digest, "lease_assignment", &replay,
+		); err != nil {
+			return err
+		} else if found {
+			if err := validateLeaseAssignment(replay); err != nil ||
+				replay.Grant.Task.Workspace.Authority != command.Authority ||
+				replay.Grant.Worker != command.Worker {
+				return fmt.Errorf("%w: invalid replayed Agent lease claim", ErrCorruptStore)
+			}
+			if err := verifyLeaseAssignmentFromStore(tx, replay); err != nil {
+				return err
+			}
+			assignment = cloneLeaseAssignment(replay)
+			return nil
+		}
 
-	var replay LeaseAssignment
-	if found, err := replayJSONCommand(
-		ctx, tx, command.Authority, command.ID,
-		"claim_lease", digest, "lease_assignment", &replay,
-	); err != nil {
-		return LeaseAssignment{}, err
-	} else if found {
-		if err := validateLeaseAssignment(replay); err != nil ||
-			replay.Grant.Task.Workspace.Authority != command.Authority ||
-			replay.Grant.Worker != command.Worker {
-			return LeaseAssignment{}, fmt.Errorf("%w: invalid replayed Agent lease claim", ErrCorruptStore)
+		record, err := tx.FindClaimableTask(command.Authority)
+		if errors.Is(err, ErrStoreRecordNotFound) {
+			return ErrLeaseNotFound
 		}
-		if err := verifyLeaseHistory(ctx, tx, replay); err != nil {
-			return LeaseAssignment{}, err
+		if err != nil {
+			return fmt.Errorf("select claimable Agent Task: %w", err)
 		}
-		return cloneLeaseAssignment(replay), nil
-	}
+		if err := validateStoreTaskRecord(record); err != nil ||
+			record.Task.Ref.Workspace.Authority != command.Authority ||
+			record.Task.State.Terminal() || record.Lease.Owner != "" {
+			return fmt.Errorf("%w: selected Agent Task is not claimable", ErrCorruptStore)
+		}
+		previousGrantedAt, err := validateLeaseHistoryHeadFromStore(tx, record)
+		if err != nil {
+			return err
+		}
+		if record.Lease.Fence >= LeaseFence(math.MaxInt64) {
+			return ErrLeaseFenceExhausted
+		}
 
-	var ref TaskRef
-	ref.Workspace.Authority = command.Authority
-	if err := tx.QueryRowContext(ctx, `
-		SELECT workspace_id, task_id
-		FROM agent_tasks
-		WHERE authority_id = ?
-		  AND lease_owner = ''
-		  AND state NOT IN ('completed', 'canceled', 'rejected', 'failed')
-		ORDER BY created_at, workspace_id, task_id
-		LIMIT 1`, command.Authority,
-	).Scan(&ref.Workspace.ID, &ref.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return LeaseAssignment{}, ErrLeaseNotFound
+		nextFence := record.Lease.Fence + 1
+		now := timestampAtLeast(agent.now(), record.Task.UpdatedAt, previousGrantedAt)
+		assignment = LeaseAssignment{
+			Grant: LeaseGrant{Task: record.Task.Ref, Worker: command.Worker, Fence: nextFence},
+			Task:  cloneTask(record.Task), GrantedAt: now,
 		}
-		return LeaseAssignment{}, fmt.Errorf("select claimable Agent Task: %w", err)
-	}
-	if err := validateTaskRef(ref); err != nil {
-		return LeaseAssignment{}, fmt.Errorf("%w: invalid claimable Agent Task identity", ErrCorruptStore)
-	}
-	task, err := loadTask(ctx, tx, ref)
-	if err != nil {
-		return LeaseAssignment{}, err
-	}
-	owner, fence, previousGrantedAt, err := loadLeaseState(ctx, tx, ref)
-	if err != nil {
-		return LeaseAssignment{}, err
-	}
-	if task.State.Terminal() || owner != "" {
-		return LeaseAssignment{}, fmt.Errorf("%w: selected Agent Task is not claimable", ErrCorruptStore)
-	}
-	if fence >= LeaseFence(math.MaxInt64) {
-		return LeaseAssignment{}, ErrLeaseFenceExhausted
-	}
-
-	nextFence := fence + 1
-	now := timestampAtLeast(agent.now(), task.UpdatedAt, previousGrantedAt)
-	assignment := LeaseAssignment{
-		Grant: LeaseGrant{Task: ref, Worker: command.Worker, Fence: nextFence},
-		Task:  task, GrantedAt: now,
-	}
-	if err := validateLeaseAssignment(assignment); err != nil {
-		return LeaseAssignment{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO agent_lease_grants (
-		  authority_id, workspace_id, task_id, fence, worker_id, granted_at
-		) VALUES (?, ?, ?, ?, ?, ?)`,
-		command.Authority, ref.Workspace.ID, ref.ID,
-		nextFence, command.Worker, unixNano(now),
-	); err != nil {
-		if uniqueConstraint(err) {
-			return LeaseAssignment{}, fmt.Errorf("%w: duplicate Agent lease generation", ErrCorruptStore)
+		if err := validateLeaseAssignment(assignment); err != nil {
+			return err
 		}
-		return LeaseAssignment{}, fmt.Errorf("record claimed Agent lease grant: %w", err)
-	}
-	result, err := tx.ExecContext(ctx, `
-		UPDATE agent_tasks
-		SET lease_owner = ?, lease_fence = ?
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ?
-		  AND lease_owner = '' AND lease_fence = ?
-		  AND state NOT IN ('completed', 'canceled', 'rejected', 'failed')`,
-		command.Worker, nextFence, command.Authority, ref.Workspace.ID, ref.ID, fence,
-	)
+		if err := tx.InsertLeaseGrant(StoreLeaseGrantRecord{
+			Grant: assignment.Grant, GrantedAt: now,
+		}); err != nil {
+			if errors.Is(err, ErrStoreConflict) {
+				return fmt.Errorf("%w: duplicate Agent lease generation", ErrCorruptStore)
+			}
+			return fmt.Errorf("record claimed Agent lease grant: %w", err)
+		}
+		expectedLease := record.Lease
+		next := record
+		next.Task = cloneTask(record.Task)
+		next.Lease = StoreLeaseState{Owner: command.Worker, Fence: nextFence}
+		changed, err := tx.CompareAndSwapTask(StoreTaskMutation{
+			Ref: record.Task.Ref,
+			Condition: StoreTaskCondition{
+				ExpectedRevision: record.Task.Revision,
+				ExpectedLease:    &expectedLease,
+			},
+			Next: next,
+		})
+		if err != nil {
+			return fmt.Errorf("claim Agent lease: %w", err)
+		}
+		if !changed {
+			return ErrLeaseUnavailable
+		}
+		return recordJSONCommandToStore(
+			tx, command.Authority, command.ID,
+			"claim_lease", digest, "lease_assignment", assignment, now,
+		)
+	})
 	if err != nil {
-		return LeaseAssignment{}, fmt.Errorf("claim Agent lease: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return LeaseAssignment{}, fmt.Errorf("inspect Agent lease claim: %w", err)
-	}
-	if affected != 1 {
-		return LeaseAssignment{}, ErrLeaseUnavailable
-	}
-	if err := recordJSONCommand(
-		ctx, tx, command.Authority, command.ID,
-		"claim_lease", digest, "lease_assignment", assignment, now,
-	); err != nil {
 		return LeaseAssignment{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return LeaseAssignment{}, fmt.Errorf("commit Agent lease claim: %w", err)
 	}
 	return cloneLeaseAssignment(assignment), nil
 }

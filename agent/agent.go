@@ -10,17 +10,14 @@ import (
 	"fmt"
 	"math"
 	"mime"
-	"os"
-	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
-	"github.com/vibe-agi/human/internal/ownerlock"
-	"github.com/vibe-agi/human/internal/sqlitefile"
-	_ "modernc.org/sqlite"
+	"github.com/vibe-agi/human/framework"
 )
 
 const (
@@ -32,12 +29,17 @@ const (
 
 var stableID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
-// Config controls one durable HumanAgent domain instance. This first public
-// driver is intentionally single-owner SQLite; DatabasePath is explicit so an
-// embedder cannot accidentally share state with an unrelated LLM gateway.
+// Config controls one durable HumanAgent domain instance. Exactly one of Store
+// and DatabasePath must be supplied. Store is the framework extension point;
+// DatabasePath composes the official built-in SQLite implementation for the
+// convenient local case.
 type Config struct {
+	// Store injects a complete Agent persistence consistency domain. Borrowed
+	// resources remain caller-owned; owned resources are released by Shutdown.
+	Store framework.Resource[Store]
 	// DatabasePath selects the dedicated HumanAgent SQLite identity. Missing
 	// parent directories are created privately; do not share this file with LLM.
+	// It is mutually exclusive with Store.
 	DatabasePath string
 	// MaxArtifactBytes limits newly frozen payloads. Reads continue to accept
 	// already committed payloads up to the schema hard limit of 64 MiB.
@@ -51,8 +53,15 @@ func DefaultConfig() Config {
 
 func (config Config) withDefaults() (Config, error) {
 	config.DatabasePath = strings.TrimSpace(config.DatabasePath)
-	if config.DatabasePath == "" {
-		return Config{}, fmt.Errorf("%w: agent database path is required", ErrInvalidArgument)
+	store, err := config.Store.Value()
+	if err != nil {
+		return Config{}, fmt.Errorf("inspect Agent Store resource: %w", err)
+	}
+	hasStore := !nilAgentStore(store)
+	if hasStore == (config.DatabasePath != "") {
+		return Config{}, fmt.Errorf(
+			"%w: exactly one of agent Store or database path is required", ErrInvalidArgument,
+		)
 	}
 	if config.MaxArtifactBytes == 0 {
 		config.MaxArtifactBytes = defaultArtifactMax
@@ -66,14 +75,21 @@ func (config Config) withDefaults() (Config, error) {
 // Agent owns the durable HumanAgent domain store. It does not own an HTTP
 // listener or worker transport; those are adapters over this lifecycle.
 type Agent struct {
+	// database remains only as a package-test corruption hook while the SQLite
+	// bridge moves to agent/sqlite. Core operations never read it.
 	database         *sql.DB
-	owner            *ownerlock.Lock
+	storeResource    framework.Resource[Store]
+	store            Store
 	now              func() time.Time
 	maxArtifactBytes int64
 
-	lifecycle sync.RWMutex
+	lifecycle sync.Mutex
 	closed    bool
-	closeOnce sync.Once
+	active    uint64
+	drained   chan struct{}
+	drainOnce sync.Once
+	done      chan struct{}
+	finish    sync.Once
 	closeErr  error
 }
 
@@ -88,111 +104,157 @@ func Open(ctx context.Context, config Config) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	config.DatabasePath, err = resolveAgentDatabasePath(config.DatabasePath)
+	if config.DatabasePath == "" {
+		return newAgent(ctx, config.Store, config.MaxArtifactBytes)
+	}
+	resource, err := OpenSQLiteStore(ctx, config.DatabasePath)
 	if err != nil {
 		return nil, err
 	}
-	location, err := sqlitefile.PreparePrivate(config.DatabasePath, "HumanAgent database")
+	result, err := newAgent(ctx, resource, config.MaxArtifactBytes)
 	if err != nil {
 		return nil, err
 	}
-	owner, err := ownerlock.Acquire(location, "HumanAgent database")
-	if err != nil {
-		if errors.Is(err, ownerlock.ErrInUse) {
-			return nil, fmt.Errorf("%w: %v", ErrDatabaseInUse, err)
-		}
-		return nil, err
+	if store, ok := result.store.(*sqliteStore); ok {
+		result.database = store.database
 	}
-	releaseOwner := true
-	defer func() {
-		if releaseOwner && owner != nil {
-			_ = owner.Close()
-		}
-	}()
+	return result, nil
+}
 
-	database, err := sql.Open("sqlite", location.OpenDSN())
-	if err != nil {
-		return nil, fmt.Errorf("open HumanAgent sqlite: %w", err)
-	}
-	database.SetMaxOpenConns(1)
-	database.SetMaxIdleConns(1)
-	closeDatabase := true
-	defer func() {
-		if closeDatabase {
-			_ = database.Close()
-		}
-	}()
-	for _, pragma := range []string{
-		"PRAGMA journal_mode = DELETE",
-		"PRAGMA synchronous = FULL",
-		"PRAGMA secure_delete = ON",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA foreign_keys = ON",
-	} {
-		if _, err := database.ExecContext(ctx, pragma); err != nil {
-			return nil, fmt.Errorf("configure HumanAgent sqlite: %w", err)
-		}
-	}
-	if err := requireCurrentOrEmptySchema(ctx, database); err != nil {
-		return nil, err
-	}
-	if _, err := database.ExecContext(ctx, agentSchema); err != nil {
-		return nil, fmt.Errorf("initialize HumanAgent sqlite schema: %w", err)
-	}
+// New constructs an Agent from Config. It is equivalent to Open and exists so
+// custom Store compositions read naturally alongside human.NewAgent.
+func New(ctx context.Context, config Config) (*Agent, error) { return Open(ctx, config) }
 
-	closeDatabase = false
-	releaseOwner = false
+func newAgent(
+	ctx context.Context,
+	resource framework.Resource[Store],
+	maxArtifactBytes int64,
+) (*Agent, error) {
+	store, err := resource.Value()
+	if err != nil {
+		return nil, fmt.Errorf("acquire Agent Store resource: %w", err)
+	}
+	if nilAgentStore(store) {
+		err = fmt.Errorf("%w: Agent Store is required", ErrInvalidArgument)
+	} else if descriptionErr := store.Description().Validate(); descriptionErr != nil {
+		err = fmt.Errorf("validate Agent Store: %w", descriptionErr)
+	}
+	if err != nil {
+		releaseErr := resource.Release(context.WithoutCancel(ctx))
+		return nil, errors.Join(err, releaseErr)
+	}
 	return &Agent{
-		database: database, owner: owner, now: time.Now,
-		maxArtifactBytes: config.MaxArtifactBytes,
+		storeResource:    resource,
+		store:            store,
+		now:              time.Now,
+		maxArtifactBytes: maxArtifactBytes,
+		drained:          make(chan struct{}),
+		done:             make(chan struct{}),
 	}, nil
 }
 
-func resolveAgentDatabasePath(path string) (string, error) {
-	path = strings.TrimSpace(path)
-	if path == ":memory:" || strings.HasPrefix(path, "file:") {
-		return path, nil
+func nilAgentStore(store Store) bool {
+	if store == nil {
+		return true
 	}
-	absolute, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("resolve HumanAgent database path: %w", err)
+	value := reflect.ValueOf(store)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
 	}
-	if err := os.MkdirAll(filepath.Dir(absolute), 0o700); err != nil {
-		return "", fmt.Errorf("create HumanAgent database directory: %w", err)
-	}
-	return absolute, nil
 }
 
-// Close waits for in-process operations, then closes SQLite and releases its
-// cross-process owner lock. It is idempotent.
-func (agent *Agent) Close() error {
+func (agent *Agent) acquireStore() (Store, func(), error) {
+	if agent == nil {
+		return nil, func() {}, ErrClosed
+	}
+	agent.lifecycle.Lock()
+	if agent.closed || agent.store == nil {
+		agent.lifecycle.Unlock()
+		return nil, func() {}, ErrClosed
+	}
+	agent.active++
+	store := agent.store
+	agent.lifecycle.Unlock()
+	var once sync.Once
+	return store, func() {
+		once.Do(func() {
+			agent.lifecycle.Lock()
+			if agent.active > 0 {
+				agent.active--
+			}
+			if agent.closed && agent.active == 0 {
+				agent.drainOnce.Do(func() { close(agent.drained) })
+			}
+			agent.lifecycle.Unlock()
+		})
+	}, nil
+}
+
+// Shutdown stops admission, waits for already admitted method calls, then
+// releases an explicitly owned Store. A borrowed Store is never closed. If ctx
+// expires while calls are draining, shutdown remains initiated and a later
+// call may finish it.
+func (agent *Agent) Shutdown(ctx context.Context) error {
 	if agent == nil {
 		return nil
 	}
-	agent.closeOnce.Do(func() {
-		agent.lifecycle.Lock()
-		defer agent.lifecycle.Unlock()
-		agent.closed = true
-		if agent.database != nil {
-			agent.closeErr = agent.database.Close()
-		}
-		if agent.owner != nil {
-			agent.closeErr = errors.Join(agent.closeErr, agent.owner.Close())
-		}
+	if ctx == nil {
+		return fmt.Errorf("%w: context is required", ErrInvalidArgument)
+	}
+	agent.lifecycle.Lock()
+	agent.closed = true
+	if agent.active == 0 {
+		agent.drainOnce.Do(func() { close(agent.drained) })
+	}
+	drained := agent.drained
+	agent.lifecycle.Unlock()
+
+	select {
+	case <-drained:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	agent.finish.Do(func() {
+		agent.closeErr = agent.storeResource.Release(ctx)
+		close(agent.done)
 	})
 	return agent.closeErr
 }
 
-func (agent *Agent) acquire() (*sql.DB, func(), error) {
+// Done closes after Shutdown has drained calls and released owned resources.
+func (agent *Agent) Done() <-chan struct{} {
 	if agent == nil {
-		return nil, func() {}, ErrClosed
+		closed := make(chan struct{})
+		close(closed)
+		return closed
 	}
-	agent.lifecycle.RLock()
-	if agent.closed || agent.database == nil {
-		agent.lifecycle.RUnlock()
-		return nil, func() {}, ErrClosed
+	return agent.done
+}
+
+// Err returns the terminal resource-release error after Done closes. Before
+// then it returns nil.
+func (agent *Agent) Err() error {
+	if agent == nil {
+		return nil
 	}
-	return agent.database, agent.lifecycle.RUnlock, nil
+	select {
+	case <-agent.done:
+		return agent.closeErr
+	default:
+		return nil
+	}
+}
+
+// Close is the compatibility form of Shutdown for io.Closer users.
+func (agent *Agent) Close() error {
+	return agent.Shutdown(context.Background())
 }
 
 func (agent *Agent) CreateTask(ctx context.Context, command CreateTaskCommand) (Task, error) {
@@ -207,64 +269,64 @@ func (agent *Agent) CreateTask(ctx context.Context, command CreateTaskCommand) (
 	if err != nil {
 		return Task{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return Task{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, nil)
+	var result Task
+	err = store.Update(ctx, func(tx StoreTx) error {
+		if replay, found, err := replayTaskCommandFromStore(
+			tx, command.Task.Workspace.Authority, command.Meta.ID, "create_task", digest,
+		); err != nil {
+			return err
+		} else if found {
+			if replay.Ref != command.Task || replay.Context != command.Context {
+				return fmt.Errorf("%w: create command result identity mismatch", ErrCorruptStore)
+			}
+			result = replay
+			return nil
+		}
+
+		now := agent.now().UTC()
+		task := Task{
+			Ref: command.Task, Context: command.Context, State: TaskSubmitted,
+			Revision: 1, MessageCount: 1, EventCount: 1,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := tx.InsertTask(StoreTaskRecord{Task: task}); err != nil {
+			if errors.Is(err, ErrStoreConflict) {
+				return ErrTaskConflict
+			}
+			return fmt.Errorf("insert Agent task: %w", err)
+		}
+		message := Message{
+			ID: command.Message.ID, Task: command.Task, Sequence: 1,
+			Author: AuthorCaller, Parts: cloneParts(command.Message.Parts), CreatedAt: now,
+		}
+		if err := insertMessageToStore(tx, message); err != nil {
+			return err
+		}
+		event := Event{
+			Task: command.Task, Sequence: 1, Type: EventTaskSubmitted,
+			State: TaskSubmitted, Revision: 1, Message: message.ID, OccurredAt: now,
+		}
+		if err := insertEventToStore(tx, event); err != nil {
+			return err
+		}
+		if err := recordTaskCommandToStore(
+			tx, command.Task.Workspace.Authority, command.Meta.ID,
+			"create_task", digest, task, now,
+		); err != nil {
+			return err
+		}
+		result = cloneTask(task)
+		return nil
+	})
 	if err != nil {
-		return Task{}, fmt.Errorf("begin create Agent task: %w", err)
+		return Task{}, fmt.Errorf("create Agent task: %w", err)
 	}
-	defer tx.Rollback()
-	if replay, found, err := replayTaskCommand(ctx, tx, command.Task.Workspace.Authority, command.Meta.ID, "create_task", digest); err != nil {
-		return Task{}, err
-	} else if found {
-		if replay.Ref != command.Task || replay.Context != command.Context {
-			return Task{}, fmt.Errorf("%w: create command result identity mismatch", ErrCorruptStore)
-		}
-		return replay, nil
-	}
-	now := agent.now().UTC()
-	task := Task{
-		Ref: command.Task, Context: command.Context, State: TaskSubmitted,
-		Revision: 1, MessageCount: 1, EventCount: 1,
-		CreatedAt: now, UpdatedAt: now,
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO agent_tasks (
-		  authority_id, workspace_id, task_id, context_id, state,
-		  revision, message_count, event_count, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, 1, 1, 1, ?, ?)`,
-		command.Task.Workspace.Authority, command.Task.Workspace.ID, command.Task.ID,
-		command.Context.ID, TaskSubmitted, unixNano(now), unixNano(now),
-	); err != nil {
-		if uniqueConstraint(err) {
-			return Task{}, ErrTaskConflict
-		}
-		return Task{}, fmt.Errorf("insert Agent task: %w", err)
-	}
-	message := Message{
-		ID: command.Message.ID, Task: command.Task, Sequence: 1,
-		Author: AuthorCaller, Parts: cloneParts(command.Message.Parts), CreatedAt: now,
-	}
-	if err := insertMessage(ctx, tx, message); err != nil {
-		return Task{}, err
-	}
-	event := Event{
-		Task: command.Task, Sequence: 1, Type: EventTaskSubmitted,
-		State: TaskSubmitted, Revision: 1, Message: message.ID, OccurredAt: now,
-	}
-	if err := insertEvent(ctx, tx, event); err != nil {
-		return Task{}, err
-	}
-	if err := recordTaskCommand(ctx, tx, command.Task.Workspace.Authority, command.Meta.ID, "create_task", digest, task, now); err != nil {
-		return Task{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Task{}, fmt.Errorf("commit Agent task creation: %w", err)
-	}
-	return cloneTask(task), nil
+	return result, nil
 }
 
 func (agent *Agent) AcceptTask(ctx context.Context, command WorkerTaskCommand) (Task, error) {
@@ -394,219 +456,188 @@ func (agent *Agent) transition(
 	if err != nil {
 		return Task{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return Task{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, nil)
-	if err != nil {
-		return Task{}, fmt.Errorf("begin %s: %w", kind, err)
-	}
-	defer tx.Rollback()
-	if replay, found, err := replayTaskCommand(ctx, tx, ref.Workspace.Authority, meta.ID, kind, digest); err != nil {
-		return Task{}, err
-	} else if found {
-		if replay.Ref != ref {
-			return Task{}, fmt.Errorf("%w: transition command result identity mismatch", ErrCorruptStore)
-		}
-		if grant != nil {
-			if _, err := verifyLeaseGrantHistory(ctx, tx, *grant); err != nil {
-				return Task{}, err
-			}
-		}
-		return replay, nil
-	}
-	current, err := loadTask(ctx, tx, ref)
-	if err != nil {
-		return Task{}, err
-	}
-	if grant != nil {
-		if err := requireCurrentLease(ctx, tx, *grant); err != nil {
-			return Task{}, err
-		}
-	}
-	if current.Revision != meta.ExpectedRevision {
-		return Task{}, &RevisionConflictError{Expected: meta.ExpectedRevision, Actual: current.Revision}
-	}
-	if current.State.Terminal() {
-		return Task{}, &TransitionError{Operation: kind, State: current.State, Terminal: true}
-	}
-	if !containsState(change.allowed, current.State) {
-		return Task{}, &TransitionError{Operation: kind, State: current.State}
-	}
-	if current.Revision >= math.MaxInt64 || current.EventCount >= math.MaxInt64 ||
-		(change.message != nil && current.MessageCount >= math.MaxInt64) {
-		return Task{}, fmt.Errorf("%w: task counters exhausted SQLite integer range", ErrRevisionConflict)
-	}
-
-	now := timestampAtLeast(agent.now(), current.UpdatedAt)
-	next := current
-	next.State = change.next
-	next.Revision++
-	next.EventCount++
-	next.UpdatedAt = now
-	var message Message
-	if change.message != nil {
-		next.MessageCount++
-		message = Message{
-			ID: change.message.ID, Task: ref, Sequence: next.MessageCount,
-			Author: change.author, Parts: cloneParts(change.message.Parts), CreatedAt: now,
-		}
-	}
-	if change.submission != "" {
-		if (current.Artifact == nil) != (change.artifact == nil) ||
-			(current.Artifact != nil && *current.Artifact != *change.artifact) {
-			return Task{}, fmt.Errorf("%w: completion must publish the Task's exact frozen Artifact", ErrArtifactState)
-		}
-	}
-	var result sql.Result
-	if grant != nil {
-		if next.State.Terminal() {
-			result, err = tx.ExecContext(ctx, `
-				UPDATE agent_tasks
-				SET state = ?, revision = ?, message_count = ?, event_count = ?,
-				    updated_at = ?, lease_owner = ''
-				WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?
-				  AND lease_owner = ? AND lease_fence = ?`,
-				next.State, next.Revision, next.MessageCount, next.EventCount, unixNano(now),
-				ref.Workspace.Authority, ref.Workspace.ID, ref.ID, meta.ExpectedRevision,
-				grant.Worker, grant.Fence,
-			)
-		} else {
-			result, err = tx.ExecContext(ctx, `
-				UPDATE agent_tasks
-				SET state = ?, revision = ?, message_count = ?, event_count = ?, updated_at = ?
-				WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?
-				  AND lease_owner = ? AND lease_fence = ?`,
-				next.State, next.Revision, next.MessageCount, next.EventCount, unixNano(now),
-				ref.Workspace.Authority, ref.Workspace.ID, ref.ID, meta.ExpectedRevision,
-				grant.Worker, grant.Fence,
-			)
-		}
-	} else if next.State.Terminal() {
-		result, err = tx.ExecContext(ctx, `
-			UPDATE agent_tasks
-			SET state = ?, revision = ?, message_count = ?, event_count = ?,
-			    updated_at = ?, lease_owner = ''
-			WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?`,
-			next.State, next.Revision, next.MessageCount, next.EventCount, unixNano(now),
-			ref.Workspace.Authority, ref.Workspace.ID, ref.ID, meta.ExpectedRevision,
-		)
-	} else {
-		result, err = tx.ExecContext(ctx, `
-			UPDATE agent_tasks
-			SET state = ?, revision = ?, message_count = ?, event_count = ?, updated_at = ?
-			WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND revision = ?`,
-			next.State, next.Revision, next.MessageCount, next.EventCount, unixNano(now),
-			ref.Workspace.Authority, ref.Workspace.ID, ref.ID, meta.ExpectedRevision,
-		)
-	}
-	if err != nil {
-		return Task{}, fmt.Errorf("update Agent task for %s: %w", kind, err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return Task{}, fmt.Errorf("inspect Agent task update for %s: %w", kind, err)
-	}
-	if affected != 1 {
-		if grant != nil {
-			if leaseErr := requireCurrentLease(ctx, tx, *grant); leaseErr != nil {
-				return Task{}, leaseErr
-			}
-		}
-		latest, loadErr := loadTask(ctx, tx, ref)
-		if loadErr != nil {
-			return Task{}, loadErr
-		}
-		return Task{}, &RevisionConflictError{Expected: meta.ExpectedRevision, Actual: latest.Revision}
-	}
-	if change.message != nil {
-		if err := insertMessage(ctx, tx, message); err != nil {
-			return Task{}, err
-		}
-	}
-	if change.discardArtifact && current.Artifact != nil {
-		result, err := tx.ExecContext(ctx, `
-			UPDATE agent_artifacts
-			SET state = ?, discarded_at = ?
-			WHERE authority_id = ? AND workspace_id = ? AND artifact_id = ?
-			  AND task_id = ? AND state = ?`,
-			ArtifactDiscarded, unixNano(now), ref.Workspace.Authority, ref.Workspace.ID,
-			current.Artifact.ID, ref.ID, ArtifactFrozen,
-		)
-		if err != nil {
-			return Task{}, fmt.Errorf("discard Agent Artifact: %w", err)
-		}
-		affected, err := result.RowsAffected()
-		if err != nil || affected != 1 {
-			return Task{}, fmt.Errorf("%w: Task Artifact is not frozen", ErrArtifactState)
-		}
-	}
-	if change.artifact != nil {
-		result, err := tx.ExecContext(ctx, `
-			UPDATE agent_artifacts
-			SET state = ?, published_at = ?
-			WHERE authority_id = ? AND workspace_id = ? AND artifact_id = ?
-			  AND task_id = ? AND state = ?`,
-			ArtifactPublished, unixNano(now), ref.Workspace.Authority, ref.Workspace.ID,
-			change.artifact.ID, ref.ID, ArtifactFrozen,
-		)
-		if err != nil {
-			return Task{}, fmt.Errorf("publish Agent Artifact: %w", err)
-		}
-		affected, err := result.RowsAffected()
-		if err != nil || affected != 1 {
-			return Task{}, fmt.Errorf("%w: Task Artifact is not frozen", ErrArtifactState)
-		}
-	}
-	if change.submission != "" {
-		submission := Submission{
-			ID: change.submission, Task: ref, FinalMessage: message.ID,
-			Artifact: change.artifact, PublishedAt: now,
-		}
-		var artifactID any
-		if change.artifact != nil {
-			artifactID = change.artifact.ID
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO agent_submissions (
-			  authority_id, workspace_id, task_id, submission_id,
-			  final_message_id, artifact_id, published_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			ref.Workspace.Authority, ref.Workspace.ID, ref.ID,
-			submission.ID, submission.FinalMessage, artifactID, unixNano(now),
+	var result Task
+	err = store.Update(ctx, func(tx StoreTx) error {
+		if replay, found, err := replayTaskCommandFromStore(
+			tx, ref.Workspace.Authority, meta.ID, kind, digest,
 		); err != nil {
-			if uniqueConstraint(err) {
-				return Task{}, ErrSubmissionConflict
+			return err
+		} else if found {
+			if replay.Ref != ref {
+				return fmt.Errorf("%w: transition command result identity mismatch", ErrCorruptStore)
 			}
-			return Task{}, fmt.Errorf("publish Agent submission: %w", err)
+			if grant != nil {
+				if _, err := verifyLeaseGrantHistoryFromStore(tx, *grant); err != nil {
+					return err
+				}
+			}
+			result = replay
+			return nil
 		}
-		next.Submission = &submission
+
+		currentRecord, err := loadTaskRecordFromStore(tx, ref)
+		if err != nil {
+			return err
+		}
+		current := currentRecord.Task
+		if grant != nil {
+			if err := requireCurrentLeaseFromStore(tx, *grant); err != nil {
+				return err
+			}
+		}
+		if current.Revision != meta.ExpectedRevision {
+			return &RevisionConflictError{Expected: meta.ExpectedRevision, Actual: current.Revision}
+		}
+		if current.State.Terminal() {
+			return &TransitionError{Operation: kind, State: current.State, Terminal: true}
+		}
+		if !containsState(change.allowed, current.State) {
+			return &TransitionError{Operation: kind, State: current.State}
+		}
+		if current.Revision >= math.MaxInt64 || current.EventCount >= math.MaxInt64 ||
+			(change.message != nil && current.MessageCount >= math.MaxInt64) {
+			return fmt.Errorf("%w: task counters exhausted integer range", ErrRevisionConflict)
+		}
+
+		now := timestampAtLeast(agent.now(), current.UpdatedAt)
+		next := current
+		next.State = change.next
+		next.Revision++
+		next.EventCount++
+		next.UpdatedAt = now
+		var message Message
+		if change.message != nil {
+			next.MessageCount++
+			message = Message{
+				ID: change.message.ID, Task: ref, Sequence: next.MessageCount,
+				Author: change.author, Parts: cloneParts(change.message.Parts), CreatedAt: now,
+			}
+		}
+		if change.submission != "" {
+			if (current.Artifact == nil) != (change.artifact == nil) ||
+				(current.Artifact != nil && *current.Artifact != *change.artifact) {
+				return fmt.Errorf("%w: completion must publish the Task's exact frozen Artifact", ErrArtifactState)
+			}
+		}
+		var submission *Submission
+		if change.submission != "" {
+			submission = &Submission{
+				ID: change.submission, Task: ref, FinalMessage: message.ID,
+				Artifact: change.artifact, PublishedAt: now,
+			}
+			next.Submission = submission
+		}
+
+		nextRecord := currentRecord
+		nextRecord.Task = next
+		if next.State.Terminal() {
+			nextRecord.Lease.Owner = ""
+		}
+		if change.discardArtifact && current.Artifact != nil {
+			state := ArtifactDiscarded
+			nextRecord.ArtifactState = &state
+		}
+		if change.artifact != nil {
+			state := ArtifactPublished
+			nextRecord.ArtifactState = &state
+		}
+		condition := StoreTaskCondition{ExpectedRevision: meta.ExpectedRevision}
+		if grant != nil {
+			lease := StoreLeaseState{Owner: grant.Worker, Fence: grant.Fence}
+			condition.ExpectedLease = &lease
+		}
+		updated, err := tx.CompareAndSwapTask(StoreTaskMutation{
+			Ref: ref, Condition: condition, Next: nextRecord,
+		})
+		if err != nil {
+			return fmt.Errorf("update Agent task for %s: %w", kind, err)
+		}
+		if !updated {
+			if grant != nil {
+				if leaseErr := requireCurrentLeaseFromStore(tx, *grant); leaseErr != nil {
+					return leaseErr
+				}
+			}
+			latest, loadErr := loadTaskFromStore(tx, ref)
+			if loadErr != nil {
+				return loadErr
+			}
+			return &RevisionConflictError{Expected: meta.ExpectedRevision, Actual: latest.Revision}
+		}
+		if change.message != nil {
+			if err := insertMessageToStore(tx, message); err != nil {
+				return err
+			}
+		}
+		if change.discardArtifact && current.Artifact != nil {
+			discarded := now
+			changed, err := tx.CompareAndSwapArtifact(StoreArtifactMutation{
+				Ref: *current.Artifact, Task: ref,
+				ExpectedState: ArtifactFrozen, NextState: ArtifactDiscarded,
+				DiscardedAt: &discarded,
+			})
+			if err != nil {
+				return fmt.Errorf("discard Agent Artifact: %w", err)
+			}
+			if !changed {
+				return fmt.Errorf("%w: Task Artifact is not frozen", ErrArtifactState)
+			}
+		}
+		if change.artifact != nil {
+			published := now
+			changed, err := tx.CompareAndSwapArtifact(StoreArtifactMutation{
+				Ref: *change.artifact, Task: ref,
+				ExpectedState: ArtifactFrozen, NextState: ArtifactPublished,
+				PublishedAt: &published,
+			})
+			if err != nil {
+				return fmt.Errorf("publish Agent Artifact: %w", err)
+			}
+			if !changed {
+				return fmt.Errorf("%w: Task Artifact is not frozen", ErrArtifactState)
+			}
+		}
+		if change.submission != "" {
+			if err := tx.InsertSubmission(StoreSubmissionRecord{Submission: *submission}); err != nil {
+				if errors.Is(err, ErrStoreConflict) {
+					return ErrSubmissionConflict
+				}
+				return fmt.Errorf("publish Agent submission: %w", err)
+			}
+		}
+		event := Event{
+			Task: ref, Sequence: next.EventCount, Type: change.event,
+			State: next.State, Revision: next.Revision, OccurredAt: now,
+		}
+		if change.message != nil {
+			event.Message = message.ID
+		}
+		if change.submission != "" {
+			event.Submission = change.submission
+		}
+		if change.artifact != nil {
+			event.Artifact = change.artifact.ID
+		}
+		if err := insertEventToStore(tx, event); err != nil {
+			return err
+		}
+		if err := recordTaskCommandToStore(
+			tx, ref.Workspace.Authority, meta.ID, kind, digest, next, now,
+		); err != nil {
+			return err
+		}
+		result = cloneTask(next)
+		return nil
+	})
+	if err != nil {
+		return Task{}, fmt.Errorf("%s: %w", kind, err)
 	}
-	event := Event{
-		Task: ref, Sequence: next.EventCount, Type: change.event,
-		State: next.State, Revision: next.Revision, OccurredAt: now,
-	}
-	if change.message != nil {
-		event.Message = message.ID
-	}
-	if change.submission != "" {
-		event.Submission = change.submission
-	}
-	if change.artifact != nil {
-		event.Artifact = change.artifact.ID
-	}
-	if err := insertEvent(ctx, tx, event); err != nil {
-		return Task{}, err
-	}
-	if err := recordTaskCommand(ctx, tx, ref.Workspace.Authority, meta.ID, kind, digest, next, now); err != nil {
-		return Task{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Task{}, fmt.Errorf("commit %s: %w", kind, err)
-	}
-	return cloneTask(next), nil
+	return result, nil
 }
 
 func (agent *Agent) GetTask(ctx context.Context, ref TaskRef) (Task, error) {
@@ -616,12 +647,21 @@ func (agent *Agent) GetTask(ctx context.Context, ref TaskRef) (Task, error) {
 	if err := validateTaskRef(ref); err != nil {
 		return Task{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return Task{}, err
 	}
 	defer release()
-	return loadTask(ctx, database, ref)
+	var task Task
+	err = store.View(ctx, func(view StoreView) error {
+		var err error
+		task, err = loadTaskFromStore(view, ref)
+		return err
+	})
+	if err != nil {
+		return Task{}, err
+	}
+	return cloneTask(task), nil
 }
 
 func (agent *Agent) ListTasks(ctx context.Context, contextRef ContextRef, request TaskPageRequest) (TaskPage, error) {
@@ -635,71 +675,48 @@ func (agent *Agent) ListTasks(ctx context.Context, contextRef ContextRef, reques
 	if err != nil {
 		return TaskPage{}, err
 	}
-	database, release, err := agent.acquire()
+	if request.After != nil {
+		if err := validateTaskCursor(*request.After); err != nil {
+			return TaskPage{}, err
+		}
+	}
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return TaskPage{}, err
 	}
 	defer release()
-	const selectTasks = `
-		SELECT t.workspace_id, t.task_id, t.context_id, t.state, t.revision,
-		       t.message_count, t.event_count, t.created_at, t.updated_at,
-		       a.artifact_id, a.state,
-		       s.submission_id, s.final_message_id, s.artifact_id, s.published_at
-		FROM agent_tasks AS t
-		LEFT JOIN agent_artifacts AS a
-		  ON a.authority_id = t.authority_id
-		 AND a.workspace_id = t.workspace_id
-		 AND a.task_id = t.task_id
-		LEFT JOIN agent_submissions AS s
-		  ON s.authority_id = t.authority_id
-		 AND s.workspace_id = t.workspace_id
-		 AND s.task_id = t.task_id
-		WHERE t.authority_id = ? AND t.context_id = ?`
-	var rows *sql.Rows
-	if request.After == nil {
-		rows, err = database.QueryContext(ctx, selectTasks+`
-			ORDER BY t.created_at, t.workspace_id, t.task_id
-			LIMIT ?`, contextRef.Authority, contextRef.ID, limit+1)
-	} else {
-		if err := validateTaskCursor(*request.After); err != nil {
-			return TaskPage{}, err
-		}
-		created := unixNano(request.After.CreatedAt.UTC())
-		rows, err = database.QueryContext(ctx, selectTasks+`
-			AND (t.created_at > ? OR
-			     (t.created_at = ? AND
-			       (t.workspace_id > ? OR
-			        (t.workspace_id = ? AND t.task_id > ?))))
-			ORDER BY t.created_at, t.workspace_id, t.task_id
-			LIMIT ?`, contextRef.Authority, contextRef.ID,
-			created, created, request.After.Workspace, request.After.Workspace,
-			request.After.Task, limit+1)
-	}
-	if err != nil {
-		return TaskPage{}, fmt.Errorf("list Agent tasks: %w", err)
-	}
-	defer rows.Close()
-	tasks := make([]Task, 0, limit+1)
-	for rows.Next() {
-		task, err := scanTask(rows, contextRef.Authority, true)
+	page := TaskPage{}
+	err = store.View(ctx, func(view StoreView) error {
+		records, err := view.ScanContextTasks(StoreTaskContextScan{
+			Context: contextRef, After: request.After, Limit: limit + 1,
+		})
 		if err != nil {
-			return TaskPage{}, err
+			return fmt.Errorf("list Agent tasks: %w", err)
 		}
-		tasks = append(tasks, task)
-	}
-	if err := rows.Err(); err != nil {
-		return TaskPage{}, fmt.Errorf("list Agent tasks: %w", err)
-	}
-	page := TaskPage{Items: tasks}
-	if len(page.Items) > limit {
-		page.HasMore = true
-		page.Items = page.Items[:limit]
-	}
-	if page.HasMore && len(page.Items) > 0 {
-		last := page.Items[len(page.Items)-1]
-		page.Next = &TaskPageCursor{
-			CreatedAt: last.CreatedAt, Workspace: last.Ref.Workspace.ID, Task: last.Ref.ID,
+		page.Items = make([]Task, 0, min(len(records), limit))
+		if len(records) > limit {
+			page.HasMore = true
+			records = records[:limit]
 		}
+		for _, record := range records {
+			if err := validateStoreTaskRecord(record); err != nil ||
+				record.Task.Context != contextRef {
+				return fmt.Errorf("%w: invalid Agent Task in context scan", ErrCorruptStore)
+			}
+			page.Items = append(page.Items, cloneTask(record.Task))
+		}
+		if page.HasMore && len(page.Items) > 0 {
+			last := page.Items[len(page.Items)-1]
+			page.Next = &TaskPageCursor{
+				CreatedAt: last.CreatedAt,
+				Workspace: last.Ref.Workspace.ID,
+				Task:      last.Ref.ID,
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return TaskPage{}, err
 	}
 	return page, nil
 }
@@ -715,84 +732,64 @@ func (agent *Agent) ListMessages(ctx context.Context, ref TaskRef, request PageR
 	if err != nil {
 		return MessagePage{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return MessagePage{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return MessagePage{}, fmt.Errorf("begin Agent message page: %w", err)
-	}
-	defer tx.Rollback()
-	task, err := loadTask(ctx, tx, ref)
+	page := MessagePage{}
+	err = store.View(ctx, func(view StoreView) error {
+		task, err := loadTaskFromStore(view, ref)
+		if err != nil {
+			return err
+		}
+		if request.After > task.MessageCount {
+			return fmt.Errorf("%w: message cursor exceeds Task history", ErrInvalidArgument)
+		}
+		records, err := view.ScanMessages(StoreMessageScan{
+			Task: ref, After: request.After, Limit: limit + 1,
+			ReadLimit: StoreReadLimit{MaxBytes: maxPageBytes},
+		})
+		if errors.Is(err, ErrStoreRecordTooLarge) {
+			return fmt.Errorf("%w: Agent message page exceeds storage read budget", ErrCorruptStore)
+		}
+		if err != nil {
+			return fmt.Errorf("list Agent messages: %w", err)
+		}
+		page.Items = make([]Message, 0, min(len(records), limit))
+		expected := request.After + 1
+		for index, record := range records {
+			if index == limit {
+				page.HasMore = true
+				break
+			}
+			if record.Task != ref || record.Sequence != expected {
+				return fmt.Errorf("%w: Agent message history has a sequence gap", ErrCorruptStore)
+			}
+			message, err := messageFromStoreRecord(record)
+			if err != nil {
+				return err
+			}
+			page.Items = append(page.Items, message)
+			expected++
+		}
+		page.Next = request.After
+		if len(page.Items) > 0 {
+			page.Next = page.Items[len(page.Items)-1].Sequence
+		}
+		if page.Next > task.MessageCount {
+			return fmt.Errorf("%w: Agent message history exceeds Task count", ErrCorruptStore)
+		}
+		if page.Next < task.MessageCount {
+			if len(page.Items) == 0 {
+				return fmt.Errorf("%w: Agent message history does not match Task count", ErrCorruptStore)
+			}
+			page.HasMore = true
+		}
+		return nil
+	})
 	if err != nil {
 		return MessagePage{}, err
-	}
-	if request.After > task.MessageCount {
-		return MessagePage{}, fmt.Errorf("%w: message cursor exceeds Task history", ErrInvalidArgument)
-	}
-	rows, err := tx.QueryContext(ctx, `
-		SELECT message_id, sequence, author,
-		       CASE WHEN length(parts) <= ? THEN parts ELSE NULL END,
-		       digest, created_at
-		FROM agent_messages
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND sequence > ?
-		ORDER BY sequence
-		LIMIT ?`, maxPageBytes, ref.Workspace.Authority, ref.Workspace.ID, ref.ID, request.After, limit+1)
-	if err != nil {
-		return MessagePage{}, fmt.Errorf("list Agent messages: %w", err)
-	}
-	defer rows.Close()
-	page := MessagePage{Items: make([]Message, 0, limit)}
-	encodedBytes := 0
-	expected := request.After + 1
-	for rows.Next() {
-		var message Message
-		var parts []byte
-		var digest string
-		var created int64
-		message.Task = ref
-		if err := rows.Scan(&message.ID, &message.Sequence, &message.Author, &parts, &digest, &created); err != nil {
-			return MessagePage{}, fmt.Errorf("scan Agent message: %w", err)
-		}
-		if message.Sequence != expected {
-			return MessagePage{}, fmt.Errorf("%w: Agent message history has a sequence gap", ErrCorruptStore)
-		}
-		if len(page.Items) == limit || (len(page.Items) > 0 && encodedBytes+len(parts) > maxPageBytes) {
-			page.HasMore = true
-			break
-		}
-		if err := json.Unmarshal(parts, &message.Parts); err != nil {
-			return MessagePage{}, fmt.Errorf("%w: decode Agent message %q: %v", ErrCorruptStore, message.ID, err)
-		}
-		actual, err := contentDigest(message.Parts)
-		if err != nil || actual != digest {
-			return MessagePage{}, fmt.Errorf("%w: Agent message %q content digest mismatch", ErrCorruptStore, message.ID)
-		}
-		message.CreatedAt = fromUnixNano(created)
-		if err := validateStoredMessage(message); err != nil {
-			return MessagePage{}, err
-		}
-		encodedBytes += len(parts)
-		page.Items = append(page.Items, cloneMessage(message))
-		expected++
-	}
-	if err := rows.Err(); err != nil {
-		return MessagePage{}, fmt.Errorf("list Agent messages: %w", err)
-	}
-	page.Next = request.After
-	if len(page.Items) > 0 {
-		page.Next = page.Items[len(page.Items)-1].Sequence
-	}
-	if !page.HasMore && page.Next != task.MessageCount {
-		return MessagePage{}, fmt.Errorf("%w: Agent message history does not match Task count", ErrCorruptStore)
-	}
-	if err := rows.Close(); err != nil {
-		return MessagePage{}, fmt.Errorf("close Agent message page: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return MessagePage{}, fmt.Errorf("commit Agent message page: %w", err)
 	}
 	return page, nil
 }
@@ -808,74 +805,54 @@ func (agent *Agent) ReadEvents(ctx context.Context, ref TaskRef, request PageReq
 	if err != nil {
 		return EventPage{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return EventPage{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return EventPage{}, fmt.Errorf("begin Agent event page: %w", err)
-	}
-	defer tx.Rollback()
-	task, err := loadTask(ctx, tx, ref)
+	page := EventPage{}
+	err = store.View(ctx, func(view StoreView) error {
+		task, err := loadTaskFromStore(view, ref)
+		if err != nil {
+			return err
+		}
+		if request.After > task.EventCount {
+			return fmt.Errorf("%w: event cursor exceeds Task history", ErrInvalidArgument)
+		}
+		records, err := view.ScanEvents(StoreEventScan{
+			Task: ref, After: request.After, Limit: limit + 1,
+		})
+		if err != nil {
+			return fmt.Errorf("read Agent events: %w", err)
+		}
+		page.Items = make([]Event, 0, min(len(records), limit))
+		expected := request.After + 1
+		for index, record := range records {
+			if index == limit {
+				page.HasMore = true
+				break
+			}
+			event := record.Event
+			if event.Task != ref || event.Sequence != expected {
+				return fmt.Errorf("%w: Agent event history has a sequence gap", ErrCorruptStore)
+			}
+			if err := validateStoredEvent(event); err != nil {
+				return err
+			}
+			page.Items = append(page.Items, event)
+			expected++
+		}
+		page.Next = request.After
+		if len(page.Items) > 0 {
+			page.Next = page.Items[len(page.Items)-1].Sequence
+		}
+		if !page.HasMore && page.Next != task.EventCount {
+			return fmt.Errorf("%w: Agent event history does not match Task count", ErrCorruptStore)
+		}
+		return nil
+	})
 	if err != nil {
 		return EventPage{}, err
-	}
-	if request.After > task.EventCount {
-		return EventPage{}, fmt.Errorf("%w: event cursor exceeds Task history", ErrInvalidArgument)
-	}
-	rows, err := tx.QueryContext(ctx, `
-		SELECT sequence, kind, state, revision, message_id, submission_id, artifact_id, created_at
-		FROM agent_events
-		WHERE authority_id = ? AND workspace_id = ? AND task_id = ? AND sequence > ?
-		ORDER BY sequence
-		LIMIT ?`, ref.Workspace.Authority, ref.Workspace.ID, ref.ID, request.After, limit+1)
-	if err != nil {
-		return EventPage{}, fmt.Errorf("read Agent events: %w", err)
-	}
-	defer rows.Close()
-	page := EventPage{Items: make([]Event, 0, limit)}
-	expected := request.After + 1
-	for rows.Next() {
-		var event Event
-		var occurred int64
-		event.Task = ref
-		if err := rows.Scan(
-			&event.Sequence, &event.Type, &event.State, &event.Revision,
-			&event.Message, &event.Submission, &event.Artifact, &occurred,
-		); err != nil {
-			return EventPage{}, fmt.Errorf("scan Agent event: %w", err)
-		}
-		if event.Sequence != expected {
-			return EventPage{}, fmt.Errorf("%w: Agent event history has a sequence gap", ErrCorruptStore)
-		}
-		if len(page.Items) == limit {
-			page.HasMore = true
-			break
-		}
-		event.OccurredAt = fromUnixNano(occurred)
-		if err := validateStoredEvent(event); err != nil {
-			return EventPage{}, err
-		}
-		page.Items = append(page.Items, event)
-		expected++
-	}
-	if err := rows.Err(); err != nil {
-		return EventPage{}, fmt.Errorf("read Agent events: %w", err)
-	}
-	page.Next = request.After
-	if len(page.Items) > 0 {
-		page.Next = page.Items[len(page.Items)-1].Sequence
-	}
-	if !page.HasMore && page.Next != task.EventCount {
-		return EventPage{}, fmt.Errorf("%w: Agent event history does not match Task count", ErrCorruptStore)
-	}
-	if err := rows.Close(); err != nil {
-		return EventPage{}, fmt.Errorf("close Agent event page: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return EventPage{}, fmt.Errorf("commit Agent event page: %w", err)
 	}
 	return page, nil
 }

@@ -2,11 +2,8 @@ package agent
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -23,45 +20,36 @@ func (agent *Agent) GetMessage(ctx context.Context, authority AuthorityID, id Me
 	if err := validateStable("message id", string(id)); err != nil {
 		return Message{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return Message{}, err
 	}
 	defer release()
 	var message Message
-	var parts []byte
-	var digest string
-	var created int64
-	message.ID = id
-	message.Task.Workspace.Authority = authority
-	err = database.QueryRowContext(ctx, `
-		SELECT workspace_id, task_id, sequence, author,
-		       CASE WHEN length(parts) <= ? THEN parts ELSE NULL END,
-		       digest, created_at
-		FROM agent_messages
-		WHERE authority_id = ? AND message_id = ?`, maxPageBytes, authority, id,
-	).Scan(
-		&message.Task.Workspace.ID, &message.Task.ID, &message.Sequence,
-		&message.Author, &parts, &digest, &created,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Message{}, ErrNotFound
-	}
+	err = store.View(ctx, func(view StoreView) error {
+		record, err := view.LoadMessage(
+			StoreMessageKey{Authority: authority, ID: id},
+			StoreReadLimit{MaxBytes: maxPageBytes},
+		)
+		if errors.Is(err, ErrStoreRecordNotFound) {
+			return ErrNotFound
+		}
+		if errors.Is(err, ErrStoreRecordTooLarge) {
+			return fmt.Errorf("%w: Agent message exceeds storage read budget", ErrCorruptStore)
+		}
+		if err != nil {
+			return fmt.Errorf("get Agent message: %w", err)
+		}
+		if record.ID != id || record.Task.Workspace.Authority != authority {
+			return fmt.Errorf("%w: Store returned a different Agent message identity", ErrCorruptStore)
+		}
+		if len(record.EncodedParts) == 0 || len(record.EncodedParts) > maxPageBytes {
+			return fmt.Errorf("%w: Agent message exceeds storage read budget", ErrCorruptStore)
+		}
+		message, err = messageFromStoreRecord(record)
+		return err
+	})
 	if err != nil {
-		return Message{}, fmt.Errorf("get Agent message: %w", err)
-	}
-	if parts == nil {
-		return Message{}, fmt.Errorf("%w: Agent message exceeds storage read budget", ErrCorruptStore)
-	}
-	if err := json.Unmarshal(parts, &message.Parts); err != nil {
-		return Message{}, fmt.Errorf("%w: decode Agent message %q: %v", ErrCorruptStore, id, err)
-	}
-	actual, err := contentDigest(message.Parts)
-	if err != nil || actual != digest {
-		return Message{}, fmt.Errorf("%w: Agent message %q content digest mismatch", ErrCorruptStore, id)
-	}
-	message.CreatedAt = fromUnixNano(created)
-	if err := validateStoredMessage(message); err != nil {
 		return Message{}, err
 	}
 	return cloneMessage(message), nil
@@ -81,31 +69,35 @@ func (agent *Agent) ResolveTask(ctx context.Context, authority AuthorityID, id T
 	if err := validateStable("task id", string(id)); err != nil {
 		return TaskRef{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return TaskRef{}, err
 	}
 	defer release()
-	var workspace WorkspaceID
-	err = database.QueryRowContext(ctx, `
-		SELECT workspace_id
-		FROM agent_tasks
-		WHERE authority_id = ? AND task_id = ?`, authority, id,
-	).Scan(&workspace)
-	if errors.Is(err, sql.ErrNoRows) {
-		return TaskRef{}, ErrNotFound
-	}
+	var ref TaskRef
+	err = store.View(ctx, func(view StoreView) error {
+		ref, err = view.ResolveTask(authority, id)
+		if errors.Is(err, ErrStoreRecordNotFound) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("resolve Agent task: %w", err)
+		}
+		if ref.Workspace.Authority != authority || ref.ID != id {
+			return fmt.Errorf("%w: Store returned a different resolved Task identity", ErrCorruptStore)
+		}
+		if err := validateTaskRef(ref); err != nil {
+			return fmt.Errorf("%w: resolved invalid task key: %v", ErrCorruptStore, err)
+		}
+		return nil
+	})
 	if err != nil {
-		return TaskRef{}, fmt.Errorf("resolve Agent task: %w", err)
-	}
-	ref := TaskRef{Workspace: WorkspaceRef{Authority: authority, ID: workspace}, ID: id}
-	if err := validateTaskRef(ref); err != nil {
-		return TaskRef{}, fmt.Errorf("%w: resolved invalid task key: %v", ErrCorruptStore, err)
+		return TaskRef{}, err
 	}
 	return ref, nil
 }
 
-// SnapshotTask returns a Task and the exact event cursor from one SQLite read
+// SnapshotTask returns a Task and the exact event cursor from one Store read
 // snapshot. A subscriber can emit this snapshot, then call ReadEvents with the
 // returned cursor without a snapshot-to-stream gap.
 func (agent *Agent) SnapshotTask(ctx context.Context, ref TaskRef) (TaskSnapshot, error) {
@@ -115,23 +107,22 @@ func (agent *Agent) SnapshotTask(ctx context.Context, ref TaskRef) (TaskSnapshot
 	if err := validateTaskRef(ref); err != nil {
 		return TaskSnapshot{}, err
 	}
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return TaskSnapshot{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return TaskSnapshot{}, fmt.Errorf("begin Agent task snapshot: %w", err)
-	}
-	defer tx.Rollback()
-	task, err := loadTask(ctx, tx, ref)
+	var snapshot TaskSnapshot
+	err = store.View(ctx, func(view StoreView) error {
+		task, err := loadTaskFromStore(view, ref)
+		if err != nil {
+			return err
+		}
+		snapshot = TaskSnapshot{Task: task, EventCursor: task.EventCount}
+		return nil
+	})
 	if err != nil {
 		return TaskSnapshot{}, err
-	}
-	snapshot := TaskSnapshot{Task: task, EventCursor: task.EventCount}
-	if err := tx.Commit(); err != nil {
-		return TaskSnapshot{}, fmt.Errorf("commit Agent task snapshot: %w", err)
 	}
 	return snapshot, nil
 }
@@ -169,106 +160,103 @@ func (agent *Agent) ListAuthorityTasks(ctx context.Context, authority AuthorityI
 		}
 	}
 
-	database, release, err := agent.acquire()
+	store, release, err := agent.acquireStore()
 	if err != nil {
 		return TaskQueryPage{}, err
 	}
 	defer release()
-	tx, err := database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return TaskQueryPage{}, fmt.Errorf("begin Agent task query: %w", err)
-	}
-	defer tx.Rollback()
-
-	filters := []string{"t.authority_id = ?"}
-	filterArgs := []any{authority}
-	if request.Context != "" {
-		filters = append(filters, "t.context_id = ?")
-		filterArgs = append(filterArgs, request.Context)
-	}
-	if request.State != "" {
-		filters = append(filters, "t.state = ?")
-		filterArgs = append(filterArgs, request.State)
-	}
-	if request.UpdatedAtOrAfter != nil {
-		filters = append(filters, "t.updated_at >= ?")
-		filterArgs = append(filterArgs, unixNano(request.UpdatedAtOrAfter.UTC()))
-	}
-	where := strings.Join(filters, " AND ")
-	var total int64
-	if err := tx.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM agent_tasks AS t WHERE "+where,
-		filterArgs...,
-	).Scan(&total); err != nil {
-		return TaskQueryPage{}, fmt.Errorf("count Agent tasks: %w", err)
-	}
-	if total < 0 {
-		return TaskQueryPage{}, fmt.Errorf("%w: negative Agent task count", ErrCorruptStore)
-	}
-
-	pageWhere := where
-	pageArgs := append([]any(nil), filterArgs...)
-	if request.After != nil {
-		updated := unixNano(request.After.UpdatedAt.UTC())
-		pageWhere += ` AND (t.updated_at < ? OR
-			(t.updated_at = ? AND
-			 (t.workspace_id > ? OR
-			  (t.workspace_id = ? AND t.task_id > ?))))`
-		pageArgs = append(pageArgs, updated, updated, request.After.Workspace, request.After.Workspace, request.After.Task)
-	}
-	pageArgs = append(pageArgs, limit+1)
-	rows, err := tx.QueryContext(ctx, `
-		SELECT t.workspace_id, t.task_id, t.context_id, t.state, t.revision,
-		       t.message_count, t.event_count, t.created_at, t.updated_at,
-		       a.artifact_id, a.state,
-		       s.submission_id, s.final_message_id, s.artifact_id, s.published_at
-		FROM agent_tasks AS t
-		LEFT JOIN agent_artifacts AS a
-		  ON a.authority_id = t.authority_id
-		 AND a.workspace_id = t.workspace_id
-		 AND a.task_id = t.task_id
-		LEFT JOIN agent_submissions AS s
-		  ON s.authority_id = t.authority_id
-		 AND s.workspace_id = t.workspace_id
-		 AND s.task_id = t.task_id
-		WHERE `+pageWhere+`
-		ORDER BY t.updated_at DESC, t.workspace_id, t.task_id
-		LIMIT ?`, pageArgs...)
-	if err != nil {
-		return TaskQueryPage{}, fmt.Errorf("list authority Agent tasks: %w", err)
-	}
-	defer rows.Close()
-	items := make([]Task, 0, limit+1)
-	for rows.Next() {
-		task, err := scanTask(rows, authority, true)
+	var page TaskQueryPage
+	err = store.View(ctx, func(view StoreView) error {
+		result, err := view.ScanAuthorityTasks(StoreTaskAuthorityScan{
+			Authority:        authority,
+			Context:          request.Context,
+			State:            request.State,
+			UpdatedAtOrAfter: request.UpdatedAtOrAfter,
+			After:            request.After,
+			Limit:            limit + 1,
+		})
 		if err != nil {
-			return TaskQueryPage{}, err
+			return fmt.Errorf("list authority Agent tasks: %w", err)
 		}
-		items = append(items, cloneTask(task))
-	}
-	if err := rows.Err(); err != nil {
-		return TaskQueryPage{}, fmt.Errorf("list authority Agent tasks: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return TaskQueryPage{}, fmt.Errorf("close authority Agent task page: %w", err)
-	}
-	page := TaskQueryPage{Items: items, TotalSize: uint64(total)}
-	if len(page.Items) > limit {
-		page.HasMore = true
-		page.Items = page.Items[:limit]
-	}
-	if page.HasMore && len(page.Items) > 0 {
-		last := page.Items[len(page.Items)-1]
-		page.Next = &TaskQueryCursor{
-			UpdatedAt: last.UpdatedAt,
-			Workspace: last.Ref.Workspace.ID,
-			Task:      last.Ref.ID,
+		if len(result.Records) > limit+1 || result.TotalSize < uint64(len(result.Records)) {
+			return fmt.Errorf("%w: invalid Agent task query cardinality", ErrCorruptStore)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return TaskQueryPage{}, fmt.Errorf("commit Agent task query: %w", err)
+		page = TaskQueryPage{
+			Items:     make([]Task, 0, min(len(result.Records), limit)),
+			TotalSize: result.TotalSize,
+		}
+		var previous *Task
+		for index, record := range result.Records {
+			if err := validateStoreTaskRecord(record); err != nil {
+				return err
+			}
+			task := record.Task
+			if err := validateAuthorityTaskQueryRecord(task, authority, request, previous); err != nil {
+				return err
+			}
+			previous = &task
+			if index == limit {
+				page.HasMore = true
+				break
+			}
+			page.Items = append(page.Items, cloneTask(task))
+		}
+		if page.HasMore && len(page.Items) > 0 {
+			last := page.Items[len(page.Items)-1]
+			page.Next = &TaskQueryCursor{
+				UpdatedAt: last.UpdatedAt,
+				Workspace: last.Ref.Workspace.ID,
+				Task:      last.Ref.ID,
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return TaskQueryPage{}, err
 	}
 	return page, nil
+}
+
+func validateAuthorityTaskQueryRecord(
+	task Task,
+	authority AuthorityID,
+	request TaskQuery,
+	previous *Task,
+) error {
+	if task.Ref.Workspace.Authority != authority ||
+		(request.Context != "" && task.Context.ID != request.Context) ||
+		(request.State != "" && task.State != request.State) ||
+		(request.UpdatedAtOrAfter != nil && task.UpdatedAt.Before(request.UpdatedAtOrAfter.UTC())) ||
+		(request.After != nil && !taskFollowsAuthorityCursor(task, *request.After)) {
+		return fmt.Errorf("%w: Agent Store returned a Task outside the query", ErrCorruptStore)
+	}
+	if previous != nil && !authorityTaskPrecedes(*previous, task) {
+		return fmt.Errorf("%w: Agent Store returned Tasks out of order", ErrCorruptStore)
+	}
+	return nil
+}
+
+func taskFollowsAuthorityCursor(task Task, cursor TaskQueryCursor) bool {
+	if task.UpdatedAt.Before(cursor.UpdatedAt) {
+		return true
+	}
+	if !task.UpdatedAt.Equal(cursor.UpdatedAt) {
+		return false
+	}
+	if task.Ref.Workspace.ID != cursor.Workspace {
+		return task.Ref.Workspace.ID > cursor.Workspace
+	}
+	return task.Ref.ID > cursor.Task
+}
+
+func authorityTaskPrecedes(first, second Task) bool {
+	if !first.UpdatedAt.Equal(second.UpdatedAt) {
+		return first.UpdatedAt.After(second.UpdatedAt)
+	}
+	if first.Ref.Workspace.ID != second.Ref.Workspace.ID {
+		return first.Ref.Workspace.ID < second.Ref.Workspace.ID
+	}
+	return first.Ref.ID < second.Ref.ID
 }
 
 func validateTaskQueryCursor(cursor TaskQueryCursor) error {

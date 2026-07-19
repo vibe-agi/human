@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 
@@ -51,12 +52,35 @@ type ResolveWorkspaceFunc func(context.Context, Principal, *sdka2a.SendMessageRe
 // operation.
 type AuthorizeApplyReceiptFunc func(context.Context, Principal, agent.Task, *RecordApplyReceiptRequest) error
 
+// Service is the transport-facing HumanAgent domain surface used by this A2A
+// adapter. It intentionally contains no lifecycle or transport methods:
+// NewHandler borrows the service, and another caller protocol can consume the
+// same domain instance concurrently. Implementations must preserve the Agent
+// package's idempotency, revision, event-cursor, Artifact, and receipt
+// contracts; the official *agent.Agent is the reference implementation.
+type Service interface {
+	CreateTask(context.Context, agent.CreateTaskCommand) (agent.Task, error)
+	ReplyTask(context.Context, agent.MessageCommand) (agent.Task, error)
+	CancelTask(context.Context, agent.TaskCommand) (agent.Task, error)
+	ResolveTask(context.Context, agent.AuthorityID, agent.TaskID) (agent.TaskRef, error)
+	GetTask(context.Context, agent.TaskRef) (agent.Task, error)
+	GetMessage(context.Context, agent.AuthorityID, agent.MessageID) (agent.Message, error)
+	SnapshotTask(context.Context, agent.TaskRef) (agent.TaskSnapshot, error)
+	ListAuthorityTasks(context.Context, agent.AuthorityID, agent.TaskQuery) (agent.TaskQueryPage, error)
+	ListMessages(context.Context, agent.TaskRef, agent.PageRequest) (agent.MessagePage, error)
+	ReadEvents(context.Context, agent.TaskRef, agent.PageRequest) (agent.EventPage, error)
+	GetArtifact(context.Context, agent.ArtifactRef) (agent.ArtifactContent, error)
+	RecordApplyReceipt(context.Context, agent.RecordApplyReceiptCommand) (agent.ApplyReceipt, error)
+}
+
+var _ Service = (*agent.Agent)(nil)
+
 // Config composes the official A2A HTTP+JSON transport over an existing
 // durable Agent. NewHandler does not take ownership of Agent and does not close
 // it.
 type Config struct {
 	// Agent is the durable domain instance served by this handler.
-	Agent *agent.Agent
+	Agent Service
 	// Card is snapshotted at construction and served at the standard well-known
 	// path. Its interfaces, security, extensions, skills, and MIME modes must
 	// describe the mounted handler and its workers truthfully.
@@ -130,7 +154,7 @@ func newHTTPHandler(config handlerConfig, requestHandler a2asrv.RequestHandler) 
 }
 
 func checkConfig(config Config) (handlerConfig, error) {
-	if config.Agent == nil {
+	if nilService(config.Agent) {
 		return handlerConfig{}, errors.New("a2a: Agent is required")
 	}
 	if config.Card == nil {
@@ -192,6 +216,19 @@ func checkConfig(config Config) (handlerConfig, error) {
 		requiredExtensionURIs: required,
 		supportedExtensions:   supported,
 	}, nil
+}
+
+func nilService(service Service) bool {
+	if service == nil {
+		return true
+	}
+	value := reflect.ValueOf(service)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func cloneAndValidateCard(source *sdka2a.AgentCard) (*sdka2a.AgentCard, error) {

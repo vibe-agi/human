@@ -6,8 +6,9 @@ import (
 	"github.com/vibe-agi/human/agent"
 )
 
-// AgentConfig configures the durable, task-oriented HumanAgent surface.
-// DatabasePath is intentionally explicit; NewAgent never creates hidden
+// AgentConfig configures the durable, task-oriented HumanAgent surface. Supply
+// exactly one of DatabasePath (the official SQLite adapter) or Store (a
+// borrowed/owned custom agent.Store resource). NewAgent never creates hidden
 // process-global state.
 type AgentConfig = agent.Config
 
@@ -17,15 +18,15 @@ type AgentConfig = agent.Config
 type Agent = agent.Agent
 
 // DefaultAgentConfig returns the durable Agent defaults without selecting a
-// database identity. Set DatabasePath before calling NewAgent.
+// persistence identity. Set DatabasePath or Store before calling NewAgent.
 func DefaultAgentConfig() AgentConfig {
 	return agent.DefaultConfig()
 }
 
 // NewAgent opens or recovers the task-oriented HumanAgent surface. ctx controls
-// only this open operation; after NewAgent returns, method contexts and Close
-// own the Agent lifetime. HumanAgent shares message and workspace concepts with
-// HumanLLM, but not completion request, stream, or timeout lifecycle state.
+// only this open operation; after NewAgent returns, method contexts and
+// Shutdown own the Agent lifetime. HumanAgent shares message and workspace
+// concepts with HumanLLM, but not completion request, stream, or timeout state.
 func NewAgent(ctx context.Context, config AgentConfig) (*Agent, error) {
 	return agent.Open(ctx, config)
 }

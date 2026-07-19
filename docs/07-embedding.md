@@ -1,6 +1,6 @@
 # Go 库嵌入
 
-Human 的进程形态不是封闭产品边界。`human local`、`human gateway`、`human worker` 是 HumanLLM 的官方 CLI 装配；库同时提供 `human.NewLLM()` 与 `human.NewAgent()` 两个根 facade，宿主可以保留自己的 listener、身份系统、路由、终端布局与进程生命周期。
+Human 的进程形态不是封闭产品边界。`human local`、`human gateway`、`human worker` 是 HumanLLM 的官方 CLI 装配；库同时提供 `human.NewLLM()` 与 `human.NewAgent()` 两个根 facade，宿主可以保留自己的 listener、身份系统、路由、终端布局与进程生命周期。长期公共边界是“正确性内核 + 可替换 ports + 官方 adapters”，完整原子性、资源所有权、Protector 与 conformance 要求见 [10 · Human Framework 扩展合同](10-framework-contract.md)。
 
 ## 根 facade 与可组合 package
 

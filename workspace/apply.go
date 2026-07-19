@@ -118,11 +118,13 @@ type ApplyResult struct {
 	Replay bool        `json:"replay"`
 }
 
-// ApplyJournal is the embeddable caller-side durability boundary.
+// ApplyJournal is the borrowed, embeddable caller-side durability boundary.
+// Lifecycle is deliberately not part of this business port: a Human
+// composition releases an explicitly owned journal through framework.Resource,
+// while an injected journal remains caller-owned.
 type ApplyJournal interface {
 	Apply(context.Context, ApplyIntent, CASApplier) (ApplyResult, error)
 	Lookup(context.Context, ApplyIdentity) (ApplyRecord, error)
-	Close() error
 }
 
 // DigestPayload returns the canonical digest used by ApplyIntent. It hashes the

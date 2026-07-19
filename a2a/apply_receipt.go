@@ -48,7 +48,7 @@ type RecordApplyReceiptResponse struct {
 }
 
 type applyReceiptHandler struct {
-	agent     *agent.Agent
+	agent     Service
 	authorize AuthorizeApplyReceiptFunc
 	fallback  http.Handler
 }
