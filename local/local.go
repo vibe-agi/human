@@ -10,6 +10,7 @@ package local
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -23,10 +24,15 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/gateway"
 	"github.com/vibe-agi/human/internal/sqlitefile"
 	"github.com/vibe-agi/human/internal/userdata"
+	"github.com/vibe-agi/human/internal/workerbridge"
+	"github.com/vibe-agi/human/web"
 	"github.com/vibe-agi/human/worker"
+	"github.com/vibe-agi/human/workerkit"
+	workerkitsqlite "github.com/vibe-agi/human/workerkit/sqlite"
 )
 
 const (
@@ -67,6 +73,16 @@ type Config struct {
 	CallerSubject   string
 	WorkerSubject   string
 	ShutdownTimeout time.Duration
+
+	// WebListenAddress selects the browser human side instead of the terminal
+	// TUI: a second loopback listener serves the web UI over workerkit and the
+	// legacy worker bridge, and Run/Model have no terminal program. Empty keeps
+	// the frozen TUI.
+	WebListenAddress string
+	// WebStatePath is the durable workerkit conversation state used by the web
+	// human side. Empty derives a private workerkit-state.db in OS user data
+	// next to the other local databases.
+	WebStatePath string
 
 	// IssuedCredentialPolicy applies only when neither Existing* credentials nor
 	// CredentialProvider are supplied and Local.Open therefore issues a new pair.
@@ -132,6 +148,10 @@ func DefaultConfig() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("resolve default local worker state path: %w", err)
 	}
+	webStatePath, err := userdata.WorkspacePath("local", workspaceRoot, "workerkit-state.db")
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve default local web state path: %w", err)
+	}
 	gatewayConfig := gateway.DefaultConfig()
 	gatewayConfig.DatabasePath = gatewayPath
 	workerConfig.OutboxPath = outboxPath
@@ -143,6 +163,7 @@ func DefaultConfig() (Config, error) {
 		CallerSubject:   defaultCallerSubject,
 		WorkerSubject:   defaultWorkerSubject,
 		ShutdownTimeout: defaultShutdownWait,
+		WebStatePath:    webStatePath,
 	}, nil
 }
 
@@ -165,6 +186,9 @@ func (config Config) withDefaults() (Config, error) {
 	}
 	if config.ShutdownTimeout < 0 {
 		return Config{}, errors.New("open local: shutdown timeout must be positive")
+	}
+	if strings.TrimSpace(config.WebListenAddress) != "" && strings.TrimSpace(config.WebStatePath) == "" {
+		config.WebStatePath = defaults.WebStatePath
 	}
 	if config.IssuedCredentialPolicy != IssuedCredentialsRevokeOnClose &&
 		config.IssuedCredentialPolicy != IssuedCredentialsPreserve {
@@ -216,6 +240,15 @@ func (config Config) withDefaults() (Config, error) {
 type Local struct {
 	gateway *gateway.Server
 	worker  *worker.Worker
+
+	// Web human-side composition, populated only in web mode.
+	webBridge       *workerbridge.Bridge
+	webWorker       *workerkit.Worker
+	webServer       *web.Server
+	webHTTP         *http.Server
+	webListener     net.Listener
+	webStateRelease framework.ReleaseFunc
+	webURL          string
 
 	httpServer  *http.Server
 	listener    net.Listener
@@ -367,11 +400,17 @@ func Open(ctx context.Context, config Config) (*Local, error) {
 		}
 		config.Worker.OutboxScope = scope
 	}
-	openedWorker, err := worker.Open(runContext, config.Worker)
-	if err != nil {
-		return cleanupFailure(fmt.Errorf("open local worker: %w", err))
+	if strings.TrimSpace(config.WebListenAddress) != "" {
+		if err := instance.openWebHumanSide(runContext, config); err != nil {
+			return cleanupFailure(err)
+		}
+	} else {
+		openedWorker, err := worker.Open(runContext, config.Worker)
+		if err != nil {
+			return cleanupFailure(fmt.Errorf("open local worker: %w", err))
+		}
+		instance.worker = openedWorker
 	}
-	instance.worker = openedWorker
 
 	select {
 	case <-instance.serveDone:
@@ -387,6 +426,74 @@ func Open(ctx context.Context, config Config) (*Local, error) {
 		_ = instance.Close()
 	}()
 	return instance, nil
+}
+
+// openWebHumanSide composes the browser human side: the legacy worker bridge
+// over the same durable outbox identity the TUI would use, workerkit with its
+// own durable conversation state, and the web UI on a dedicated loopback
+// listener with a per-start session token.
+func (local *Local) openWebHumanSide(ctx context.Context, config Config) error {
+	bridge, err := workerbridge.Dial(ctx, workerbridge.Config{
+		URL: config.Worker.GatewayURL, Token: config.Worker.Token,
+		OutboxPath: config.Worker.OutboxPath, OutboxScope: config.Worker.OutboxScope,
+	})
+	if err != nil {
+		return fmt.Errorf("open local web worker bridge: %w", err)
+	}
+	local.webBridge = bridge
+
+	stateResource, err := workerkitsqlite.Open(ctx, workerkitsqlite.Config{Path: config.WebStatePath})
+	if err != nil {
+		return fmt.Errorf("open local web worker state: %w", err)
+	}
+	local.webStateRelease = stateResource.Release
+	stateStore, err := stateResource.Value()
+	if err != nil {
+		return fmt.Errorf("acquire local web worker state: %w", err)
+	}
+	webWorker, err := workerkit.Open(ctx, workerkit.Config{Wire: bridge, State: stateStore})
+	if err != nil {
+		return fmt.Errorf("open local web workerkit: %w", err)
+	}
+	local.webWorker = webWorker
+
+	tokenBytes := make([]byte, 24)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return fmt.Errorf("allocate local web session token: %w", err)
+	}
+	sessionToken := hex.EncodeToString(tokenBytes)
+	webServer, err := web.New(web.Config{Worker: webWorker, SessionToken: sessionToken})
+	if err != nil {
+		return fmt.Errorf("open local web server: %w", err)
+	}
+	local.webServer = webServer
+
+	webListener, err := net.Listen("tcp", config.WebListenAddress)
+	if err != nil {
+		return fmt.Errorf("open local web listener: %w", err)
+	}
+	if err := requireLoopback(webListener.Addr()); err != nil {
+		_ = webListener.Close()
+		return err
+	}
+	local.webListener = webListener
+	local.webHTTP = &http.Server{
+		Handler:           webServer,
+		BaseContext:       func(net.Listener) context.Context { return local.runContext },
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() { _ = local.webHTTP.Serve(webListener) }()
+	local.webURL = "http://" + webListener.Addr().String() + "/?token=" + sessionToken
+	return nil
+}
+
+// WebURL returns the browser login URL (including the one-time session token)
+// in web mode, and "" when the terminal TUI is composed instead.
+func (local *Local) WebURL() string {
+	if local == nil {
+		return ""
+	}
+	return local.webURL
 }
 
 func rejectPendingOfflineRestore(databasePath string) error {
@@ -542,6 +649,41 @@ func (local *Local) Close() error {
 		if local.worker != nil {
 			if err := local.worker.Close(); err != nil {
 				closeErrors = append(closeErrors, fmt.Errorf("close local worker: %w", err))
+			}
+		}
+		if local.webHTTP != nil {
+			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
+			if err := local.webHTTP.Shutdown(shutdownContext); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				closeErrors = append(closeErrors, fmt.Errorf("close local web HTTP server: %w", err))
+			}
+			shutdownCancel()
+		} else if local.webListener != nil {
+			if err := local.webListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				closeErrors = append(closeErrors, fmt.Errorf("close local web listener: %w", err))
+			}
+		}
+		if local.webServer != nil {
+			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
+			if err := local.webServer.Shutdown(shutdownContext); err != nil {
+				closeErrors = append(closeErrors, fmt.Errorf("close local web server: %w", err))
+			}
+			shutdownCancel()
+		}
+		if local.webWorker != nil {
+			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
+			if err := local.webWorker.Shutdown(shutdownContext); err != nil {
+				closeErrors = append(closeErrors, fmt.Errorf("close local web workerkit: %w", err))
+			}
+			shutdownCancel()
+		}
+		if local.webBridge != nil {
+			if err := local.webBridge.Close(); err != nil {
+				closeErrors = append(closeErrors, fmt.Errorf("close local web worker bridge: %w", err))
+			}
+		}
+		if local.webStateRelease != nil {
+			if err := local.webStateRelease(context.Background()); err != nil {
+				closeErrors = append(closeErrors, fmt.Errorf("release local web worker state: %w", err))
 			}
 		}
 		if local.gateway != nil {

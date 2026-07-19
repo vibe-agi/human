@@ -66,6 +66,7 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 	flags.Duration("max-pending", 10*time.Minute, "maximum time waiting for a Human response")
 	flags.Duration("shutdown-timeout", 10*time.Second, "graceful local shutdown timeout")
 	flags.Bool("reset-credentials", false, "rotate the persisted local caller and worker credentials")
+	flags.String("web", "", "serve the browser human side on this loopback address instead of the terminal TUI (e.g. 127.0.0.1:19081)")
 	persistent := command.PersistentFlags()
 	persistent.String("workspace", ".", "workspace used to isolate local private state; nearest Git root is selected")
 	persistent.String("db", automaticPrivatePath, "embedded SQLite database; auto uses OS user data isolated by workspace")
@@ -81,7 +82,7 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 		"local.queue_capacity":       "queue-capacity",
 		"local.stream_write_timeout": "stream-write-timeout",
 		"local.max_pending":          "max-pending", "local.shutdown_timeout": "shutdown-timeout",
-		"local.reset_credentials": "reset-credentials",
+		"local.reset_credentials": "reset-credentials", "local.web": "web",
 	} {
 		mustBind(settings, key, flags.Lookup(name))
 	}
@@ -192,8 +193,9 @@ func runLocal(ctx context.Context, output io.Writer, settings *viper.Viper) erro
 		},
 		ListenAddress:   settings.GetString("local.listen"),
 		CallerSubject:   settings.GetString("local.caller_subject"),
-		WorkerSubject:   settings.GetString("local.worker_subject"),
-		ShutdownTimeout: settings.GetDuration("local.shutdown_timeout"),
+		WorkerSubject:    settings.GetString("local.worker_subject"),
+		ShutdownTimeout:  settings.GetDuration("local.shutdown_timeout"),
+		WebListenAddress: settings.GetString("local.web"),
 	}
 
 	// Rotation runs against the same recovered gateway Local will serve, before
@@ -231,6 +233,19 @@ func runLocal(ctx context.Context, output io.Writer, settings *viper.Viper) erro
 
 	fmt.Fprintf(output, "Human local is ready\nworkspace scope: %s\nmodel base URL: %s/v1\ncaller credential: %s\n", workspaceRoot, instance.BaseURL(), credentialPath)
 	fmt.Fprintln(output, "in the same workspace: export HUMAN_CALLER_TOKEN=\"$(human local credentials --workspace . --token-only)\"")
+	if webURL := instance.WebURL(); webURL != "" {
+		fmt.Fprintf(output, "human side (browser): %s\n", webURL)
+		waitContext, waitCancel := context.WithCancel(ctx)
+		defer waitCancel()
+		waitDone := make(chan error, 1)
+		go func() { waitDone <- instance.Wait() }()
+		select {
+		case err := <-waitDone:
+			return err
+		case <-waitContext.Done():
+			return nil
+		}
+	}
 	_, err = instance.Run(ctx)
 	return err
 }
