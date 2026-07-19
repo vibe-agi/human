@@ -1,4 +1,4 @@
-package workspace
+package sqlite
 
 import (
 	"context"
@@ -10,6 +10,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	. "github.com/vibe-agi/human/workspace"
+	_ "modernc.org/sqlite"
 )
 
 func TestSQLiteApplyJournalPersistsBeforeCASAndReplaysExactly(t *testing.T) {
@@ -131,7 +134,7 @@ func TestSQLiteApplyJournalRecoveryNeverReexecutesPendingCAS(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "apply.db")
 	journal := openTestApplyJournal(t, path)
 	intent := testApplyIntent("artifact-crash", "durable payload")
-	encoded, digest, err := canonicalApplyIntent(intent)
+	encoded, digest, err := CanonicalApplyIntent(intent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +144,7 @@ func TestSQLiteApplyJournalRecoveryNeverReexecutesPendingCAS(t *testing.T) {
 	}
 	// The process may have executed CAS here and stopped before recording it.
 	// Reopening must not infer that it is safe to run again.
-	if err := journal.Close(); err != nil {
+	if err := journal.close(context.Background()); err != nil {
 		t.Fatalf("close crashed owner: %v", err)
 	}
 
@@ -182,7 +185,7 @@ func TestSQLiteApplyJournalPostCASCommitGapRecoversIndeterminate(t *testing.T) {
 	if err == nil || result.Record.State != ApplyStatePending || effects.Load() != 1 {
 		t.Fatalf("commit-gap result = %#v, %v; effects=%d", result, err, effects.Load())
 	}
-	if err := journal.Close(); err != nil {
+	if err := journal.close(context.Background()); err != nil {
 		t.Fatalf("close journal after database loss: %v", err)
 	}
 
@@ -200,7 +203,7 @@ func TestSQLiteApplyJournalPendingRetryBecomesIndeterminate(t *testing.T) {
 	t.Parallel()
 	journal := openTestApplyJournal(t, filepath.Join(t.TempDir(), "apply.db"))
 	intent := testApplyIntent("artifact-pending", "payload")
-	encoded, digest, err := canonicalApplyIntent(intent)
+	encoded, digest, err := CanonicalApplyIntent(intent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,13 +298,13 @@ func TestSQLiteApplyJournalCloseDoesNotDeadlockReentrantLookup(t *testing.T) {
 	}()
 	<-callbackEntered
 	closeResult := make(chan error, 1)
-	go func() { closeResult <- journal.Close() }()
+	go func() { closeResult <- journal.close(context.Background()) }()
 	waitForApplyJournalClosed(t, journal)
 	close(allowLookup)
 	select {
 	case err := <-lookupResult:
-		if !errors.Is(err, ErrApplyJournalClosed) {
-			t.Fatalf("reentrant Lookup after Close started = %v, want ErrApplyJournalClosed", err)
+		if !errors.Is(err, ErrStoreClosed) {
+			t.Fatalf("reentrant Lookup after Close started = %v, want ErrStoreClosed", err)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("reentrant Lookup deadlocked behind Close")
@@ -321,6 +324,70 @@ func TestSQLiteApplyJournalCloseDoesNotDeadlockReentrantLookup(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Close did not finish")
+	}
+}
+
+func TestSQLiteStoreReleaseContextBoundsBlockedApply(t *testing.T) {
+	resource, err := Open(context.Background(), Config{
+		Path:          filepath.Join(t.TempDir(), "apply.db"),
+		CommitTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := resource.Value()
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := value.(*applyJournal)
+	intent := testApplyIntent("artifact-bounded-release", "payload")
+	callbackEntered := make(chan struct{})
+	unblock := make(chan struct{})
+	var unblockOnce sync.Once
+	t.Cleanup(func() {
+		unblockOnce.Do(func() { close(unblock) })
+		_ = journal.close(context.Background())
+	})
+	applyResult := make(chan error, 1)
+	go func() {
+		_, applyErr := journal.Apply(context.Background(), intent, CASApplierFunc(func(context.Context, ApplyIntent) (CASOutcome, error) {
+			close(callbackEntered)
+			<-unblock
+			return CASOutcome{Decision: ApplySuccess, ObservedRevision: intent.ResultRevision}, nil
+		}))
+		applyResult <- applyErr
+	}()
+	select {
+	case <-callbackEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("CAS callback did not start")
+	}
+
+	releaseContext, cancelRelease := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	started := time.Now()
+	err = resource.Release(releaseContext)
+	cancelRelease()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Release blocked Apply = %v, want context deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Release ignored context for %v", elapsed)
+	}
+	if _, err := journal.Lookup(context.Background(), intent.Identity); !errors.Is(err, ErrStoreClosed) {
+		t.Fatalf("Lookup after Release admission stop = %v, want ErrStoreClosed", err)
+	}
+
+	unblockOnce.Do(func() { close(unblock) })
+	select {
+	case err := <-applyResult:
+		if err != nil {
+			t.Fatalf("admitted Apply after release timeout: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("admitted Apply did not finish")
+	}
+	if err := journal.close(context.Background()); err != nil {
+		t.Fatalf("background Store close: %v", err)
 	}
 }
 
@@ -359,7 +426,7 @@ func TestSQLiteApplyJournalSameIdentityWaitHonorsContext(t *testing.T) {
 	}
 }
 
-func waitForApplyJournalClosed(t *testing.T, journal *SQLiteApplyJournal) {
+func waitForApplyJournalClosed(t *testing.T, journal *applyJournal) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -378,14 +445,14 @@ func TestSQLiteApplyJournalSingleOwnerAndCleanBreakSchema(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "apply.db")
 	journal := openTestApplyJournal(t, path)
-	if _, err := OpenSQLiteApplyJournal(context.Background(), ApplyJournalConfig{DatabasePath: path}); !errors.Is(err, ErrApplyJournalInUse) {
-		t.Fatalf("second owner error = %v, want ErrApplyJournalInUse", err)
+	if _, err := Open(context.Background(), Config{Path: path}); !errors.Is(err, ErrInUse) {
+		t.Fatalf("second owner error = %v, want ErrInUse", err)
 	}
-	if err := journal.Close(); err != nil {
+	if err := journal.close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	reopened := openTestApplyJournal(t, path)
-	if err := reopened.Close(); err != nil {
+	if err := reopened.close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -400,7 +467,7 @@ func TestSQLiteApplyJournalSingleOwnerAndCleanBreakSchema(t *testing.T) {
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenSQLiteApplyJournal(context.Background(), ApplyJournalConfig{DatabasePath: foreignPath}); !errors.Is(err, errUnsupportedApplyJournalSchema) {
+	if _, err := Open(context.Background(), Config{Path: foreignPath}); !errors.Is(err, ErrUnsupportedSchema) {
 		t.Fatalf("foreign schema error = %v, want clean-break rejection", err)
 	}
 }
@@ -423,17 +490,25 @@ func TestSQLiteApplyJournalRejectsInvalidIntentBeforePersistence(t *testing.T) {
 	}
 }
 
-func openTestApplyJournal(t *testing.T, path string) *SQLiteApplyJournal {
+func openTestApplyJournal(t *testing.T, path string) *applyJournal {
 	t.Helper()
-	journal, err := OpenSQLiteApplyJournal(context.Background(), ApplyJournalConfig{
-		DatabasePath:  path,
+	resource, err := Open(context.Background(), Config{
+		Path:          path,
 		CommitTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatalf("open apply journal: %v", err)
 	}
+	value, err := resource.Value()
+	if err != nil {
+		t.Fatalf("read apply journal resource: %v", err)
+	}
+	journal, ok := value.(*applyJournal)
+	if !ok {
+		t.Fatalf("apply journal resource type = %T", value)
+	}
 	t.Cleanup(func() {
-		if err := journal.Close(); err != nil {
+		if err := resource.Release(context.Background()); err != nil {
 			t.Errorf("close apply journal: %v", err)
 		}
 	})
@@ -444,7 +519,7 @@ func testApplyIntent(artifact, data string) ApplyIntent {
 	payload := Payload{MediaType: "application/json", Data: []byte(data)}
 	return ApplyIntent{
 		Identity:       ApplyIdentity{Authority: "caller-1", Workspace: "workspace-1", Artifact: artifact},
-		ArtifactDigest: sha256Digest([]byte("artifact:" + artifact)),
+		ArtifactDigest: digestBytes([]byte("artifact:" + artifact)),
 		PayloadDigest:  DigestPayload(payload),
 		BaseRevision:   Revision("base:initial"),
 		ResultRevision: Revision("result:" + artifact),

@@ -12,6 +12,7 @@ import (
 	sdk "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/vibe-agi/human/agent"
 	"github.com/vibe-agi/human/workspace"
+	workspacesqlite "github.com/vibe-agi/human/workspace/sqlite"
 )
 
 func TestA2AArtifactApplyJournalReceiptVerticalSlice(t *testing.T) {
@@ -60,14 +61,18 @@ func TestA2AArtifactApplyJournalReceiptVerticalSlice(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	journal, err := workspace.OpenSQLiteApplyJournal(context.Background(), workspace.ApplyJournalConfig{
-		DatabasePath: filepath.Join(t.TempDir(), "apply.db"),
+	journalResource, err := workspacesqlite.Open(context.Background(), workspacesqlite.Config{
+		Path: filepath.Join(t.TempDir(), "apply.db"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	journal, err := journalResource.Value()
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
-		if err := journal.Close(); err != nil {
+		if err := journalResource.Release(context.Background()); err != nil {
 			t.Errorf("close apply journal: %v", err)
 		}
 	})

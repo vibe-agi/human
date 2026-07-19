@@ -1,7 +1,8 @@
-// Package workspace contains transport-neutral identities and the HumanAgent
-// caller-side apply journal. HumanLLM does not yet use these values or join the
-// same durable revision/apply chain. Payload values remain declarative;
-// filesystem mutation belongs to an explicitly supplied, authorized CASApplier.
+// Package workspace contains transport-neutral identities and the replaceable
+// caller-side Store used to apply HumanAgent artifacts. HumanLLM does not yet
+// use these values or join the same durable revision/apply chain. Payload values
+// remain declarative; filesystem mutation belongs to an explicitly supplied,
+// authorized CASApplier.
 package workspace
 
 // Revision is an opaque workspace chain identity. Implementations compare it
