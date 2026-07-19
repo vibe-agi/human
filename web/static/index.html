@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Human Worker</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --line: #e2e5ea; --text: #1c2430;
+    --muted: #6b7686; --accent: #2456d6; --danger: #c0392b; --ok: #1e8e4e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14181f; --panel: #1d232d; --line: #2c3442; --text: #e6eaf1;
+      --muted: #93a0b4; --accent: #6c96ff; --danger: #ff7b6b; --ok: #57c98a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+    display: grid; grid-template-columns: 320px 1fr; height: 100vh;
+  }
+  aside { border-right: 1px solid var(--line); overflow-y: auto; padding: 12px; }
+  main { display: flex; flex-direction: column; overflow: hidden; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 14px 4px 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 8px; cursor: pointer;
+  }
+  .card.selected { border-color: var(--accent); }
+  .card .meta { color: var(--muted); font-size: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .card .preview { margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+  .card .actions { margin-top: 8px; display: flex; gap: 8px; }
+  button {
+    border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    border-radius: 8px; padding: 6px 14px; cursor: pointer; font-size: 13px;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--danger); border-color: var(--danger); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  #transcript { flex: 1; overflow-y: auto; padding: 18px 22px; }
+  .entry { max-width: 760px; margin: 0 auto 12px; }
+  .entry .who { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+  .entry .bubble {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 14px; white-space: pre-wrap; word-break: break-word;
+  }
+  .entry.human .bubble { border-color: var(--accent); }
+  .entry.rejected .bubble { border-color: var(--danger); }
+  .entry .kind { font-size: 11px; color: var(--muted); margin-left: 6px; }
+  #composer { border-top: 1px solid var(--line); padding: 12px 22px 16px; background: var(--panel); }
+  #composer .inner { max-width: 760px; margin: 0 auto; }
+  textarea {
+    width: 100%; min-height: 72px; resize: vertical; border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px; background: var(--bg); color: var(--text);
+    font: inherit;
+  }
+  #composer .row { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+  #phase { color: var(--muted); font-size: 12px; margin-left: auto; }
+  #status { position: fixed; right: 14px; top: 10px; font-size: 12px; color: var(--muted); }
+  #status.offline { color: var(--danger); }
+  #empty { flex: 1; display: grid; place-items: center; color: var(--muted); }
+  details { margin-top: 8px; }
+  details textarea { min-height: 56px; font-family: ui-monospace, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<aside>
+  <div id="status">连接中…</div>
+  <h2>收件箱</h2>
+  <div id="inbox"></div>
+  <h2>会话</h2>
+  <div id="conversations"></div>
+</aside>
+<main>
+  <div id="empty">从左侧接单或选择会话</div>
+  <div id="transcript" hidden></div>
+  <div id="composer" hidden>
+    <div class="inner">
+      <textarea id="draft" placeholder="输入回复… (Ctrl+Enter 发送进度)"></textarea>
+      <div class="row">
+        <button id="send-progress" class="primary">发送进度</button>
+        <button id="send-clarify">追问</button>
+        <button id="send-final" class="ok">完成交付</button>
+        <span id="phase"></span>
+      </div>
+      <details>
+        <summary>高级:工具调用 (JSON)</summary>
+        <textarea id="tool-calls" placeholder='[{"id":"call-1","name":"bash","input":{"command":"ls"}}]'></textarea>
+        <div class="row"><button id="send-tools">发送工具调用</button></div>
+      </details>
+    </div>
+  </div>
+</main>
+<script>
+"use strict";
+let state = { inbox: [], conversations: [] };
+let selected = null; // {caller, task_id}
+let draftTimer = null;
+
+const $ = (id) => document.getElementById(id);
+
+async function api(path, body) {
+  const response = await fetch(path, {
+    method: body ? "POST" : "GET",
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.message || response.statusText);
+  return data;
+}
+
+function keyOf(conversation) {
+  return { caller: conversation.key.caller, task_id: conversation.key.task_id };
+}
+function sameKey(a, b) { return a && b && a.caller === b.caller && a.task_id === b.task_id; }
+
+function selectedConversation() {
+  return state.conversations.find((c) => sameKey(keyOf(c), selected)) || null;
+}
+
+function render() {
+  const inbox = $("inbox");
+  inbox.replaceChildren(...state.inbox.map((item) => {
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `
+      <div class="meta"><span>${item.tier || "chat"}</span><span>${item.task_id}</span></div>
+      <div class="preview"></div>
+      <div class="actions"></div>`;
+    card.querySelector(".preview").textContent = item.preview || "(无文本)";
+    const accept = document.createElement("button");
+    accept.className = "primary"; accept.textContent = "接单";
+    accept.onclick = async () => {
+      try {
+        const result = await api("/api/accept", { delivery: item.delivery });
+        selected = { caller: result.key.Caller || result.key.caller, task_id: result.key.TaskID || result.key.task_id };
+      } catch (error) { alert("接单失败: " + error.message); }
+    };
+    const reject = document.createElement("button");
+    reject.className = "danger"; reject.textContent = "拒单";
+    reject.onclick = async () => {
+      const reason = prompt("拒单原因", "暂时无法处理");
+      if (reason === null) return;
+      try { await api("/api/reject", { delivery: item.delivery, reason }); }
+      catch (error) { alert("拒单失败: " + error.message); }
+    };
+    card.querySelector(".actions").append(accept, reject);
+    return card;
+  }));
+
+  const list = $("conversations");
+  list.replaceChildren(...state.conversations.map((conversation) => {
+    const card = document.createElement("div");
+    const key = keyOf(conversation);
+    card.className = "card" + (sameKey(key, selected) ? " selected" : "");
+    const phase = { active: "进行中", awaiting_results: "等待工具结果",
+      awaiting_caller: "等待对方回复", terminal: "已完成" }[conversation.phase] || conversation.phase;
+    card.innerHTML = `<div class="meta"><span></span><span>${phase}</span></div><div class="preview"></div>`;
+    card.querySelector(".meta span").textContent = key.task_id;
+    const tail = (conversation.transcript || []).at(-1);
+    card.querySelector(".preview").textContent = tail ? (tail.text || tail.kind) : "";
+    card.onclick = () => { selected = key; render(); };
+    return card;
+  }));
+
+  const conversation = selectedConversation();
+  $("empty").hidden = !!conversation;
+  $("transcript").hidden = !conversation;
+  $("composer").hidden = !conversation;
+  if (!conversation) return;
+
+  const transcript = $("transcript");
+  const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
+  transcript.replaceChildren(...(conversation.transcript || []).map((entry) => {
+    const item = document.createElement("div");
+    item.className = "entry " + (entry.author === "human" ? "human" : entry.kind === "rejected" ? "rejected" : "");
+    const who = { caller: "对方 Agent", human: "我", system: "系统" }[entry.author] || entry.author;
+    const kind = { progress: "进度", clarification: "追问", final: "交付",
+      tool_calls: "工具调用", tool_result: "工具结果", rejected: "被拒绝" }[entry.kind] || "";
+    item.innerHTML = `<div class="who"></div><div class="bubble"></div>`;
+    item.querySelector(".who").textContent = who + (kind ? " · " + kind : "");
+    let text = entry.text || "";
+    if (entry.kind === "tool_calls") {
+      text = (entry.tool_calls || []).map((c) => `${c.name}(${JSON.stringify(c.input)})`).join("\n");
+    }
+    item.querySelector(".bubble").textContent = text || "(空)";
+    return item;
+  }));
+  if (nearBottom) transcript.scrollTop = transcript.scrollHeight;
+
+  const active = conversation.phase === "active";
+  $("send-progress").disabled = !active;
+  $("send-clarify").disabled = !active;
+  $("send-final").disabled = !active;
+  $("send-tools").disabled = !active;
+  $("phase").textContent = { active: "轮到你回复", awaiting_results: "等待对方执行工具…",
+    awaiting_caller: "已追问,等待对方…", terminal: "会话已结束" }[conversation.phase] || "";
+  if (document.activeElement !== $("draft")) $("draft").value = conversation.draft || "";
+}
+
+async function sendText(path) {
+  const conversation = selectedConversation();
+  if (!conversation) return;
+  const text = $("draft").value.trim();
+  if (!text) return;
+  try {
+    await api(path, { ...keyOf(conversation), text });
+    $("draft").value = "";
+  } catch (error) { alert("发送失败: " + error.message); }
+}
+
+$("send-progress").onclick = () => sendText("/api/reply");
+$("send-clarify").onclick = () => sendText("/api/clarify");
+$("send-final").onclick = () => {
+  if (confirm("确认发送最终交付并结束会话?")) sendText("/api/final");
+};
+$("send-tools").onclick = async () => {
+  const conversation = selectedConversation();
+  if (!conversation) return;
+  let calls;
+  try { calls = JSON.parse($("tool-calls").value); }
+  catch { alert("工具调用 JSON 无法解析"); return; }
+  try {
+    await api("/api/tool-calls", { ...keyOf(conversation), calls });
+    $("tool-calls").value = "";
+  } catch (error) { alert("发送失败: " + error.message); }
+};
+$("draft").addEventListener("input", () => {
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => {
+    const conversation = selectedConversation();
+    if (conversation) api("/api/draft", { ...keyOf(conversation), text: $("draft").value }).catch(() => {});
+  }, 600);
+});
+$("draft").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) sendText("/api/reply");
+});
+
+function connect() {
+  const source = new EventSource("/api/events");
+  source.addEventListener("state", (event) => {
+    state = JSON.parse(event.data);
+    $("status").textContent = "已连接";
+    $("status").classList.remove("offline");
+    if (!selected && state.conversations.length) selected = keyOf(state.conversations[0]);
+    render();
+    if (state.inbox.length && Notification.permission === "granted") {
+      // Only notify when the page is hidden to avoid noise.
+      if (document.hidden) new Notification("Human:有新的请求等待接单");
+    }
+  });
+  source.onerror = () => {
+    $("status").textContent = "连接断开,重连中…";
+    $("status").classList.add("offline");
+  };
+}
+
+if ("Notification" in window && Notification.permission === "default") {
+  Notification.requestPermission();
+}
+api("/api/state").then((initial) => { state = initial; render(); }).catch(() => {});
+connect();
+</script>
+</body>
+</html>
