@@ -51,7 +51,7 @@ flowchart LR
 
 ## 运行形态与代码边界
 
-`llm.Service` 是新的 HumanLLM transport-neutral 正确性内核；现有 gateway 是面向 CLI/兼容端点的一体化产品 composition。`human local` 把 gateway、SQLite 与 TUI 放进同一进程；远程、团队或多个专家部署拆成 `human gateway` 与 `human worker`。HumanAgent 提供可嵌入 Go 领域、A2A caller handler 与独立远程 worker transport，但暂不发布第二套 daemon 或官方 Agent TUI。
+`llm.Service` 是新的 HumanLLM transport-neutral 正确性内核；现有 gateway 是面向 CLI/兼容端点的一体化产品 composition，**已定位为 legacy**：新协议与扩展点只落公共内核，RC 后 gateway 将迁移到 `llm.Service` 之上（决策见 [06](docs/06-product-todos.md#架构决策方向性不进入本轮验收)）。在迁移完成前，公共内核的自定义 codec/Store 不会自动出现在 `human local`。`human local` 把 gateway、SQLite 与 TUI 放进同一进程；远程、团队或多个专家部署拆成 `human gateway` 与 `human worker`。HumanAgent 提供可嵌入 Go 领域、A2A caller handler 与独立远程 worker transport，但暂不发布第二套 daemon 或官方 Agent TUI。
 
 | 组件 | 职责 |
 |---|---|

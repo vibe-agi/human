@@ -34,11 +34,17 @@ caller 由 `a2a.NewHandler` 单独装配。Task 等领域类型来自 `human/age
 
 ```go
 store, err := llmsqlite.Open(ctx, llmsqlite.Config{Path: path})
-config := human.DefaultLLMConfig() // 只填入三个 built-in codecs
+config := human.DefaultLLMConfig() // 三个 built-in codecs + 显式 llm.AdmitAll()
 config.DeploymentID = "my-human-deployment"
 config.Store = store               // owned Resource 转交给 HumanLLM
 service, err := human.NewLLM(ctx, config)
 ```
+
+AdmissionPolicy 是必填部署选择：`NewLLM` 拒绝 nil 策略。`DefaultLLMConfig` 已显式填入
+全放行的 `llm.AdmitAll()`；需要配额、租户或工具级准入时替换 `config.Admission`。宿主
+认证的 claims 可经 `callerhttp.Identity.Attributes` 传给 AdmissionPolicy/WorkerRouter
+做 ABAC 与路由；属性不进入请求身份与持久化。多 worker 部署必须配置 `config.Router`，
+否则第二个 worker 连接后 admission 以 `worker_router_required` fail-closed。
 
 SQLite 不是构造器要求。第三方实现直接写
 `config.Store = framework.Borrow[llm.Store](myStore)`；若把关闭责任转交给 Human，则用

@@ -46,13 +46,29 @@ WebSocket frame、A2A DTO 或云厂商 KMS DTO。官方 adapter 与第三方 ada
 | Agent Caller Surface | `agent.Agent` 的领域命令；caller DTO 不进入领域 | `a2a` HTTP+JSON handler | 自有 HTTP/RPC/队列 adapter |
 | Workspace Store | `workspace.Store`、`CASApplier`、exact-base intent、revision/digest、indeterminate 收口 | `workspace/sqlite` + host applier | PostgreSQL、Git、远程 IDE、对象存储、虚拟工作区 |
 | Protector | `protect.Protector`：带 Binding/AAD 的 envelope seal/open、key id/version | `protect/aead` AES-256-GCM | KMS、HSM、Vault、宿主密钥环 |
-| Codec / Policy | `llm.Codec`、`AdmissionPolicy`、`WorkerRouter`、`ToolAuthorizer` | 三个 built-in codec 与默认策略 | 私有模型协议、RBAC/ABAC、专家路由 |
+| Codec / Policy | `llm.Codec`、`AdmissionPolicy`、`WorkerRouter`、`ToolAuthorizer` | 三个 built-in codec、显式 `llm.AdmitAll`、单 worker 直路由 | 私有模型协议、RBAC/ABAC、专家路由 |
 | Clock / ID / Seed | 并发安全、context-aware、codec 重放所需的持久 seed | system clock、随机 opaque ID | 逻辑钟、宿主 ID/KMS 服务 |
 
 Codec 是纯转换 port：decode 必须严格，encode 只能由已持久化 seed 与有序 event 决定，
 并声明 fingerprint 与上限。内核不通过字段相似度猜协议或工具语义。认证属于具体
 transport；核心只接收 adapter 从可信凭据构造出的 principal。当前没有宣称通用
 Observer SPI，日志与 metrics 仍是后续可抽取项。
+
+策略 port 有三条已定死的安全语义：
+
+1. **AdmissionPolicy 是必填部署选择。** `NewService` 拒绝 nil 策略；全放行必须显式
+   写 `llm.AdmitAll()`，使"只靠 transport 认证"成为可 grep、可审计的决定，而不是
+   静默默认。
+2. **认证属性只是 advisory 通道。** caller adapter 可以把已认证 principal 的 claims
+   （如 JWT claims、mTLS SAN）经 `AdmissionRequest.CallerAttributes` 传给
+   `AdmissionPolicy` 与 `WorkerRouter` 做 ABAC 和专家路由。属性不进入 correctness
+   identity：request digest、幂等比较、持久记录与 worker assignment 一概忽略它们，
+   异属性的精确重试仍逐字节 replay。`ToolAuthorizer` 故意收不到属性——工具授权发生
+   在 worker event 时刻、可能跨进程重启，只允许依赖 durable 状态；需要 claims 的
+   授权应在 admission 时刻降级 tier 或拒绝。
+3. **缺 Router 是配置错误,不是容量问题。** nil Router 只服务单 worker 部署：第二个
+   worker 连接后 admission 以 `ErrWorkerRouterRequired`（HTTP 500
+   `worker_router_required`）fail-closed，不伪装成可重试的 `worker_unavailable`。
 
 ## 3. Store 不是 CRUD
 
@@ -177,7 +193,14 @@ record；允许读取旧明文只能由显式 migration policy 开启。
 
 `humantest` 已公开 Agent Store、LLM Store、Workspace Store 以及两个 worker Journal 的
 conformance kit；两个 Journal 另有可由第三方直接调用的
-`TestAgentWorkerJournalRecovery` / `TestLLMWorkerJournalRecovery`。官方 SQLite adapters
+`TestAgentWorkerJournalRecovery` / `TestLLMWorkerJournalRecovery`。针对 Store 合同中
+最危险的 `ErrStoreCommitUnknown` 路径，`humantest.CommitUnknownLLMStore` 提供可组合的
+歧义提交注入（commit 已落但应答丢失 / commit 前连接丢失两种模式），
+`humantest.TestLLMServiceCommitUnknownReconciliation` 则用真实 HumanLLM core 驱动
+factory 提供的 Store，验证 admission 与 worker event 两个提交点都能按 durable identity
+对账：可疑但已提交的 admission 收敛为精确 replay 且只有一个 assignment；真丢失的
+commit 失败后同 key 精确重试成功；可疑 worker event 收敛为幂等 ACK。官方
+`llm/sqlite` 与示例 custom Store 都运行该套件。官方 SQLite adapters
 与可用的 Memory model 运行相同的领域套件，覆盖
 callback exactly-once、rollback、strict serialization、byte ownership、limits、CAS、binding、
 receipt、release/reopen recovery 与 retention。Journal recovery kit 会跨 reopen 验证完整
