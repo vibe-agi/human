@@ -163,15 +163,26 @@ durable 状态全部在 daemon;关浏览器不丢任务、不断连接。多个 
 
 ## 7. 里程碑与验收门
 
-| 里程碑 | 内容 | 验收 |
+| 里程碑 | 内容 | 状态(2026-07-19) |
 |---|---|---|
-| M0 TUI 冻结 | TUI 与 `internal/tui`/`internal/workerclient` 只修 bug,不加功能;人侧新功能一律进 workerkit/web | 立即生效;RC 继续以现有 TUI 真实门交付 |
-| M1 workerkit-core | 接单/回复/final/工具循环 + StateStore conformance + fake wire 故障注入(断线、重启、outbox 重放、commit 歧义) | custom-framework 示例以 workerkit 实现人侧,跑通嵌入内核完整闭环 |
-| M2 human web MVP | inbox/对话/final + SSE + 通知,无 Live Workspace | 真实 OpenCode 连嵌入内核 + web 人侧完成文本/工具闭环 |
-| M3 Mirror port 化 | mirror/review/save-ahead 迁入 workerkit,web 获得 Review 交付面板 | 现有 save-ahead 与拒单故障注入测试在 workerkit 层通过 |
-| M4 TUI 删除 | web 版真实 OpenCode 产品门(HTTP/SSE 驱动,替代 PTY 键值驱动)达到与 `make real-opencode-tui-test` 同覆盖;随后整体删除 TUI、`internal/tui`、`internal/workerclient` 与旧 worker WS 方言 | web 真实门连续通过后删除;此为双栈收敛 worker 半边完成标志 |
+| M0 TUI 冻结 | TUI 与 `internal/tui`/`internal/workerclient` 只修 bug,不加功能 | **完成**:三个包已带冻结声明 |
+| M1 workerkit-core | 接单/回复/final/工具循环 + StateStore conformance + fake wire 故障注入 | **完成**:公共 `workerkit` + memory/sqlite StateStore + `humantest.TestWorkerStateStore`;fake-wire 覆盖重投去重、发送失败重试、拒单顺序、NACK 先持久后确认、32 上限 fail-closed、重启恢复;并以进程内 adapter 驱动真实 `llm.Service` 通过 chat 与 workspace 工具续接闭环 |
+| M2 human web MVP | web 包 + SSE + 会话 token + 嵌入式单文件 UI(en/zh,默认 en) | **完成**:真实 OpenCode 1.17.18 Basic 门通过——CLI 连嵌入内核,人侧全程 web HTTP API,final 逐字回流;另有 Playwright 驱动真实 Chrome 操作页面、GLM 类 LLM 模拟人类专家的浏览器门 |
+| M3 Mirror port 化 | `workerkit.Mirror` port + 官方 `fsmirror` adapter + web Review 面板 | **完成**:baseline 仅在成功 result 回流时推进、失败保持 pending、可选 BaselineFile 跨重启;工具映射 builder 留在宿主侧待 Harness SPI |
+| M4 web 门对齐 → 删除 TUI | web 版真实 OpenCode 门逐项对齐 TUI 门;随后删除 TUI 栈 | **门侧已达成用户流程对齐**:Workspace 档真实门通过——accept、流式回复、`:pull` 字节级 hydration(envelope 解码)、镜像 save→review→confirm、原生 `write` 交付、result 续接、bash+todowrite 批、final、aux chat 隔离,工作树逐字节正确。**删除仍按闸待执行**,见下 |
 
-Observer(§6)与 M1 并行落地。
+M4 删除闸的剩余项(不满足前不删):
+
+1. `human local`/`human worker` 产品仍装配在 legacy gateway 上,TUI 是其唯一
+   人侧;删除前必须先把产品装配迁到 workerkit/web(双栈收敛 worker 半边),
+   或为 legacy gateway 提供 workerkit Wire 桥。
+2. web 门尚未覆盖:同 session 第二 user turn(`--session`)、edit-with-baseline
+   映射(当前 builder 用整文件 `write`)、`REAL_COUNT=3` 连续重复、TUI 门的
+   save-ahead journal 崩溃细节(workerkit 层有等价故障注入,但未在真实门重演)。
+3. 删除本身是大规模机械 churn(worker/local/humancmd 重装配 + 数万行测试随删),
+   须与 08 运维文档、backup/restore 的 worker outbox/state 语义同步修订。
+
+Observer(§6)仍未落地,与产品迁移同批实现。
 
 风险与诚实边界:
 
