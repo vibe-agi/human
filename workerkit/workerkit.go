@@ -300,6 +300,7 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 		Delivery: delivery.ID, Key: key,
 		Tier:       delivery.Assignment.Task.CapabilityTier,
 		Preview:    requestPreview(delivery.Assignment.Request),
+		ToolCount:  len(delivery.Assignment.Request.Tools),
 		ReceivedAt: worker.now().UTC(),
 	})
 	worker.inboxRequests[delivery.ID] = delivery.Assignment.Request

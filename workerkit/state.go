@@ -115,10 +115,14 @@ type StateStore interface {
 // InboxItem is one assignment awaiting an accept/reject decision. It is not
 // persisted by workerkit; the transport replays unconfirmed assignments.
 type InboxItem struct {
-	Delivery   llm.WorkerDeliveryID
-	Key        ConversationKey
-	Tier       llm.CapabilityTier
-	Preview    string
+	Delivery llm.WorkerDeliveryID
+	Key      ConversationKey
+	Tier     llm.CapabilityTier
+	Preview  string
+	// ToolCount is the number of caller-declared tools. Zero usually marks an
+	// auxiliary request (e.g. OpenCode title/summary generation) rather than
+	// the main conversation turn.
+	ToolCount  int
 	ReceivedAt time.Time
 }
 

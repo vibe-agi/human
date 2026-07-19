@@ -109,6 +109,7 @@
 const MESSAGES = {
   en: {
     inbox: "Inbox", conversations: "Conversations", workspaceChanges: "Workspace changes",
+    auxiliary: "auxiliary (likely title generation)",
     accept: "Accept", reject: "Reject", rejectPrompt: "Reason for rejecting",
     rejectDefault: "Unable to take this request", noText: "(no text)",
     deliverSelected: "Deliver selected", discardSelected: "Discard selected",
@@ -135,6 +136,7 @@ const MESSAGES = {
   },
   zh: {
     inbox: "收件箱", conversations: "会话", workspaceChanges: "工作区改动",
+    auxiliary: "辅助请求(多为标题生成)",
     accept: "接单", reject: "拒单", rejectPrompt: "拒单原因",
     rejectDefault: "暂时无法处理", noText: "(无文本)",
     deliverSelected: "交付所选", discardSelected: "丢弃所选",
@@ -221,6 +223,12 @@ function render() {
       <div class="actions"></div>`;
     card.querySelector(".preview").textContent = item.preview || t("noText");
     card.dataset.testid = "inbox-item";
+    if (!item.tool_count) {
+      const badge = document.createElement("span");
+      badge.textContent = t("auxiliary");
+      badge.style.color = "var(--muted)";
+      card.querySelector(".meta").append(badge);
+    }
     const accept = document.createElement("button");
     accept.className = "primary"; accept.textContent = t("accept");
     accept.dataset.action = "accept";

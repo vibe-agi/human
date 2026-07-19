@@ -418,6 +418,7 @@ func stateView(state workerkit.State) map[string]any {
 			"task_id":     string(item.Key.TaskID),
 			"tier":        string(item.Tier),
 			"preview":     item.Preview,
+			"tool_count":  item.ToolCount,
 			"received_at": item.ReceivedAt,
 		})
 	}
