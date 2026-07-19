@@ -41,6 +41,11 @@ var (
 	ErrStoreClosed = errors.New("llm: store is closed")
 	// ErrStoreRecordTooLarge means a bounded materialization was refused.
 	ErrStoreRecordTooLarge = errors.New("llm: store record exceeds read budget")
+	// ErrStoreInvalidArgument means a Store primitive received a malformed key,
+	// cursor, limit, mutation, or nil callback. It is part of the portable port
+	// contract so custom adapters do not need to expose driver-specific argument
+	// errors.
+	ErrStoreInvalidArgument = errors.New("llm: invalid store argument")
 	// ErrStoreCorruptRecord means physical data could not be represented as the
 	// typed logical record promised by this contract. It is distinct from an
 	// invalid canonical payload, which HumanLLM core detects and quarantines.
