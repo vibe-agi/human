@@ -1,9 +1,8 @@
 // Package local runs a complete Human Agent instance in one process.
 //
-// It owns a loopback HTTP listener, an embedded SQLite-backed gateway, and a
-// Human worker with its Bubble Tea model. Applications that need custom
-// routing or identity should compose the gateway and worker packages directly;
-// local intentionally uses built-in tokens and never persists their plaintext
+// It owns a loopback HTTP listener, an embedded SQLite-backed gateway, and
+// the browser human side (workerkit + web over the worker bridge). Local
+// intentionally uses built-in tokens and never persists their plaintext
 // values. Credentials issued by Open are revoked on Close by default; an
 // embedding application may explicitly preserve and persist the returned pair.
 package local
@@ -23,15 +22,15 @@ import (
 	"sync"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
 	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/gateway"
 	"github.com/vibe-agi/human/internal/sqlitefile"
 	"github.com/vibe-agi/human/internal/userdata"
 	"github.com/vibe-agi/human/internal/workerbridge"
+	"github.com/vibe-agi/human/llm"
 	"github.com/vibe-agi/human/web"
-	"github.com/vibe-agi/human/worker"
 	"github.com/vibe-agi/human/workerkit"
+	"github.com/vibe-agi/human/workerkit/fsmirror"
 	workerkitsqlite "github.com/vibe-agi/human/workerkit/sqlite"
 )
 
@@ -62,27 +61,29 @@ const (
 // existing pair, or obtains one from CredentialProvider so the private
 // WebSocket and public model routes use the same embedded identity store.
 //
-// Worker.GatewayURL is replaced with the actual loopback endpoint. Worker.Token
-// must be empty because local issues the credential. Library paths are passed
-// through literally; shell syntax such as ~ is not expanded.
+// Library paths are passed through literally; shell syntax such as ~ is not
+// expanded.
 type Config struct {
 	Gateway gateway.Config
-	Worker  worker.Config
+	Worker  WorkerPaths
 
 	ListenAddress   string
 	CallerSubject   string
 	WorkerSubject   string
 	ShutdownTimeout time.Duration
 
-	// WebListenAddress selects the browser human side instead of the terminal
-	// TUI: a second loopback listener serves the web UI over workerkit and the
-	// legacy worker bridge, and Run/Model have no terminal program. Empty keeps
-	// the frozen TUI.
+	// WebListenAddress is the loopback address of the browser human side.
+	// Empty asks the kernel for a free loopback port.
 	WebListenAddress string
 	// WebStatePath is the durable workerkit conversation state used by the web
 	// human side. Empty derives a private workerkit-state.db in OS user data
 	// next to the other local databases.
 	WebStatePath string
+	// WebDisableAutoTitle turns off the default web-mode auto-responder that
+	// answers tool-less chat requests (OpenCode's hidden title/summary
+	// generation) with a derived title so only real turns reach the inbox.
+	// Disable it for callers whose genuine conversations declare no tools.
+	WebDisableAutoTitle bool
 
 	// IssuedCredentialPolicy applies only when neither Existing* credentials nor
 	// CredentialProvider are supplied and Local.Open therefore issues a new pair.
@@ -109,6 +110,14 @@ type Config struct {
 	CredentialProvider func(context.Context, *gateway.Server) (Credentials, error)
 }
 
+// WorkerPaths selects the human-side durable locations: the Live Workspace
+// mirror root and the durable worker outbox carrying events across restarts.
+type WorkerPaths struct {
+	MirrorRoot  string
+	OutboxPath  string
+	OutboxScope string
+}
+
 // Credentials are the plaintext values needed by a local caller and worker.
 // NewlyIssued is true only when Open created both credentials. The library
 // keeps these values in memory. Newly issued values are revoked on Close unless
@@ -128,9 +137,9 @@ type Credentials struct {
 // current directory when no Git root exists), so opening Local cannot create
 // state inside a customer checkout implicitly.
 func DefaultConfig() (Config, error) {
-	workerConfig, err := worker.DefaultConfig()
+	home, err := os.UserHomeDir()
 	if err != nil {
-		return Config{}, err
+		return Config{}, fmt.Errorf("resolve default local mirror root: %w", err)
 	}
 	workspaceRoot, err := userdata.ResolveGitWorkspace(".")
 	if err != nil {
@@ -144,18 +153,13 @@ func DefaultConfig() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("resolve default local worker outbox path: %w", err)
 	}
-	statePath, err := userdata.WorkspacePath("local", workspaceRoot, "worker-state.db")
-	if err != nil {
-		return Config{}, fmt.Errorf("resolve default local worker state path: %w", err)
-	}
 	webStatePath, err := userdata.WorkspacePath("local", workspaceRoot, "workerkit-state.db")
 	if err != nil {
 		return Config{}, fmt.Errorf("resolve default local web state path: %w", err)
 	}
 	gatewayConfig := gateway.DefaultConfig()
 	gatewayConfig.DatabasePath = gatewayPath
-	workerConfig.OutboxPath = outboxPath
-	workerConfig.StatePath = statePath
+	workerConfig := WorkerPaths{MirrorRoot: filepath.Join(home, "mirror"), OutboxPath: outboxPath}
 	return Config{
 		Gateway:         gatewayConfig,
 		Worker:          workerConfig,
@@ -187,7 +191,10 @@ func (config Config) withDefaults() (Config, error) {
 	if config.ShutdownTimeout < 0 {
 		return Config{}, errors.New("open local: shutdown timeout must be positive")
 	}
-	if strings.TrimSpace(config.WebListenAddress) != "" && strings.TrimSpace(config.WebStatePath) == "" {
+	if strings.TrimSpace(config.WebListenAddress) == "" {
+		config.WebListenAddress = "127.0.0.1:0"
+	}
+	if strings.TrimSpace(config.WebStatePath) == "" {
 		config.WebStatePath = defaults.WebStatePath
 	}
 	if config.IssuedCredentialPolicy != IssuedCredentialsRevokeOnClose &&
@@ -202,12 +209,6 @@ func (config Config) withDefaults() (Config, error) {
 	}
 	if strings.TrimSpace(config.Worker.OutboxPath) == "" {
 		config.Worker.OutboxPath = defaults.Worker.OutboxPath
-	}
-	if !config.Worker.DisableState && strings.TrimSpace(config.Worker.StatePath) == "" {
-		config.Worker.StatePath = defaults.Worker.StatePath
-	}
-	if strings.TrimSpace(config.Worker.Token) != "" {
-		return Config{}, errors.New("open local: worker token must be empty; local provisions it")
 	}
 	config.ExistingCallerToken = strings.TrimSpace(config.ExistingCallerToken)
 	config.ExistingWorkerToken = strings.TrimSpace(config.ExistingWorkerToken)
@@ -238,11 +239,12 @@ func (config Config) withDefaults() (Config, error) {
 // idempotent. Run owns one Bubble Tea program lifetime; open a new Local to run
 // another program after it returns, matching worker.Worker.
 type Local struct {
-	gateway *gateway.Server
-	worker  *worker.Worker
+	gateway      *gateway.Server
+	gatewayWSURL string
 
 	// Web human-side composition, populated only in web mode.
 	webBridge       *workerbridge.Bridge
+	webMirror       *fsmirror.Mirror
 	webWorker       *workerkit.Worker
 	webServer       *web.Server
 	webHTTP         *http.Server
@@ -391,8 +393,7 @@ func Open(ctx context.Context, config Config) (*Local, error) {
 	}
 	go instance.serve()
 
-	config.Worker.GatewayURL = "ws://" + listener.Addr().String() + gateway.WorkerPath
-	config.Worker.Token = instance.credentials.WorkerToken
+	instance.gatewayWSURL = "ws://" + listener.Addr().String() + gateway.WorkerPath
 	if strings.TrimSpace(config.Worker.OutboxScope) == "" {
 		scope, resolveErr := localOutboxScope(config.Gateway.DatabasePath)
 		if resolveErr != nil {
@@ -400,16 +401,8 @@ func Open(ctx context.Context, config Config) (*Local, error) {
 		}
 		config.Worker.OutboxScope = scope
 	}
-	if strings.TrimSpace(config.WebListenAddress) != "" {
-		if err := instance.openWebHumanSide(runContext, config); err != nil {
-			return cleanupFailure(err)
-		}
-	} else {
-		openedWorker, err := worker.Open(runContext, config.Worker)
-		if err != nil {
-			return cleanupFailure(fmt.Errorf("open local worker: %w", err))
-		}
-		instance.worker = openedWorker
+	if err := instance.openWebHumanSide(runContext, config); err != nil {
+		return cleanupFailure(err)
 	}
 
 	select {
@@ -434,7 +427,7 @@ func Open(ctx context.Context, config Config) (*Local, error) {
 // listener with a per-start session token.
 func (local *Local) openWebHumanSide(ctx context.Context, config Config) error {
 	bridge, err := workerbridge.Dial(ctx, workerbridge.Config{
-		URL: config.Worker.GatewayURL, Token: config.Worker.Token,
+		URL: local.gatewayWSURL, Token: local.credentials.WorkerToken,
 		OutboxPath: config.Worker.OutboxPath, OutboxScope: config.Worker.OutboxScope,
 	})
 	if err != nil {
@@ -451,7 +444,25 @@ func (local *Local) openWebHumanSide(ctx context.Context, config Config) error {
 	if err != nil {
 		return fmt.Errorf("acquire local web worker state: %w", err)
 	}
-	webWorker, err := workerkit.Open(ctx, workerkit.Config{Wire: bridge, State: stateStore})
+	mirrorRoot := filepath.Join(config.Worker.MirrorRoot, "web")
+	if err := os.MkdirAll(mirrorRoot, 0o700); err != nil {
+		return fmt.Errorf("create local web mirror root: %w", err)
+	}
+	mirror, err := fsmirror.Open(ctx, fsmirror.Config{
+		Root:         mirrorRoot,
+		Build:        fsmirror.OpenCodeWriteBuilder(),
+		BaselineFile: filepath.Join(filepath.Dir(config.WebStatePath), "workerkit-mirror-baseline.json"),
+	})
+	if err != nil {
+		return fmt.Errorf("open local web mirror: %w", err)
+	}
+	local.webMirror = mirror
+
+	workerConfig := workerkit.Config{Wire: bridge, State: stateStore, Mirror: mirror}
+	if !config.WebDisableAutoTitle {
+		workerConfig.AutoResponder = autoTitleResponder
+	}
+	webWorker, err := workerkit.Open(ctx, workerConfig)
 	if err != nil {
 		return fmt.Errorf("open local web workerkit: %w", err)
 	}
@@ -485,6 +496,35 @@ func (local *Local) openWebHumanSide(ctx context.Context, config Config) error {
 	go func() { _ = local.webHTTP.Serve(webListener) }()
 	local.webURL = "http://" + webListener.Addr().String() + "/?token=" + sessionToken
 	return nil
+}
+
+// autoTitleResponder answers tool-less chat assignments (OpenCode's hidden
+// title/summary generation) with a short title derived from the latest user
+// text, so only real conversation turns reach the human inbox.
+func autoTitleResponder(delivery llm.WorkerAssignmentDelivery) (string, bool) {
+	if len(delivery.Assignment.Request.Tools) != 0 ||
+		delivery.Assignment.Task.CapabilityTier != llm.TierChat {
+		return "", false
+	}
+	var latest string
+	for _, message := range delivery.Assignment.Request.Messages {
+		if message.Role != llm.RoleUser {
+			continue
+		}
+		for _, block := range message.Blocks {
+			if block.Type == llm.BlockText && strings.TrimSpace(block.Text) != "" {
+				latest = block.Text
+			}
+		}
+	}
+	title := strings.TrimSpace(strings.SplitN(latest, "\n", 2)[0])
+	if runes := []rune(title); len(runes) > 60 {
+		title = string(runes[:60])
+	}
+	if title == "" {
+		title = "Conversation"
+	}
+	return title, true
 }
 
 // WebURL returns the browser login URL (including the one-time session token)
@@ -573,38 +613,13 @@ func (local *Local) Gateway() *gateway.Server {
 	return local.gateway
 }
 
-// Worker returns the in-process Human worker.
-func (local *Local) Worker() *worker.Worker {
+// WebWorker returns the in-process workerkit Worker behind the browser UI,
+// for embedders that add their own surfaces next to the official web one.
+func (local *Local) WebWorker() *workerkit.Worker {
 	if local == nil {
 		return nil
 	}
-	return local.worker
-}
-
-// Model returns the worker's Bubble Tea model.
-func (local *Local) Model() tea.Model {
-	if local == nil || local.worker == nil {
-		return nil
-	}
-	return local.worker.Model()
-}
-
-// Run starts the stock worker TUI. It stops when either ctx or the Local
-// lifecycle ends.
-func (local *Local) Run(ctx context.Context, options ...tea.ProgramOption) (tea.Model, error) {
-	if local == nil || local.worker == nil {
-		return nil, errors.New("run local: local instance is not open")
-	}
-	if ctx == nil {
-		return nil, errors.New("run local: context is required")
-	}
-	runContext, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(local.runContext, cancel)
-	defer func() {
-		stop()
-		cancel()
-	}()
-	return local.worker.Run(runContext, options...)
+	return local.webWorker
 }
 
 // Wait waits for the embedded HTTP server to stop and reports an unexpected
@@ -646,11 +661,6 @@ func (local *Local) Close() error {
 				closeErrors = append(closeErrors, fmt.Errorf("close local listener: %w", err))
 			}
 		}
-		if local.worker != nil {
-			if err := local.worker.Close(); err != nil {
-				closeErrors = append(closeErrors, fmt.Errorf("close local worker: %w", err))
-			}
-		}
 		if local.webHTTP != nil {
 			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
 			if err := local.webHTTP.Shutdown(shutdownContext); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -675,6 +685,11 @@ func (local *Local) Close() error {
 				closeErrors = append(closeErrors, fmt.Errorf("close local web workerkit: %w", err))
 			}
 			shutdownCancel()
+		}
+		if local.webMirror != nil {
+			if err := local.webMirror.Close(); err != nil {
+				closeErrors = append(closeErrors, fmt.Errorf("close local web mirror: %w", err))
+			}
 		}
 		if local.webBridge != nil {
 			if err := local.webBridge.Close(); err != nil {

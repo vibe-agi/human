@@ -130,18 +130,7 @@ func TestRealOpenCodeWorkspaceWebDoor(t *testing.T) {
 	mirror, err := fsmirror.Open(t.Context(), fsmirror.Config{
 		Root: mirrorRoot, Debounce: 100 * time.Millisecond,
 		BaselineFile: filepath.Join(t.TempDir(), "baseline.json"),
-		Build: func(change workerkit.Change, content []byte, _ []llm.Tool) ([]llm.ToolCall, error) {
-			if change.Kind == workerkit.ChangeDelete {
-				return nil, fmt.Errorf("delete is not mapped in this door")
-			}
-			return []llm.ToolCall{{
-				ID: "call-" + change.ID, Name: "write",
-				Input: map[string]any{
-					"filePath": filepath.Join(workspace, filepath.FromSlash(change.Path)),
-					"content":  string(content),
-				},
-			}}, nil
-		},
+		Build: fsmirror.OpenCodeWriteBuilder(),
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -16,7 +16,6 @@ import (
 
 	"github.com/vibe-agi/human/gateway"
 	"github.com/vibe-agi/human/internal/userdata"
-	"github.com/vibe-agi/human/worker"
 )
 
 func TestDefaultConfigScopesPrivateStoresOutsideWorkspace(t *testing.T) {
@@ -38,13 +37,13 @@ func TestDefaultConfigScopesPrivateStoresOutsideWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantState, err := userdata.WorkspacePath("local", workspace, "worker-state.db")
+	wantState, err := userdata.WorkspacePath("local", workspace, "workerkit-state.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Gateway.DatabasePath != wantGateway || config.Worker.OutboxPath != wantOutbox || config.Worker.StatePath != wantState {
+	if config.Gateway.DatabasePath != wantGateway || config.Worker.OutboxPath != wantOutbox || config.WebStatePath != wantState {
 		t.Fatalf("local private defaults = %q / %q / %q, want %q / %q / %q",
-			config.Gateway.DatabasePath, config.Worker.OutboxPath, config.Worker.StatePath,
+			config.Gateway.DatabasePath, config.Worker.OutboxPath, config.WebStatePath,
 			wantGateway, wantOutbox, wantState)
 	}
 	if config.IssuedCredentialPolicy != IssuedCredentialsRevokeOnClose {
@@ -97,14 +96,15 @@ func TestOpenConnectsWorkerServesCallerAndClosesIdempotently(t *testing.T) {
 	}
 	config := Config{
 		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
-		Worker: worker.Config{
+		Worker: WorkerPaths{
 			MirrorRoot: filepath.Join(root, "mirror"),
 			OutboxPath: filepath.Join(privateRoot, "outbox.db"),
-			StatePath:  filepath.Join(privateRoot, "state.db"),
 		},
-		ListenAddress: "127.0.0.1:0",
-		CallerSubject: "test-caller",
-		WorkerSubject: "test-worker",
+		ListenAddress:    "127.0.0.1:0",
+		WebListenAddress: "127.0.0.1:0",
+		WebStatePath:     filepath.Join(privateRoot, "workerkit-state.db"),
+		CallerSubject:    "test-caller",
+		WorkerSubject:    "test-worker",
 	}
 
 	instance, err := Open(context.Background(), config)
@@ -117,7 +117,7 @@ func TestOpenConnectsWorkerServesCallerAndClosesIdempotently(t *testing.T) {
 			_ = instance.Close()
 		}
 	})
-	if instance.Worker() == nil || instance.Model() == nil || instance.Gateway() == nil {
+	if instance.WebWorker() == nil || instance.Gateway() == nil {
 		t.Fatal("local instance did not expose all embedded components")
 	}
 	if instance.CallerToken() == "" {
@@ -233,12 +233,13 @@ func TestOpenExplicitlyPreservesAndReusesExistingCredentials(t *testing.T) {
 	}
 	config := Config{
 		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
-		Worker: worker.Config{
+		Worker: WorkerPaths{
 			MirrorRoot: filepath.Join(root, "mirror"),
 			OutboxPath: filepath.Join(privateRoot, "outbox.db"),
-			StatePath:  filepath.Join(privateRoot, "state.db"),
 		},
 		ListenAddress:          "127.0.0.1:0",
+		WebListenAddress:       "127.0.0.1:0",
+		WebStatePath:           filepath.Join(privateRoot, "workerkit-state.db"),
 		CallerSubject:          "stable-caller",
 		WorkerSubject:          "stable-worker",
 		IssuedCredentialPolicy: IssuedCredentialsPreserve,
@@ -347,14 +348,15 @@ func TestOpenUsesCredentialProviderBeforeStartingWorker(t *testing.T) {
 	providerCalled := false
 	config := Config{
 		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
-		Worker: worker.Config{
+		Worker: WorkerPaths{
 			MirrorRoot: filepath.Join(root, "mirror"),
 			OutboxPath: filepath.Join(privateRoot, "outbox.db"),
-			StatePath:  filepath.Join(privateRoot, "state.db"),
 		},
-		ListenAddress: "127.0.0.1:0",
-		CallerSubject: "provided-caller",
-		WorkerSubject: "provided-worker",
+		ListenAddress:    "127.0.0.1:0",
+		WebListenAddress: "127.0.0.1:0",
+		WebStatePath:     filepath.Join(privateRoot, "workerkit-state.db"),
+		CallerSubject:    "provided-caller",
+		WorkerSubject:    "provided-worker",
 	}
 	config.CredentialProvider = func(ctx context.Context, server *gateway.Server) (Credentials, error) {
 		providerCalled = true
@@ -406,10 +408,9 @@ func TestOpenRejectsCustomAuthenticatorAndNonLoopbackListener(t *testing.T) {
 	root := t.TempDir()
 	base := Config{
 		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
-		Worker: worker.Config{
-			MirrorRoot:   filepath.Join(root, "mirror"),
-			OutboxPath:   filepath.Join(root, "outbox.db"),
-			DisableState: true,
+		Worker: WorkerPaths{
+			MirrorRoot: filepath.Join(root, "mirror"),
+			OutboxPath: filepath.Join(root, "outbox.db"),
 		},
 	}
 	customAuth := base
@@ -452,13 +453,13 @@ func TestDefaultConfigUsesEmbeddableComponentDefaults(t *testing.T) {
 	if config.ListenAddress != DefaultListenAddress {
 		t.Fatalf("listen address = %q", config.ListenAddress)
 	}
-	if config.Gateway.Authenticator != nil || config.Worker.Token != "" {
-		t.Fatal("default local config unexpectedly contains external auth or plaintext credentials")
+	if config.Gateway.Authenticator != nil {
+		t.Fatal("default local config unexpectedly contains external auth")
 	}
 	for label, path := range map[string]string{
 		"mirror": config.Worker.MirrorRoot,
 		"outbox": config.Worker.OutboxPath,
-		"state":  config.Worker.StatePath,
+		"state":  config.WebStatePath,
 	} {
 		if !filepath.IsAbs(path) {
 			t.Fatalf("%s path = %q, want absolute", label, path)

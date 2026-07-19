@@ -56,6 +56,12 @@ type Config struct {
 	// Mirror optionally enables the Live Workspace review/delivery surface.
 	// Without it, DeliverChanges and DiscardChanges fail with ErrNoMirror.
 	Mirror Mirror
+	// AutoResponder optionally answers an assignment without human attention:
+	// returning (text, true) confirms the assignment and delivers text as the
+	// final event, and the item never reaches the inbox. Products use it for
+	// caller housekeeping requests (e.g. OpenCode's tool-less title
+	// generation). A failed auto-response falls back to the inbox.
+	AutoResponder func(llm.WorkerAssignmentDelivery) (string, bool)
 	// Clock supplies transcript timestamps. Nil uses time.Now.
 	Clock func() time.Time
 	// IDs allocates event and delivery identifiers. Nil uses crypto/rand. The
@@ -66,11 +72,12 @@ type Config struct {
 // Worker is the headless human-side domain object. All methods are safe for
 // concurrent use; commands are serialized internally.
 type Worker struct {
-	wire   Wire
-	state  StateStore
-	mirror Mirror
-	now    func() time.Time
-	ids    func(kind string) (string, error)
+	wire          Wire
+	state         StateStore
+	mirror        Mirror
+	autoResponder func(llm.WorkerAssignmentDelivery) (string, bool)
+	now           func() time.Time
+	ids           func(kind string) (string, error)
 
 	mu            sync.Mutex
 	inbox         []InboxItem
@@ -115,7 +122,8 @@ func Open(ctx context.Context, config Config) (*Worker, error) {
 	}
 	loopCtx, loopCancel := context.WithCancel(context.Background())
 	worker := &Worker{
-		wire: config.Wire, state: config.State, mirror: config.Mirror, now: now, ids: ids,
+		wire: config.Wire, state: config.State, mirror: config.Mirror,
+		autoResponder: config.AutoResponder, now: now, ids: ids,
 		inboxRequests: make(map[llm.WorkerDeliveryID]llm.Request),
 		conversations: make(map[ConversationKey]*Conversation, len(restored)),
 		notifications: make(chan struct{}, 1),
@@ -265,34 +273,48 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 			_ = worker.wire.ConfirmAssignment(worker.loopCtx, delivery.ID)
 			return
 		}
-		// Caller continuation for a live conversation: resume it.
-		settlement := worker.resumeLocked(conversation, delivery)
-		saved := *conversation
+		// Caller continuation for a live conversation. The resume is prepared on
+		// a copy and becomes command-visible only after the conversation is
+		// durably saved, the assignment is confirmed, and the mirror settled:
+		// otherwise a command could bind events to a not-yet-acknowledged
+		// assignment and be NACKed.
+		resumed := cloneConversation(*conversation)
 		worker.mu.Unlock()
-		if err := worker.state.SaveConversation(worker.loopCtx, cloneConversation(saved)); err != nil {
-			// Fail closed: without a durable resume the assignment must replay,
-			// so it is not confirmed and the in-memory resume is rolled back.
-			worker.mu.Lock()
-			restored, stillThere := worker.conversations[key]
-			if stillThere {
-				restored.Phase = PhaseAwaitingResults
-				if len(restored.ParkedCalls) == 0 {
-					restored.Phase = PhaseAwaitingCaller
-				}
-			}
-			worker.mu.Unlock()
+		settlement := worker.resumeInto(&resumed, delivery)
+		if err := worker.state.SaveConversation(worker.loopCtx, cloneConversation(resumed)); err != nil {
+			// Fail closed: without a durable resume the assignment must replay
+			// unconfirmed; the visible conversation was never touched.
 			worker.notify()
 			return
 		}
 		_ = worker.wire.ConfirmAssignment(worker.loopCtx, delivery.ID)
 		if settlement != nil && worker.mirror != nil {
-			// Settlement follows the durable resume; Settle is idempotent, so a
-			// crash between save and this call re-settles on the next result
-			// replay rather than losing or double-advancing the baseline.
+			// Settle is idempotent, so a crash between save and this call
+			// re-settles on the next result replay rather than losing or
+			// double-advancing the baseline.
 			_ = worker.mirror.Settle(worker.loopCtx, *settlement)
 		}
+		worker.mu.Lock()
+		if current, stillThere := worker.conversations[key]; stillThere {
+			resumed.Draft = current.Draft
+			worker.conversations[key] = &resumed
+		}
+		worker.mu.Unlock()
 		worker.notify()
 		return
+	}
+
+	// Auto-answered housekeeping never reaches the human.
+	if worker.autoResponder != nil {
+		if text, handled := worker.autoResponder(llm.CloneWorkerAssignmentDelivery(delivery)); handled {
+			worker.mu.Unlock()
+			if worker.autoFinal(delivery, text) {
+				worker.notify()
+				return
+			}
+			// Fall back to the inbox on any auto-response failure.
+			worker.mu.Lock()
+		}
 	}
 
 	// Fresh work (or a caller reusing a terminal task id): inbox.
@@ -309,6 +331,22 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 	worker.notify()
 }
 
+// autoFinal confirms and finals one auto-answered assignment. It reports
+// whether both steps durably succeeded.
+func (worker *Worker) autoFinal(delivery llm.WorkerAssignmentDelivery, text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	if err := worker.wire.ConfirmAssignment(worker.loopCtx, delivery.ID); err != nil {
+		return false
+	}
+	event, err := worker.buildEvent(delivery, llm.Event{Type: llm.EventFinal, Text: text})
+	if err != nil {
+		return false
+	}
+	return worker.wire.SendEvent(worker.loopCtx, event) == nil
+}
+
 // pendingAssignments lazily allocates the delivery cache used by Accept and
 // Reject. Guarded by worker.mu.
 func (worker *Worker) pendingAssignments() map[llm.WorkerDeliveryID]llm.WorkerAssignmentDelivery {
@@ -318,9 +356,9 @@ func (worker *Worker) pendingAssignments() map[llm.WorkerDeliveryID]llm.WorkerAs
 	return worker.pending
 }
 
-// resumeLocked folds a caller continuation into the conversation and returns
-// the mirror settlement earned by a fully successful delivered batch, if any.
-func (worker *Worker) resumeLocked(conversation *Conversation, delivery llm.WorkerAssignmentDelivery) *MirrorSettlement {
+// resumeInto folds a caller continuation into the conversation copy and
+// returns the mirror settlement earned by a fully successful delivered batch.
+func (worker *Worker) resumeInto(conversation *Conversation, delivery llm.WorkerAssignmentDelivery) *MirrorSettlement {
 	now := worker.now().UTC()
 	var settlement *MirrorSettlement
 	if len(conversation.ParkedCalls) > 0 {
@@ -563,10 +601,13 @@ func (worker *Worker) DeliverChanges(ctx context.Context, key ConversationKey, c
 		return fmt.Errorf("%w: %v is %s", ErrConversationNotActive, key, phase)
 	}
 	tools := append([]llm.Tool(nil), conversation.Assignment.Assignment.Request.Tools...)
+	root := conversation.Assignment.Assignment.Task.WorkspaceRoot
 	worker.mu.Unlock()
 
 	calls, err := worker.mirror.Resolve(ctx, MirrorResolve{
-		ChangeIDs: append([]string(nil), changeIDs...), Tools: tools,
+		ChangeIDs:     append([]string(nil), changeIDs...),
+		Tools:         tools,
+		WorkspaceRoot: root,
 	})
 	if err != nil {
 		return fmt.Errorf("workerkit: resolve reviewed changes: %w", err)

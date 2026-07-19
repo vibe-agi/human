@@ -14,7 +14,6 @@ import (
 	"github.com/spf13/viper"
 	"github.com/vibe-agi/human/internal/gatewaycmd"
 	"github.com/vibe-agi/human/internal/userdata"
-	workerlib "github.com/vibe-agi/human/worker"
 )
 
 const automaticPrivatePath = "auto"
@@ -43,7 +42,7 @@ func New() *cobra.Command {
 	for key, name := range map[string]string{
 		"gateway.url": "gateway", "gateway.token_file": "token-file",
 		"workspace.mirror_root": "mirror-root", "workspace.auto_send": "workspace-auto-send",
-		"worker.outbox": "outbox", "worker.state_db": "state-db",
+		"worker.outbox": "outbox", "worker.state_db": "state-db", "worker.web": "web",
 	} {
 		mustBind(settings, key, workerCommand.Flags().Lookup(name))
 	}
@@ -63,7 +62,8 @@ func addWorkerFlags(flags *pflag.FlagSet) {
 	flags.String("mirror-root", "~/mirror", "worker-local workspace mirror root")
 	flags.Bool("workspace-auto-send", false, "send clean mirror changes after live detection and fresh review")
 	flags.String("outbox", automaticPrivatePath, "private SQLite outbox; auto uses the OS user-data directory")
-	flags.String("state-db", automaticPrivatePath, "private SQLite TUI recovery state; auto uses OS user data, empty disables persistence")
+	flags.String("state-db", automaticPrivatePath, "reserved; legacy TUI state flag kept for config compatibility")
+	flags.String("web", "", "loopback address of the browser human side (default 127.0.0.1:19082)")
 }
 
 func run(ctx context.Context, settings *viper.Viper) error {
@@ -87,17 +87,12 @@ func run(ctx context.Context, settings *viper.Viper) error {
 	if err != nil {
 		return err
 	}
-	worker, err := workerlib.Open(ctx, workerlib.Config{
-		GatewayURL: url, Token: token, MirrorRoot: mirrorRoot,
-		OutboxPath: outboxPath, StatePath: statePath, DisableState: statePath == "",
-		WorkspaceAutoSend: settings.GetBool("workspace.auto_send"),
-	})
-	if err != nil {
-		return err
+	_ = statePath
+	webAddress := strings.TrimSpace(settings.GetString("worker.web"))
+	if webAddress == "" {
+		webAddress = "127.0.0.1:19082"
 	}
-	defer worker.Close()
-	_, err = worker.Run(ctx)
-	return err
+	return runWebWorker(ctx, url, token, mirrorRoot, outboxPath, webAddress)
 }
 
 func resolveMirrorRoot(value string) (string, error) {

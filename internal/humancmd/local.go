@@ -18,7 +18,6 @@ import (
 	"github.com/vibe-agi/human/gateway"
 	"github.com/vibe-agi/human/internal/userdata"
 	localruntime "github.com/vibe-agi/human/local"
-	"github.com/vibe-agi/human/worker"
 )
 
 const localCredentialVersion = 1
@@ -52,7 +51,7 @@ type localCredentialAuthority interface {
 
 func newLocalCommand(settings *viper.Viper) *cobra.Command {
 	command := &cobra.Command{
-		Use: "local", Short: "run gateway, SQLite, and Human TUI in one process",
+		Use: "local", Short: "run gateway, SQLite, and the browser human side in one process",
 		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			return runLocal(command.Context(), command.OutOrStdout(), settings)
@@ -66,7 +65,7 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 	flags.Duration("max-pending", 10*time.Minute, "maximum time waiting for a Human response")
 	flags.Duration("shutdown-timeout", 10*time.Second, "graceful local shutdown timeout")
 	flags.Bool("reset-credentials", false, "rotate the persisted local caller and worker credentials")
-	flags.String("web", "", "serve the browser human side on this loopback address instead of the terminal TUI (e.g. 127.0.0.1:19081)")
+	flags.String("web", "", "loopback address of the browser human side (default 127.0.0.1:19081)")
 	persistent := command.PersistentFlags()
 	persistent.String("workspace", ".", "workspace used to isolate local private state; nearest Git root is selected")
 	persistent.String("db", automaticPrivatePath, "embedded SQLite database; auto uses OS user data isolated by workspace")
@@ -186,10 +185,8 @@ func runLocal(ctx context.Context, output io.Writer, settings *viper.Viper) erro
 			StreamWriteTimeout: settings.GetDuration("local.stream_write_timeout"),
 			MaxPending:         settings.GetDuration("local.max_pending"),
 		},
-		Worker: worker.Config{
+		Worker: localruntime.WorkerPaths{
 			MirrorRoot: mirrorRoot, OutboxPath: outboxPath,
-			StatePath: statePath, DisableState: statePath == "",
-			WorkspaceAutoSend: settings.GetBool("local.workspace_auto_send"),
 		},
 		ListenAddress:   settings.GetString("local.listen"),
 		CallerSubject:   settings.GetString("local.caller_subject"),
@@ -197,6 +194,10 @@ func runLocal(ctx context.Context, output io.Writer, settings *viper.Viper) erro
 		ShutdownTimeout:  settings.GetDuration("local.shutdown_timeout"),
 		WebListenAddress: settings.GetString("local.web"),
 	}
+	if strings.TrimSpace(config.WebListenAddress) == "" {
+		config.WebListenAddress = "127.0.0.1:19081"
+	}
+	_ = statePath
 
 	// Rotation runs against the same recovered gateway Local will serve, before
 	// its HTTP listener or worker starts. A prepared pair is first fsynced into
@@ -233,21 +234,15 @@ func runLocal(ctx context.Context, output io.Writer, settings *viper.Viper) erro
 
 	fmt.Fprintf(output, "Human local is ready\nworkspace scope: %s\nmodel base URL: %s/v1\ncaller credential: %s\n", workspaceRoot, instance.BaseURL(), credentialPath)
 	fmt.Fprintln(output, "in the same workspace: export HUMAN_CALLER_TOKEN=\"$(human local credentials --workspace . --token-only)\"")
-	if webURL := instance.WebURL(); webURL != "" {
-		fmt.Fprintf(output, "human side (browser): %s\n", webURL)
-		waitContext, waitCancel := context.WithCancel(ctx)
-		defer waitCancel()
-		waitDone := make(chan error, 1)
-		go func() { waitDone <- instance.Wait() }()
-		select {
-		case err := <-waitDone:
-			return err
-		case <-waitContext.Done():
-			return nil
-		}
+	fmt.Fprintf(output, "human side (browser): %s\n", instance.WebURL())
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- instance.Wait() }()
+	select {
+	case err := <-waitDone:
+		return err
+	case <-ctx.Done():
+		return nil
 	}
-	_, err = instance.Run(ctx)
-	return err
 }
 
 func resolveLocalWorkspace(value string) (string, error) {

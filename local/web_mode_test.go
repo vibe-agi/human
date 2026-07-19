@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/vibe-agi/human/gateway"
-	"github.com/vibe-agi/human/worker"
 )
 
 // TestOpenWebModeServesBrowserHumanSide proves the migrated product path: the
@@ -29,10 +28,9 @@ func TestOpenWebModeServesBrowserHumanSide(t *testing.T) {
 	}
 	config := Config{
 		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
-		Worker: worker.Config{
+		Worker: WorkerPaths{
 			MirrorRoot: filepath.Join(root, "mirror"),
 			OutboxPath: filepath.Join(privateRoot, "outbox.db"),
-			StatePath:  filepath.Join(privateRoot, "state.db"),
 		},
 		ListenAddress:    "127.0.0.1:0",
 		WebListenAddress: "127.0.0.1:0",
@@ -46,8 +44,8 @@ func TestOpenWebModeServesBrowserHumanSide(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = instance.Close() })
 
-	if instance.Worker() != nil || instance.Model() != nil {
-		t.Fatal("web mode must not compose the terminal TUI")
+	if instance.WebWorker() == nil {
+		t.Fatal("web mode did not compose the workerkit human side")
 	}
 	webURL := instance.WebURL()
 	if !strings.HasPrefix(webURL, "http://127.0.0.1:") || !strings.Contains(webURL, "?token=") {
@@ -113,10 +111,37 @@ func TestOpenWebModeServesBrowserHumanSide(t *testing.T) {
 		}
 	}()
 
-	// The caller: one streamed chat completion through the legacy gateway.
+	// A tool-less request is auto-answered with a derived title and never
+	// reaches the human inbox (OpenCode title-generation behavior).
+	titleContext, cancelTitle := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelTitle()
+	titleBody := []byte(`{"model":"human-expert","stream":true,"messages":[{"role":"user","content":"summarize this conversation title"}]}`)
+	titleRequest, err := http.NewRequestWithContext(
+		titleContext, http.MethodPost, instance.BaseURL()+"/v1/chat/completions", bytes.NewReader(titleBody),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	titleRequest.Header.Set("Authorization", "Bearer "+instance.CallerToken())
+	titleRequest.Header.Set("Content-Type", "application/json")
+	titleRequest.Header.Set("Idempotency-Key", "web-mode-title-1")
+	titleResponse, err := http.DefaultClient.Do(titleRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	titleStream, err := io.ReadAll(titleResponse.Body)
+	_ = titleResponse.Body.Close()
+	if err != nil || titleResponse.StatusCode != http.StatusOK ||
+		!strings.Contains(string(titleStream), "summarize this conversation title") {
+		t.Fatalf("auto-title response = %d, %v:\n%s", titleResponse.StatusCode, err, titleStream)
+	}
+
+	// The caller: one streamed, tool-declaring chat completion (a real turn).
 	requestContext, cancelRequest := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancelRequest()
-	body := []byte(`{"model":"human-expert","stream":true,"messages":[{"role":"user","content":"please answer"}]}`)
+	body := []byte(`{"model":"human-expert","stream":true,` +
+		`"tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"object"}}}],` +
+		`"messages":[{"role":"user","content":"please answer"}]}`)
 	chatRequest, err := http.NewRequestWithContext(
 		requestContext, http.MethodPost, instance.BaseURL()+"/v1/chat/completions", bytes.NewReader(body),
 	)

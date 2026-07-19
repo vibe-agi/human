@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -21,10 +22,8 @@ import (
 	"testing"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
 	"github.com/vibe-agi/human/gateway"
 	"github.com/vibe-agi/human/internal/completion/adapter"
-	"github.com/vibe-agi/human/worker"
 )
 
 // TestRealOpenCodeRecoversAcrossNetworkFaultMatrix is the real-client transport
@@ -34,6 +33,8 @@ import (
 // HUMAN_REAL_OPENCODE_NETWORK_DROPS. OpenCode must retry the byte-identical request, the
 // gateway must replay the same durable response rather than enqueueing a second
 // assignment, and the original Human turn must finish without duplicate text.
+//
+// The human side is driven exclusively through the local web HTTP API.
 //
 // It is opt-in because it requires the exact captured OpenCode binary:
 //
@@ -123,14 +124,15 @@ func runRealOpenCodeNetworkScenario(t *testing.T, binary string, scenario realOp
 			HeartbeatInterval: 100 * time.Millisecond,
 			MaxPending:        maxPending,
 		},
-		Worker: worker.Config{
+		Worker: WorkerPaths{
 			MirrorRoot: mirrorRoot,
 			OutboxPath: filepath.Join(privateRoot, "worker-outbox.db"),
-			StatePath:  filepath.Join(privateRoot, "worker-state.db"),
 		},
-		ListenAddress: "127.0.0.1:0",
-		CallerSubject: "network-e2e-caller",
-		WorkerSubject: "network-e2e-worker",
+		ListenAddress:    "127.0.0.1:0",
+		WebListenAddress: "127.0.0.1:0",
+		WebStatePath:     filepath.Join(privateRoot, "workerkit-state.db"),
+		CallerSubject:    "network-e2e-caller",
+		WorkerSubject:    "network-e2e-worker",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -147,34 +149,63 @@ func runRealOpenCodeNetworkScenario(t *testing.T, binary string, scenario realOp
 	defer faultProxy.Close()
 	writeRealOpenCodeNetworkConfig(t, callerWorkspace, faultProxy.URL, instance.CallerToken())
 
-	inputReader, inputWriter := io.Pipe()
-	defer inputWriter.Close()
-	probe := newTUIViewProbe()
-	program := tea.NewProgram(
-		tuiObservedModel{inner: instance.Model(), probe: probe},
-		tea.WithContext(runContext),
-		tea.WithInput(inputReader),
-		tea.WithOutput(io.Discard),
-		tea.WithoutRenderer(),
-		tea.WithoutSignals(),
-	)
-	programDone := make(chan error, 1)
-	go func() {
-		_, runErr := program.Run()
-		programDone <- runErr
-	}()
-	program.Send(tea.WindowSizeMsg{Width: 160, Height: 48})
-	t.Cleanup(func() {
-		program.Quit()
-		select {
-		case err := <-programDone:
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, tea.ErrProgramKilled) {
-				t.Errorf("stop TUI program: %v", err)
+	// The human side is the web HTTP API: parse the login URL into base and
+	// bearer token, then drive the operator through /api/state, /api/accept,
+	// /api/reply, and /api/final.
+	webURL := instance.WebURL()
+	base := webURL[:strings.Index(webURL, "/?token=")]
+	token := webURL[strings.Index(webURL, "?token=")+len("?token="):]
+	webJSON := func(method, path string, body any) (map[string]any, int) {
+		var reader io.Reader
+		if body != nil {
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
 			}
-		case <-time.After(2 * time.Second):
-			t.Error("TUI program did not stop")
+			reader = bytes.NewReader(encoded)
 		}
-	})
+		request, err := http.NewRequestWithContext(runContext, method, base+path, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+		if body != nil {
+			request.Header.Set("Content-Type", "application/json")
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return nil, 0
+		}
+		defer response.Body.Close()
+		var decoded map[string]any
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		return decoded, response.StatusCode
+	}
+	webState := func() map[string]any {
+		state, status := webJSON(http.MethodGet, "/api/state", nil)
+		if status != http.StatusOK {
+			t.Fatalf("GET /api/state = %d (%v)", status, state)
+		}
+		return state
+	}
+	waitWebState := func(what string, ready func(state map[string]any) bool) map[string]any {
+		t.Helper()
+		var last map[string]any
+		for {
+			state, status := webJSON(http.MethodGet, "/api/state", nil)
+			if status == http.StatusOK {
+				last = state
+				if ready(state) {
+					return state
+				}
+			}
+			select {
+			case <-runContext.Done():
+				t.Fatalf("timed out waiting for %s: %v\nlast web state: %v", what, runContext.Err(), last)
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
 
 	command := exec.CommandContext(runContext, binary, "run", "--pure", "--auto", "--format", "json",
 		"--model", "human-network-e2e/human", "--dir", callerWorkspace,
@@ -199,23 +230,39 @@ func runRealOpenCodeNetworkScenario(t *testing.T, binary string, scenario realOp
 	}()
 
 	// OpenCode may issue a finite auxiliary Chat request beside its Workspace
-	// turn. Finish auxiliaries normally. The proxy classifies the main request by
-	// its declared native bash tool, so no auxiliary response can consume the
-	// single injected failure.
-	for attempts := 0; ; attempts++ {
-		if attempts >= 4 {
-			t.Fatalf("main OpenCode Workspace request never became active\n%s", probe.view())
+	// turn. Local web mode auto-answers tool-less chat requests with a derived
+	// title (auto-title), so auxiliaries never reach the inbox; there is no
+	// auxiliary handling step here. The main Workspace request is classified by
+	// its declared native bash tool, so it arrives with tool_count > 0 and no
+	// auxiliary response can consume the single injected failure.
+	var delivery string
+	waitWebState("the main OpenCode Workspace assignment in the inbox", func(state map[string]any) bool {
+		for _, item := range webInboxItems(state) {
+			if count, _ := item["tool_count"].(float64); count > 0 {
+				delivery, _ = item["delivery"].(string)
+				return delivery != ""
+			}
 		}
-		probe.waitContains(t, runContext, "INBOX")
-		acceptRealOpenCodeRequest(t, runContext, probe, inputWriter)
-		if strings.Contains(probe.view(), "bash · runs on client Agent") {
+		return false
+	})
+
+	// Accept may transiently conflict while a preceding response event is still
+	// being committed; retry until the conversation is ours.
+	var callerID, taskID string
+	for {
+		accepted, status := webJSON(http.MethodPost, "/api/accept", map[string]any{"delivery": delivery})
+		if status == http.StatusOK {
+			key, _ := accepted["key"].(map[string]any)
+			callerID = fmt.Sprint(key["caller"])
+			taskID = fmt.Sprint(key["task_id"])
 			break
 		}
-		writeTUIInput(t, inputWriter, "OpenCode auxiliary request complete")
-		probe.waitContains(t, runContext, "OpenCode auxiliary request complete")
-		_, beforeAuxiliaryFinal := probe.snapshot()
-		writeTUIInput(t, inputWriter, "\x04")
-		probe.waitAfterAny(t, runContext, beforeAuxiliaryFinal, "INBOX", "IDLE")
+		select {
+		case <-runContext.Done():
+			t.Fatalf("accepting the OpenCode Workspace assignment never succeeded: %v (last accept = %d, %v)",
+				runContext.Err(), status, accepted)
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 
 	if scenario.point != faultAfterHumanProgress {
@@ -223,38 +270,49 @@ func runRealOpenCodeNetworkScenario(t *testing.T, binary string, scenario realOp
 		faultProxy.waitForReplay(t, runContext)
 	}
 
-	writeTUIInput(t, inputWriter, progressFragment)
-	probe.waitContains(t, runContext, progressFragment)
-	_, beforeFirstReply := probe.snapshot()
-	writeTUIInput(t, inputWriter, "\r")
-	probe.waitAfterContains(t, runContext, beforeFirstReply, "stream open")
+	if reply, status := webJSON(http.MethodPost, "/api/reply", map[string]any{
+		"caller": callerID, "task_id": taskID, "text": progressFragment,
+	}); status != http.StatusOK {
+		t.Fatalf("POST /api/reply = %d (%v)", status, reply)
+	}
+	waitWebState("the Human progress reply in the transcript", func(state map[string]any) bool {
+		return webTranscriptFragmentCount(state, progressFragment) >= 1
+	})
 	if scenario.point == faultAfterHumanProgress {
 		faultProxy.waitForDrop(t, runContext)
 		faultProxy.waitForReplay(t, runContext)
 	}
 
 	// A transport retry is response replay only. It must not produce another
-	// Inbox item or move the sole active Human turn out of its streaming state.
-	if count := strings.Count(probe.view(), progressFragment); count != 1 {
-		t.Fatalf("TUI displayed the Human progress fragment %d times; want exactly once\n%s", count, probe.view())
+	// Inbox item, another conversation, or a duplicate of the sole Human
+	// progress entry.
+	state := webState()
+	if count := webTranscriptFragmentCount(state, progressFragment); count != 1 {
+		t.Fatalf("web transcript contained the Human progress fragment %d times; want exactly once\n%v", count, state)
 	}
-	if strings.Contains(probe.view(), "INBOX 1") || strings.Contains(probe.view(), "Inbox 1/1") {
-		t.Fatalf("transport retry enqueued a duplicate assignment\n%s", probe.view())
+	if items := webInboxItems(state); len(items) != 0 {
+		t.Fatalf("transport retry enqueued a duplicate assignment\n%v", items)
+	}
+	if conversations := webConversations(state); len(conversations) != 1 {
+		t.Fatalf("transport retry produced %d conversations; want exactly one\n%v", len(conversations), state)
 	}
 
 	finalFragment := "network retry completed " + scenarioID + " in the original Human turn"
-	writeTUIInput(t, inputWriter, finalFragment)
-	probe.waitContains(t, runContext, finalFragment)
-	writeTUIInput(t, inputWriter, "\x04")
+	if final, status := webJSON(http.MethodPost, "/api/final", map[string]any{
+		"caller": callerID, "task_id": taskID, "text": finalFragment,
+	}); status != http.StatusOK {
+		t.Fatalf("POST /api/final = %d (%v)", status, final)
+	}
 
 	var result commandResult
 	select {
 	case result = <-commandDone:
 	case <-runContext.Done():
-		t.Fatalf("real OpenCode network recovery timed out: %v\n%s", runContext.Err(), probe.view())
+		lastState, _ := webJSON(http.MethodGet, "/api/state", nil)
+		t.Fatalf("real OpenCode network recovery timed out: %v\nweb state: %v", runContext.Err(), lastState)
 	}
 	if result.err != nil {
-		t.Fatalf("real OpenCode network recovery failed: %v\n%s\nTUI:\n%s", result.err, result.output, probe.view())
+		t.Fatalf("real OpenCode network recovery failed: %v\n%s", result.err, result.output)
 	}
 	faultProxy.assertExactReplay(t)
 	output := string(result.output)
@@ -265,30 +323,44 @@ func runRealOpenCodeNetworkScenario(t *testing.T, binary string, scenario realOp
 	}
 }
 
-func acceptRealOpenCodeRequest(
-	t *testing.T,
-	ctx context.Context,
-	probe *tuiViewProbe,
-	input io.Writer,
-) {
-	t.Helper()
-	for retries := 0; retries < 5; retries++ {
-		_, beforeAccept := probe.snapshot()
-		writeTUIInput(t, input, "a")
-		probe.waitAfter(t, ctx, beforeAccept, func(content string) bool {
-			return strings.Contains(content, "HUMAN TURN") ||
-				strings.Contains(content, "another response event is still being committed")
-		}, "HUMAN TURN or completion of the preceding response event")
-		if strings.Contains(probe.view(), "HUMAN TURN") {
-			return
+// webInboxItems extracts the inbox rows from a decoded /api/state payload.
+func webInboxItems(state map[string]any) []map[string]any {
+	raw, _ := state["inbox"].([]any)
+	items := make([]map[string]any, 0, len(raw))
+	for _, entry := range raw {
+		if item, ok := entry.(map[string]any); ok {
+			items = append(items, item)
 		}
-		_, blockedRevision := probe.snapshot()
-		probe.waitAfter(t, ctx, blockedRevision, func(content string) bool {
-			return strings.Contains(content, "INBOX") &&
-				!strings.Contains(content, "another response event is still being committed")
-		}, "the preceding response event to finish committing")
 	}
-	t.Fatalf("OpenCode request remained blocked by a preceding response event\n%s", probe.view())
+	return items
+}
+
+// webConversations extracts the conversation rows from a decoded /api/state
+// payload.
+func webConversations(state map[string]any) []map[string]any {
+	raw, _ := state["conversations"].([]any)
+	conversations := make([]map[string]any, 0, len(raw))
+	for _, entry := range raw {
+		if conversation, ok := entry.(map[string]any); ok {
+			conversations = append(conversations, conversation)
+		}
+	}
+	return conversations
+}
+
+// webTranscriptFragmentCount counts occurrences of fragment across every
+// transcript entry of every conversation in a decoded /api/state payload.
+func webTranscriptFragmentCount(state map[string]any, fragment string) int {
+	count := 0
+	for _, conversation := range webConversations(state) {
+		transcript, _ := conversation["transcript"].([]any)
+		for _, entry := range transcript {
+			entryMap, _ := entry.(map[string]any)
+			text, _ := entryMap["text"].(string)
+			count += strings.Count(text, fragment)
+		}
+	}
+	return count
 }
 
 func writeRealOpenCodeNetworkConfig(t *testing.T, workspace, baseURL, callerToken string) {

@@ -89,7 +89,7 @@ make fault-test FAULT_COUNT=3
 安装精确 OpenCode 1.17.18 后，再跑两个真实客户端门：
 
 ```sh
-make real-opencode-tui-test REAL_COUNT=3
+make real-opencode-web-test REAL_COUNT=3
 # REAL_NETWORK_DROPS defaults to 5; release repeats the whole matrix 3 times.
 make real-opencode-network-test REAL_COUNT=3
 # Extra race probe for the same three real-network scenarios:

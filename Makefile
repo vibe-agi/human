@@ -1,4 +1,4 @@
-.PHONY: all build test fault-test formal-check real-opencode-tui-test real-opencode-network-test release-build release-semantics-test release-build-contract-test fmt fmt-check tidy-check vet check
+.PHONY: all build test fault-test formal-check real-opencode-web-test real-opencode-network-test release-build release-semantics-test release-build-contract-test fmt fmt-check tidy-check vet check
 
 GO_FILES := $(shell git ls-files --cached --others --exclude-standard -- '*.go')
 FAULT_COUNT ?= 1
@@ -26,8 +26,9 @@ fault-test:
 formal-check:
 	./formal/run-checks.sh
 
-real-opencode-tui-test:
-	HUMAN_REAL_OPENCODE_TUI_E2E=1 go test -count=$(REAL_COUNT) -timeout=2m ./local -run '^TestRealOpenCodeTUIWorkspaceLoop$$' -v
+real-opencode-web-test:
+	HUMAN_REAL_OPENCODE_E2E=1 go test -count=$(REAL_COUNT) -timeout=5m ./local -run '^TestRealOpenCodeLocalWebMode$$' -v
+	HUMAN_REAL_OPENCODE_E2E=1 go test -count=$(REAL_COUNT) -timeout=5m ./web -run '^TestRealOpenCode' -v
 
 real-opencode-network-test:
 	HUMAN_REAL_OPENCODE_NETWORK_E2E=1 HUMAN_REAL_OPENCODE_NETWORK_DROPS=$(REAL_NETWORK_DROPS) go test -count=$(REAL_COUNT) -timeout=8m ./local -run '^TestRealOpenCodeRecoversAcrossNetworkFaultMatrix$$' -v

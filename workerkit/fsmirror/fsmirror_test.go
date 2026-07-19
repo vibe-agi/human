@@ -13,7 +13,7 @@ import (
 	"github.com/vibe-agi/human/workerkit/fsmirror"
 )
 
-func writeBuilder(change workerkit.Change, content []byte, _ []llm.Tool) ([]llm.ToolCall, error) {
+func writeBuilder(change workerkit.Change, content []byte, _ workerkit.MirrorResolve) ([]llm.ToolCall, error) {
 	return []llm.ToolCall{{
 		ID: "call-" + change.ID, Name: "write",
 		Input: map[string]any{"filePath": change.Path, "content": string(content)},

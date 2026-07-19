@@ -41,10 +41,14 @@ func run() error {
 	// client embedded in your application. The token is intentionally never
 	// printed or logged by this example.
 	fmt.Fprintf(os.Stderr, "Human model API listening at %s (credential retained in process)\n", instance.BaseURL())
+	fmt.Fprintf(os.Stderr, "human side (browser): %s\n", instance.WebURL())
 
-	_, runErr := instance.Run(ctx)
-	if errors.Is(runErr, context.Canceled) && ctx.Err() != nil {
-		runErr = nil
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- instance.Wait() }()
+	var runErr error
+	select {
+	case runErr = <-waitDone:
+	case <-ctx.Done():
 	}
 	closeErr := instance.Close()
 	return errors.Join(runErr, closeErr)

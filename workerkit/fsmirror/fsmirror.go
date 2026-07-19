@@ -44,8 +44,38 @@ import (
 
 // BuildFunc maps one confirmed change onto native tool calls. content is the
 // exact file bytes frozen at resolve time (nil for a delete). The builder must
-// only use tools present in the provided declaration list.
-type BuildFunc func(change workerkit.Change, content []byte, tools []llm.Tool) ([]llm.ToolCall, error)
+// only use tools declared in request.Tools; request.WorkspaceRoot is the
+// caller's absolute workspace root for building native absolute paths.
+type BuildFunc func(change workerkit.Change, content []byte, request workerkit.MirrorResolve) ([]llm.ToolCall, error)
+
+// OpenCodeWriteBuilder maps creates and modifies onto OpenCode's native
+// write tool (whole-file content, absolute filePath). Deletes are not mapped.
+func OpenCodeWriteBuilder() BuildFunc {
+	return func(change workerkit.Change, content []byte, request workerkit.MirrorResolve) ([]llm.ToolCall, error) {
+		if change.Kind == workerkit.ChangeDelete {
+			return nil, fmt.Errorf("fsmirror: delete has no mapped native tool")
+		}
+		declared := false
+		for _, tool := range request.Tools {
+			if tool.Namespace == "" && tool.Name == "write" {
+				declared = true
+			}
+		}
+		if !declared {
+			return nil, fmt.Errorf("fsmirror: caller did not declare a write tool")
+		}
+		if request.WorkspaceRoot == "" {
+			return nil, fmt.Errorf("fsmirror: assignment has no workspace root")
+		}
+		return []llm.ToolCall{{
+			ID: "call-" + change.ID, Name: "write",
+			Input: map[string]any{
+				"filePath": filepath.Join(request.WorkspaceRoot, filepath.FromSlash(change.Path)),
+				"content":  string(content),
+			},
+		}}, nil
+	}
+}
 
 var (
 	ErrConfig = errors.New("fsmirror: invalid configuration")
@@ -416,7 +446,7 @@ func (mirror *Mirror) Resolve(ctx context.Context, request workerkit.MirrorResol
 			}
 			content = read
 		}
-		built, err := mirror.build(change, content, request.Tools)
+		built, err := mirror.build(change, content, request)
 		if err != nil {
 			return fail(fmt.Errorf("fsmirror: build calls for %s: %w", change.Path, err))
 		}

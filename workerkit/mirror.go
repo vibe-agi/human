@@ -40,6 +40,9 @@ type Review struct {
 type MirrorResolve struct {
 	ChangeIDs []string
 	Tools     []llm.Tool
+	// WorkspaceRoot is the caller's absolute workspace root from the current
+	// assignment, so builders can produce absolute native paths.
+	WorkspaceRoot string
 }
 
 // MirrorOutcome is the terminal fate of a reviewed change set.

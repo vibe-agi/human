@@ -169,7 +169,7 @@ durable 状态全部在 daemon;关浏览器不丢任务、不断连接。多个 
 | M1 workerkit-core | 接单/回复/final/工具循环 + StateStore conformance + fake wire 故障注入 | **完成**:公共 `workerkit` + memory/sqlite StateStore + `humantest.TestWorkerStateStore`;fake-wire 覆盖重投去重、发送失败重试、拒单顺序、NACK 先持久后确认、32 上限 fail-closed、重启恢复;并以进程内 adapter 驱动真实 `llm.Service` 通过 chat 与 workspace 工具续接闭环 |
 | M2 human web MVP | web 包 + SSE + 会话 token + 嵌入式单文件 UI(en/zh,默认 en) | **完成**:真实 OpenCode 1.17.18 Basic 门通过——CLI 连嵌入内核,人侧全程 web HTTP API,final 逐字回流;另有 Playwright 驱动真实 Chrome 操作页面、GLM 类 LLM 模拟人类专家的浏览器门 |
 | M3 Mirror port 化 | `workerkit.Mirror` port + 官方 `fsmirror` adapter + web Review 面板 | **完成**:baseline 仅在成功 result 回流时推进、失败保持 pending、可选 BaselineFile 跨重启;工具映射 builder 留在宿主侧待 Harness SPI |
-| M4 web 门对齐 → 删除 TUI | web 版真实 OpenCode 门逐项对齐 TUI 门;随后删除 TUI 栈 | **门侧已达成用户流程对齐**:Workspace 档真实门通过——accept、流式回复、`:pull` 字节级 hydration(envelope 解码)、镜像 save→review→confirm、原生 `write` 交付、result 续接、bash+todowrite 批、final、aux chat 隔离,工作树逐字节正确。**删除仍按闸待执行**,见下 |
+| M4 web 门对齐 → 删除 TUI | web 版真实 OpenCode 门逐项对齐 TUI 门;随后删除 TUI 栈 | **完成**:Workspace 档真实门(accept、流式回复、`:pull` 字节级 hydration、镜像 save→review→confirm、原生 `write` 交付、result 续接、bash+todowrite、final、aux 自动应答)、`human local` web 产品门(含同 session 第二 user turn)与三断点真实网络门均已在 web 人侧通过;`internal/tui`、`worker` 包与 TUI 装配已删除,`human local`/`human worker` 只组合 workerkit + web,`make real-opencode-web-test` 取代旧 TUI 门 |
 
 **产品迁移已落地**:`internal/workerbridge` 把 legacy worker WS 方言桥接为公共
 `workerkit.Wire`(确定性桥接 ID 去重重投、ConfirmAssignment ↦ 幂等 accepted
@@ -179,15 +179,16 @@ listener、每次启动一次性 session token、独立 `workerkit-state.db`、C
 拆除。真实 OpenCode 门已通过:CLI 连真实 local 产品(legacy gateway + 签发凭据 +
 真实 WS + durable outbox + 桥),人侧全程 web HTTP API,final 逐字回流。
 
-M4 删除闸的剩余项(不满足前不删):
+删除已执行,诚实边界如下:
 
-1. web 门尚未覆盖:同 session 第二 user turn(`--session`)、local web 装配下的
-   Workspace 档真实门(mirror/fsmirror 尚未接入 `--web` 装配,exact profile 的
-   :pull/preview/confirm 在产品路径未重演)、`REAL_COUNT=3` 连续重复、TUI 门的
-   save-ahead journal 崩溃细节(workerkit 层有等价故障注入,未在真实门重演)。
-2. `human worker --web`(远程拆分模式)尚未提供 web 装配;桥当前只由 local 组合。
-3. 删除本身是大规模机械 churn(worker/local/humancmd 重装配 + 数万行测试随删),
-   须与 08 运维文档、backup/restore 的 worker outbox/state 语义同步修订。
+1. **保留** `internal/workerclient`(桥的传输——legacy gateway 仍讲旧 WS 方言,
+   其删除属于双栈收敛 caller 半边)、`internal/workerstate`(backup manifest
+   依赖)与 `internal/mirror`(gateway exact-profile 门的 worker 仿真)。
+2. workerkit 会话状态(workerkit-state.db)是显示/草稿恢复层,不入 backup
+   archive;correctness(gateway DB、worker outbox)照旧入档。auto-title 自动
+   应答无工具 chat 请求,可用 `WebDisableAutoTitle` 关闭。
+3. 旧 TUI 门的 PTY 键值路径与 save-ahead journal 细节由 workerkit 层故障注入 +
+   web 真实门(REAL_COUNT 可重复)接替;`fault-test` 内部矩阵不变。
 
 Observer(§6)仍未落地,与产品迁移同批实现。
 

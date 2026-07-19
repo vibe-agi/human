@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/vibe-agi/human/gateway"
-	"github.com/vibe-agi/human/worker"
 )
 
 func TestRealOpenCodeLocalWebMode(t *testing.T) {
@@ -47,10 +46,9 @@ func TestRealOpenCodeLocalWebMode(t *testing.T) {
 	}
 	instance, err := Open(context.Background(), Config{
 		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
-		Worker: worker.Config{
+		Worker: WorkerPaths{
 			MirrorRoot: filepath.Join(root, "mirror"),
 			OutboxPath: filepath.Join(privateRoot, "outbox.db"),
-			StatePath:  filepath.Join(privateRoot, "state.db"),
 		},
 		ListenAddress:    "127.0.0.1:0",
 		WebListenAddress: "127.0.0.1:0",
@@ -161,11 +159,43 @@ func TestRealOpenCodeLocalWebMode(t *testing.T) {
 	if runErr != nil {
 		t.Fatalf("real OpenCode failed: %v\n%s", runErr, output)
 	}
-	stopOperator()
 	if !strings.Contains(string(output), "LOCAL-WEB-DOOR-FINAL") {
 		t.Fatalf("OpenCode output lacks the web-delivered final:\n%s", output)
 	}
-	if handled.Load() < 1 {
-		t.Fatalf("web operator handled %d conversations, want at least 1", handled.Load())
+	firstHandled := handled.Load()
+	if firstHandled < 1 {
+		t.Fatalf("web operator handled %d conversations, want at least 1", firstHandled)
+	}
+
+	// Second top-level user turn in the SAME OpenCode session must reach the
+	// human again and complete through the web API.
+	sessionID := ""
+	for _, line := range strings.Split(string(output), "\n") {
+		var event struct {
+			SessionID string `json:"sessionID"`
+		}
+		if json.Unmarshal([]byte(line), &event) == nil && event.SessionID != "" {
+			sessionID = event.SessionID
+			break
+		}
+	}
+	if sessionID == "" {
+		t.Fatalf("no session id in OpenCode output:\n%s", output)
+	}
+	second := exec.CommandContext(ctx, binary, "run", "--pure", "--auto", "--format", "json",
+		"--model", "human-local/human-expert", "--dir", workspace, "--session", sessionID,
+		"Handle this second top-level user turn in the same session.")
+	second.Dir = workspace
+	second.Env = command.Env
+	secondOutput, secondErr := second.CombinedOutput()
+	if secondErr != nil || ctx.Err() != nil {
+		t.Fatalf("second OpenCode turn failed: %v %v\n%s", secondErr, ctx.Err(), secondOutput)
+	}
+	stopOperator()
+	if !strings.Contains(string(secondOutput), "LOCAL-WEB-DOOR-FINAL") {
+		t.Fatalf("second turn lacks the web-delivered final:\n%s", secondOutput)
+	}
+	if handled.Load() <= firstHandled {
+		t.Fatalf("second turn did not reach the web operator (handled %d)", handled.Load())
 	}
 }
