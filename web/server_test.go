@@ -260,6 +260,39 @@ func TestWebAcceptReplyFinalFlow(t *testing.T) {
 	}
 }
 
+func TestWebIndexSetsSecurityHeaders(t *testing.T) {
+	_, _, listener := openWebServer(t)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	response, err := client.Get(listener.URL + "/?token=" + testToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if got := response.Header.Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("Referrer-Policy = %q", got)
+	}
+	if got := response.Header.Get("Content-Security-Policy"); !strings.Contains(got, "frame-ancestors 'none'") {
+		t.Fatalf("CSP = %q", got)
+	}
+	if got := response.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q", got)
+	}
+}
+
+func TestWebCommandErrorDoesNotLeakInternals(t *testing.T) {
+	_, _, listener := openWebServer(t)
+	// An unknown conversation error must not carry the internal key/path text.
+	body := doJSON(t, authedRequest(t, http.MethodPost, listener.URL+"/api/final",
+		map[string]string{"caller": "secret-caller", "task_id": "secret-task", "text": "hi"}), http.StatusNotFound)
+	message, _ := body["message"].(string)
+	if strings.Contains(message, "secret-caller") || strings.Contains(message, "secret-task") ||
+		strings.Contains(message, "workerkit") {
+		t.Fatalf("error message leaked internals: %q", message)
+	}
+}
+
 func TestWebCommandErrorMapping(t *testing.T) {
 	_, _, listener := openWebServer(t)
 

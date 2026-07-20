@@ -250,9 +250,11 @@ function render() {
     const card = document.createElement("div");
     card.className = "card";
     card.innerHTML = `
-      <div class="meta"><span>${item.tier || "chat"}</span><span>${item.task_id}</span></div>
+      <div class="meta"><span class="tier"></span><span class="task"></span></div>
       <div class="preview"></div>
       <div class="actions"></div>`;
+    card.querySelector(".tier").textContent = item.tier || "chat";
+    card.querySelector(".task").textContent = item.task_id || "";
     card.querySelector(".preview").textContent = item.preview || t("noText");
     card.dataset.testid = "inbox-item";
     if (!item.tool_count) {
@@ -288,8 +290,9 @@ function render() {
     const card = document.createElement("div");
     const key = keyOf(conversation);
     card.className = "card" + (sameKey(key, selected) ? " selected" : "");
-    card.innerHTML = `<div class="meta"><span></span><span>${tt("phaseShort", conversation.phase)}</span></div><div class="preview"></div>`;
-    card.querySelector(".meta span").textContent = key.task_id;
+    card.innerHTML = `<div class="meta"><span class="task"></span><span class="phase"></span></div><div class="preview"></div>`;
+    card.querySelector(".task").textContent = key.task_id;
+    card.querySelector(".phase").textContent = tt("phaseShort", conversation.phase);
     const tail = (conversation.transcript || []).at(-1);
     card.querySelector(".preview").textContent = tail ? (tail.text || tt("kind", tail.kind)) : "";
     card.onclick = () => { selected = key; render(); };
@@ -307,13 +310,16 @@ function render() {
       card.className = "card";
       card.innerHTML = `
         <label style="display:flex;gap:8px;align-items:baseline">
-          <input type="checkbox" data-id="${change.id}">
-          <span class="meta"><span>${tt("change", change.kind)}</span></span><span class="path"></span>
+          <input type="checkbox">
+          <span class="meta"><span class="kind"></span></span><span class="path"></span>
         </label>
         <details><summary>diff</summary><pre style="white-space:pre-wrap;font-size:12px"></pre></details>`;
+      const box = card.querySelector("input");
+      box.dataset.id = change.id;
+      box.checked = previous.has(change.id);
+      card.querySelector(".kind").textContent = tt("change", change.kind);
       card.querySelector(".path").textContent = change.path;
       card.querySelector("pre").textContent = change.diff || change.warning || "";
-      card.querySelector("input").checked = previous.has(change.id);
       return card;
     }));
   }

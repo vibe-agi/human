@@ -186,6 +186,7 @@ func (server *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 // handleIndex serves the embedded UI. A one-time ?token=... exchange sets the
 // session cookie and strips the token from the address bar via redirect.
 func (server *Server) handleIndex(response http.ResponseWriter, request *http.Request) {
+	securityHeaders(response)
 	if token := request.URL.Query().Get("token"); token != "" {
 		if subtle.ConstantTimeCompare([]byte(token), []byte(server.token)) != 1 {
 			writeError(response, http.StatusUnauthorized, "unauthenticated", "invalid session token")
@@ -193,7 +194,7 @@ func (server *Server) handleIndex(response http.ResponseWriter, request *http.Re
 		}
 		http.SetCookie(response, &http.Cookie{
 			Name: sessionCookie, Value: token, Path: "/",
-			HttpOnly: true, SameSite: http.SameSiteStrictMode,
+			HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: requestIsHTTPS(request),
 		})
 		http.Redirect(response, request, "/", http.StatusSeeOther)
 		return
@@ -376,25 +377,51 @@ func decodeBody(response http.ResponseWriter, request *http.Request, target any)
 	return true
 }
 
+// writeCommandError maps a domain error to a status and a fixed, generic
+// message. It never forwards err.Error() — downstream wrapping (e.g. fsmirror
+// wraps filesystem paths) must not reach the browser, matching the caller
+// adapter's no-internal-detail convention.
 func writeCommandError(response http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, workerkit.ErrUnknownDelivery), errors.Is(err, workerkit.ErrUnknownConversation),
 		errors.Is(err, workerkit.ErrUnknownChange):
-		writeError(response, http.StatusNotFound, "not_found", err.Error())
+		writeError(response, http.StatusNotFound, "not_found", "the referenced item does not exist")
 	case errors.Is(err, workerkit.ErrConversationTerminal),
 		errors.Is(err, workerkit.ErrConversationNotActive),
 		errors.Is(err, workerkit.ErrTooManyContinuations),
 		errors.Is(err, workerkit.ErrNoMirror):
-		writeError(response, http.StatusConflict, "conflict", err.Error())
+		writeError(response, http.StatusConflict, "conflict", "the command is not valid for the current state")
 	case errors.Is(err, workerkit.ErrInvalidCommand):
-		writeError(response, http.StatusBadRequest, "invalid_command", err.Error())
+		writeError(response, http.StatusBadRequest, "invalid_command", "the command is invalid")
 	case errors.Is(err, workerkit.ErrClosed):
-		writeError(response, http.StatusServiceUnavailable, "closed", err.Error())
+		writeError(response, http.StatusServiceUnavailable, "closed", "the worker is shutting down")
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		writeError(response, http.StatusRequestTimeout, "canceled", "request was canceled")
 	default:
-		writeError(response, http.StatusBadGateway, "transport_failed", err.Error())
+		writeError(response, http.StatusBadGateway, "transport_failed", "the command could not be delivered")
 	}
+}
+
+// securityHeaders hardens the document response: no external resources, no
+// framing, no referrer leak (the login URL carries the session token), and no
+// content-type sniffing.
+func securityHeaders(response http.ResponseWriter) {
+	header := response.Header()
+	header.Set("Referrer-Policy", "no-referrer")
+	header.Set("X-Content-Type-Options", "nosniff")
+	header.Set("Content-Security-Policy",
+		"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "+
+			"img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+}
+
+// requestIsHTTPS reports whether the request reached the daemon over TLS,
+// directly or through a host-owned reverse proxy, so the session cookie can be
+// marked Secure without breaking the loopback plaintext default.
+func requestIsHTTPS(request *http.Request) bool {
+	if request.TLS != nil {
+		return true
+	}
+	return request.Header.Get("X-Forwarded-Proto") == "https"
 }
 
 func writeError(response http.ResponseWriter, status int, code, message string) {
