@@ -346,25 +346,26 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 	worker.notify()
 }
 
-// autoFinal answers one assignment with a final event. It sends before
-// confirming — the same ordering as Reject — so a failure returns false only
-// when nothing was delivered, and the caller safely falls back to the inbox.
-// Once the final is durably owned by the transport the task is answered, so a
-// later confirm failure (harmless redelivery, deduplicated by the core) does
-// not undo it.
+// autoFinal answers one assignment with a final event. Confirm precedes send
+// because a final is only valid after the assignment is accepted (the legacy
+// bridge maps ConfirmAssignment to the accepted event the gateway state
+// machine requires before any final; an in-process wire is order-agnostic). A
+// send failure falls back to the inbox; the assignment is already accepted, so
+// the transport redelivers it — on this session or, after a crash, on the next
+// worker session — and the auto-responder answers again rather than losing the
+// task. The inbox is a transient convenience for the crash-free case.
 func (worker *Worker) autoFinal(delivery llm.WorkerAssignmentDelivery, text string) bool {
 	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	if err := worker.wire.ConfirmAssignment(worker.loopCtx, delivery.ID); err != nil {
 		return false
 	}
 	event, err := worker.buildEvent(delivery, llm.Event{Type: llm.EventFinal, Text: text})
 	if err != nil {
 		return false
 	}
-	if err := worker.wire.SendEvent(worker.loopCtx, event); err != nil {
-		return false
-	}
-	_ = worker.wire.ConfirmAssignment(worker.loopCtx, delivery.ID)
-	return true
+	return worker.wire.SendEvent(worker.loopCtx, event) == nil
 }
 
 // pendingAssignments lazily allocates the delivery cache used by Accept and
@@ -677,7 +678,13 @@ func (worker *Worker) DeliverChanges(ctx context.Context, key ConversationKey, c
 	delivery := &PendingDelivery{
 		ChangeIDs: append([]string(nil), changeIDs...), CallIDs: callIDs,
 	}
-	return worker.sendToolCallBatch(ctx, key, calls, delivery)
+	if err := worker.sendToolCallBatch(ctx, key, calls, delivery); err != nil {
+		// The batch never reached the transport; return the resolved changes to
+		// review so they are neither invisible nor silently unsettled.
+		_ = worker.mirror.Cancel(ctx, changeIDs)
+		return err
+	}
+	return nil
 }
 
 // DiscardChanges settles reviewed changes as discarded without delivery.

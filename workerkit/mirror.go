@@ -69,9 +69,13 @@ type MirrorSettlement struct {
 //
 //   - Reviews delivers complete replacement reviews (coalescing is the
 //     implementation's choice); workerkit keeps only the latest.
-//   - Resolve builds native tool calls for selected changes. It has no side
-//     effects: a crash after Resolve but before the event is durably owned by
-//     the transport must leave the changes pending in the next review.
+//   - Resolve builds native tool calls for selected changes and freezes their
+//     exact bytes for the eventual baseline advance, hiding them from review
+//     while in flight. If the delivery is never sent, workerkit calls Cancel
+//     to return them to review; a crash before the event is durably owned by
+//     the transport leaves them for the mirror to reseed into a later review.
+//   - Cancel returns resolved-but-unsent changes to review without advancing
+//     the baseline. It is idempotent and a no-op for unknown ids.
 //   - Settle(MirrorDelivered) is called only after the caller returned
 //     successful results for every call of the batch — never at send time —
 //     so the baseline advances exactly with the caller's working tree.
@@ -83,6 +87,7 @@ type MirrorSettlement struct {
 type Mirror interface {
 	Reviews() <-chan Review
 	Resolve(context.Context, MirrorResolve) ([]llm.ToolCall, error)
+	Cancel(context.Context, []string) error
 	Settle(context.Context, MirrorSettlement) error
 }
 

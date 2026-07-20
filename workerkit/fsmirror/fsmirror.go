@@ -471,6 +471,31 @@ type inflightRecord struct {
 	content []byte
 }
 
+// Cancel implements workerkit.Mirror: it releases resolved-but-unsent changes
+// so they reappear in the next review without advancing the baseline.
+func (mirror *Mirror) Cancel(ctx context.Context, changeIDs []string) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: context is required", ErrConfig)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	mirror.mu.Lock()
+	if mirror.closed {
+		mirror.mu.Unlock()
+		return ErrClosed
+	}
+	for _, id := range changeIDs {
+		if record, resolved := mirror.inflightByID[id]; resolved {
+			delete(mirror.inflight, record.path)
+			delete(mirror.inflightByID, id)
+		}
+	}
+	mirror.mu.Unlock()
+	mirror.publish()
+	return nil
+}
+
 // Settle implements workerkit.Mirror.
 func (mirror *Mirror) Settle(ctx context.Context, settlement workerkit.MirrorSettlement) error {
 	if ctx == nil {

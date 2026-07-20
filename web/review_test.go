@@ -38,6 +38,8 @@ func (mirror *fakeMirror) Settle(_ context.Context, settlement workerkit.MirrorS
 	return nil
 }
 
+func (mirror *fakeMirror) Cancel(context.Context, []string) error { return nil }
+
 func TestWebReviewDeliverAndDiscard(t *testing.T) {
 	wire := newFakeWire()
 	mirror := &fakeMirror{reviews: make(chan workerkit.Review, 4)}

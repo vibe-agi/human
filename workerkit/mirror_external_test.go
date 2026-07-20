@@ -17,6 +17,7 @@ type fakeMirror struct {
 	reviews  chan workerkit.Review
 	resolved [][]string
 	settled  []workerkit.MirrorSettlement
+	canceled []string
 	calls    []llm.ToolCall
 	fail     error
 }
@@ -52,6 +53,13 @@ func (mirror *fakeMirror) Settle(_ context.Context, settlement workerkit.MirrorS
 	mirror.mu.Lock()
 	defer mirror.mu.Unlock()
 	mirror.settled = append(mirror.settled, settlement)
+	return nil
+}
+
+func (mirror *fakeMirror) Cancel(_ context.Context, changeIDs []string) error {
+	mirror.mu.Lock()
+	defer mirror.mu.Unlock()
+	mirror.canceled = append(mirror.canceled, changeIDs...)
 	return nil
 }
 
@@ -189,6 +197,14 @@ func TestWorkerDeliverChangesFailureKeepsChangesPending(t *testing.T) {
 	}
 	if settled := mirror.settlements(); len(settled) != 0 {
 		t.Fatalf("failed delivery settled changes: %+v", settled)
+	}
+	// A failed send must return the resolved change to review via Cancel, not
+	// leave it invisible and unsettled.
+	mirror.mu.Lock()
+	canceled := append([]string(nil), mirror.canceled...)
+	mirror.mu.Unlock()
+	if len(canceled) != 1 || canceled[0] != "change-1" {
+		t.Fatalf("failed delivery did not cancel the change: %v", canceled)
 	}
 	// A retry after the transport recovers succeeds and parks the conversation.
 	if err := worker.DeliverChanges(t.Context(), key, []string{"change-1"}); err != nil {
