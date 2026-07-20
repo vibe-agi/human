@@ -110,4 +110,4 @@ Docs: [goals](docs/01-goals.md), [gateway](docs/02-gateway.md),
 [the human-side stack](docs/11-human-side.md).
 
 Status, honestly: OpenCode 1.17.18 on a single machine is the validated path.
-Codex is partially validated, Claude is codec-only so far.
+Codex is partially validated; Claude Code has a verified basic text loop, workspace tier pending.

@@ -147,8 +147,9 @@ session/幂等 key 派生、hydration 命令构造与回读、任务工具 schem
 
 ### Claude
 
-- 当前只有 Anthropic codec、`TodoWrite` matcher 与仓库测试，没有真实 Claude Code E2E。
-- 待真实验证 Messages stream/nonstream、tool_use/tool_result、Tasks、usage/上下文压缩行为和网络恢复，再决定 exact profile。
+- Claude Code 2.1.215 的 **Basic 文本闭环已真实验证**:真实 `claude -p` 连嵌入内核 `/v1/messages`,人侧全程 web API,final 逐字回流(`web/claude_real_e2e_test.go`,`HUMAN_REAL_CLAUDE_E2E=1`)。
+- 黑盒捕获(2.1.215)已固化的 wire 事实:`POST /v1/messages?beta=true`;`x-api-key` 认证(非 Bearer);不发 `Idempotency-Key`,Stainless SDK 重试时 body 不变、仅 `X-Stainless-Retry-Count` 递增(门用 body 摘要作 retry 身份);`system` 是块数组;顶层携带 `thinking`(enabled+budget)与 `context_management`,builtin codec 均能解码;`metadata.user_id` 内嵌 JSON 含 `session_id`(未来 session 亲和材料);断连时按 SDK 节奏重试直至客户端超时(`X-Stainless-Timeout: 600`)。
+- 待真实验证:tool_use/tool_result 工具闭环、`TodoWrite` 真实同步、部分 SSE 后的重试语义、上下文压缩行为;之后再决定 exact Workspace profile。Basic 门不外推为完整 Claude Code 支持。
 
 ### 其它版本与扩展
 

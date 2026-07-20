@@ -82,4 +82,4 @@ curl 会一直挂着，直到你在浏览器里回复。
 
 文档：[目标](docs/01-goals.md)、[gateway](docs/02-gateway.md)、[嵌入](docs/07-embedding.md)、[运维](docs/08-operations.md)、[TLA+ 模型](docs/09-formal-model.md)、[框架合同](docs/10-framework-contract.md)、[人侧栈](docs/11-human-side.md)。
 
-老实说状态：OpenCode 1.17.18 单机是已验收路径；Codex 部分验证，Claude 目前只有 codec。
+老实说状态：OpenCode 1.17.18 单机是已验收路径；Codex 部分验证；Claude Code 基础文本闭环已真实验证，Workspace 档待做。

@@ -130,7 +130,7 @@ func TestRealOpenCodeWorkspaceWebDoor(t *testing.T) {
 	mirror, err := fsmirror.Open(t.Context(), fsmirror.Config{
 		Root: mirrorRoot, Debounce: 100 * time.Millisecond,
 		BaselineFile: filepath.Join(t.TempDir(), "baseline.json"),
-		Build: fsmirror.OpenCodeWriteBuilder(),
+		Build:        fsmirror.OpenCodeWriteBuilder(),
 	})
 	if err != nil {
 		t.Fatal(err)
