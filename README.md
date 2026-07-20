@@ -1,5 +1,7 @@
 # Human
 
+> The world's slowest LLM. Astonishing reasoning. Terrible latency. Unionized.
+
 An OpenAI/Anthropic-compatible model server where the model is a person.
 
 [简体中文](README.zh-CN.md)

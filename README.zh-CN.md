@@ -1,5 +1,7 @@
 # Human
 
+> 全世界最慢的 LLM。推理能力惊人,延迟感人,还要交社保。
+
 一个 OpenAI/Anthropic 兼容的模型服务,只是模型是个人。
 
 [English](README.md)
