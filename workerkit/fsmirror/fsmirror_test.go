@@ -210,6 +210,31 @@ func TestMirrorBaselinePersistsAcrossReopen(t *testing.T) {
 	_ = context.Background()
 }
 
+func TestMirrorWatchesRapidlyNestedDirectories(t *testing.T) {
+	root := t.TempDir()
+	mirror := openMirror(t, root, "")
+	nextReview(t, mirror, func(workerkit.Review) bool { return true })
+
+	// mkdir -p a/b/c then edit only under the deepest directory: the watch on
+	// the new subtree must be installed so the edit produces a review change.
+	deep := filepath.Join(root, "a", "b", "c")
+	if err := os.MkdirAll(deep, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deep, "deep.txt"), []byte("nested\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	review := nextReview(t, mirror, func(review workerkit.Review) bool {
+		for _, change := range review.Changes {
+			if change.Path == "a/b/c/deep.txt" {
+				return true
+			}
+		}
+		return false
+	})
+	_ = review
+}
+
 func TestMirrorIgnoresGitAndSymlinks(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o700); err != nil {

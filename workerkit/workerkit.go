@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/vibe-agi/human/llm"
 )
@@ -34,6 +35,13 @@ import (
 // The cap is enforced before the tool_calls event is sent, so a full worker
 // fails closed instead of accumulating unresumable state.
 const MaxParkedContinuations = 32
+
+// maxTranscriptTextBytes bounds one transcript entry's display text. Tool
+// results carry full command output, which is otherwise unbounded; capping it
+// keeps a long conversation from growing past a StateStore's per-record limit
+// and livelocking on persistence. The full result still reaches the caller
+// through the wire — the transcript is display state only.
+const maxTranscriptTextBytes = 16 << 10
 
 var (
 	ErrInvalidConfig         = errors.New("workerkit: invalid configuration")
@@ -934,16 +942,28 @@ func extractToolResults(request llm.Request) map[string]toolResult {
 func formatToolOutput(output any) string {
 	switch value := output.(type) {
 	case string:
-		return value
+		return truncateTranscriptText(value)
 	case nil:
 		return ""
 	default:
 		encoded, err := json.Marshal(value)
 		if err != nil {
-			return fmt.Sprintf("%v", value)
+			return truncateTranscriptText(fmt.Sprintf("%v", value))
 		}
-		return string(encoded)
+		return truncateTranscriptText(string(encoded))
 	}
+}
+
+func truncateTranscriptText(text string) string {
+	if len(text) <= maxTranscriptTextBytes {
+		return text
+	}
+	// Cut on a rune boundary at or below the byte cap.
+	cut := maxTranscriptTextBytes
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut] + "…(truncated)"
 }
 
 func requestPreview(request llm.Request) string {

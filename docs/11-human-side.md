@@ -179,6 +179,24 @@ listener、每次启动一次性 session token、独立 `workerkit-state.db`、C
 拆除。真实 OpenCode 门已通过:CLI 连真实 local 产品(legacy gateway + 签发凭据 +
 真实 WS + durable outbox + 桥),人侧全程 web HTTP API,final 逐字回流。
 
+### 已知边界(代码审查记录,非阻塞)
+
+- **Observer/Notifier 缺口**:workerkit 尚无全局 Notifier port。桥接后 legacy
+  worker 的 `OutboxQuarantine` 告警只经 `Bridge.Err()` 暴露,web 不主动展示;
+  第一优先的后续项是给 workerkit 加 Notifier port,让"回复因 outbox 隔离而
+  无法送达"成为人可见告警。
+- **CallerAttributes 深拷贝**:`llm` 内核对 caller 认证属性做顶层浅拷贝
+  (`maps.Clone`)。契约要求策略实现只借用、不修改嵌套值;内核不做深拷贝防护
+  (任意 `map[string]any` 深拷贝昂贵)。ABAC 策略若原地规范化嵌套 slice/map,
+  须自行拷贝。
+- **routeAdmission 升级说明**:多 worker 且未配 `WorkerRouter` 的 admission 从
+  旧的可重试 `503 worker_unavailable` 变为不可重试 `500 worker_router_required`
+  (有意 fail-closed)。曾靠"两 worker 随便挑 + 重试"的部署须显式配置 Router。
+  单 worker 部署无回归。
+- **会话状态非 backup 对象**:workerkit 会话/草稿(workerkit-state.db)是显示/
+  恢复层,不入 `human local backup` archive;correctness(gateway DB、worker
+  outbox)照常入档。会话状态丢失只损失草稿与显示历史,不损失已交付内容。
+
 删除已执行,诚实边界如下:
 
 1. **保留** `internal/workerclient`(桥的传输——legacy gateway 仍讲旧 WS 方言,

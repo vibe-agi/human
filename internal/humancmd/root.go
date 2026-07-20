@@ -63,7 +63,7 @@ func addWorkerFlags(flags *pflag.FlagSet) {
 	flags.Bool("workspace-auto-send", false, "send clean mirror changes after live detection and fresh review")
 	flags.String("outbox", automaticPrivatePath, "private SQLite outbox; auto uses the OS user-data directory")
 	flags.String("state-db", automaticPrivatePath, "reserved; legacy TUI state flag kept for config compatibility")
-	flags.String("web", "", "loopback address of the browser human side (default 127.0.0.1:19082)")
+	flags.String("web", "", "loopback address of the browser human side; the printed login URL carries a per-start session token, so keep it off shared terminals and proxy logs (default 127.0.0.1:19082)")
 }
 
 func run(ctx context.Context, settings *viper.Viper) error {

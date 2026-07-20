@@ -231,7 +231,11 @@ func (mirror *Mirror) run() {
 			}
 			if event.Op&fsnotify.Create != 0 {
 				if info, err := os.Lstat(event.Name); err == nil && info.IsDir() {
-					_ = mirror.watcher.Add(event.Name)
+					// Walk the new subtree, not just its root: mkdir -p a/b can
+					// create b before a's watch is installed, so b's own create
+					// event is missed. Re-adding every descendant (Add is
+					// idempotent) closes that race.
+					_ = mirror.addTree(event.Name)
 				}
 			}
 			if timer == nil {
@@ -269,6 +273,23 @@ func (mirror *Mirror) ignored(path string) bool {
 		}
 	}
 	return false
+}
+
+// addTree adds root and every directory under it to the watcher, ignoring
+// .git. Add is idempotent, so re-adding already-watched directories is safe.
+func (mirror *Mirror) addTree(root string) error {
+	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if mirror.ignored(path) && path != mirror.root {
+				return filepath.SkipDir
+			}
+			return mirror.watcher.Add(path)
+		}
+		return nil
+	})
 }
 
 func (mirror *Mirror) watchTree() error {
@@ -532,10 +553,15 @@ func (mirror *Mirror) Settle(ctx context.Context, settlement workerkit.MirrorSet
 				mirror.baseline[record.path] = record.content
 			}
 		case workerkit.MirrorDiscarded:
-			// Dropping a change accepts the current mirror content as baseline
-			// so it stops appearing without being delivered.
-			content, err := os.ReadFile(filepath.Join(mirror.root, filepath.FromSlash(record.path)))
-			if err != nil {
+			// Dropping a change accepts the current mirror content as baseline so
+			// it stops appearing without being delivered. A warning-only change
+			// (oversize or non-regular, skipped by scan) must not be read whole
+			// into memory/baseline — drop it from the baseline instead.
+			absolute := filepath.Join(mirror.root, filepath.FromSlash(record.path))
+			info, statErr := os.Lstat(absolute)
+			if statErr != nil || !info.Mode().IsRegular() || info.Size() > mirror.maxFileBytes {
+				delete(mirror.baseline, record.path)
+			} else if content, readErr := os.ReadFile(absolute); readErr != nil {
 				delete(mirror.baseline, record.path)
 			} else {
 				mirror.baseline[record.path] = content

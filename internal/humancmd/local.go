@@ -65,7 +65,7 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 	flags.Duration("max-pending", 10*time.Minute, "maximum time waiting for a Human response")
 	flags.Duration("shutdown-timeout", 10*time.Second, "graceful local shutdown timeout")
 	flags.Bool("reset-credentials", false, "rotate the persisted local caller and worker credentials")
-	flags.String("web", "", "loopback address of the browser human side (default 127.0.0.1:19081)")
+	flags.String("web", "", "loopback address of the browser human side; the printed login URL carries a per-start session token, so keep it off shared terminals and proxy logs (default 127.0.0.1:19081)")
 	flags.Bool("no-auto-title", false, "do not auto-answer tool-less chat requests with a derived title; route them to the human inbox instead")
 	persistent := command.PersistentFlags()
 	persistent.String("workspace", ".", "workspace used to isolate local private state; nearest Git root is selected")
