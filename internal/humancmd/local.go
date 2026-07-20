@@ -66,6 +66,7 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 	flags.Duration("shutdown-timeout", 10*time.Second, "graceful local shutdown timeout")
 	flags.Bool("reset-credentials", false, "rotate the persisted local caller and worker credentials")
 	flags.String("web", "", "loopback address of the browser human side (default 127.0.0.1:19081)")
+	flags.Bool("no-auto-title", false, "do not auto-answer tool-less chat requests with a derived title; route them to the human inbox instead")
 	persistent := command.PersistentFlags()
 	persistent.String("workspace", ".", "workspace used to isolate local private state; nearest Git root is selected")
 	persistent.String("db", automaticPrivatePath, "embedded SQLite database; auto uses OS user data isolated by workspace")
@@ -82,6 +83,7 @@ func newLocalCommand(settings *viper.Viper) *cobra.Command {
 		"local.stream_write_timeout": "stream-write-timeout",
 		"local.max_pending":          "max-pending", "local.shutdown_timeout": "shutdown-timeout",
 		"local.reset_credentials": "reset-credentials", "local.web": "web",
+		"local.no_auto_title": "no-auto-title",
 	} {
 		mustBind(settings, key, flags.Lookup(name))
 	}
@@ -188,11 +190,12 @@ func runLocal(ctx context.Context, output io.Writer, settings *viper.Viper) erro
 		Worker: localruntime.WorkerPaths{
 			MirrorRoot: mirrorRoot, OutboxPath: outboxPath,
 		},
-		ListenAddress:   settings.GetString("local.listen"),
-		CallerSubject:   settings.GetString("local.caller_subject"),
-		WorkerSubject:    settings.GetString("local.worker_subject"),
-		ShutdownTimeout:  settings.GetDuration("local.shutdown_timeout"),
-		WebListenAddress: settings.GetString("local.web"),
+		ListenAddress:       settings.GetString("local.listen"),
+		CallerSubject:       settings.GetString("local.caller_subject"),
+		WorkerSubject:       settings.GetString("local.worker_subject"),
+		ShutdownTimeout:     settings.GetDuration("local.shutdown_timeout"),
+		WebListenAddress:    settings.GetString("local.web"),
+		WebDisableAutoTitle: settings.GetBool("local.no_auto_title"),
 	}
 	if strings.TrimSpace(config.WebListenAddress) == "" {
 		config.WebListenAddress = "127.0.0.1:19081"

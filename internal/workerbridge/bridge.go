@@ -47,6 +47,7 @@ type Bridge struct {
 	assignments chan llm.WorkerAssignmentDelivery
 	rejections  chan workerkit.Rejection
 	done        chan struct{}
+	closing     chan struct{}
 
 	mu         sync.Mutex
 	byKey      map[string]completion.Assignment // caller\x00idempotency -> legacy assignment
@@ -72,6 +73,7 @@ func Dial(ctx context.Context, config Config) (*Bridge, error) {
 		assignments: make(chan llm.WorkerAssignmentDelivery, 64),
 		rejections:  make(chan workerkit.Rejection, 64),
 		done:        make(chan struct{}),
+		closing:     make(chan struct{}),
 		byKey:       make(map[string]completion.Assignment),
 		byDelivery:  make(map[llm.WorkerDeliveryID]string),
 		settled:     make(map[string]bool),
@@ -80,10 +82,14 @@ func Dial(ctx context.Context, config Config) (*Bridge, error) {
 	return bridge, nil
 }
 
-// Close shuts the underlying legacy client down and ends the pump.
+// Close shuts the underlying legacy client down and ends the pump. Signaling
+// closing first unblocks a pump parked on a full assignments/rejections
+// channel (its consumer may already be gone), so Close cannot deadlock waiting
+// on done.
 func (bridge *Bridge) Close() error {
 	var err error
 	bridge.closeone.Do(func() {
+		close(bridge.closing)
 		err = bridge.client.Close()
 	})
 	<-bridge.done
@@ -117,12 +123,26 @@ func (bridge *Bridge) pump() {
 			bridge.byKey[legacy.SessionKey()] = legacy
 			bridge.byDelivery[delivery.ID] = legacy.SessionKey()
 			bridge.mu.Unlock()
-			bridge.assignments <- delivery
+			select {
+			case bridge.assignments <- delivery:
+			case <-bridge.closing:
+				return
+			}
 		case message.EventRejected != nil:
 			rejection, ok := bridge.bridgeRejection(message)
 			if ok {
-				bridge.rejections <- rejection
+				select {
+				case bridge.rejections <- rejection:
+				case <-bridge.closing:
+					return
+				}
 			}
+		case message.OutboxQuarantine != nil:
+			// A durable outbox row was quarantined: an event the human believed
+			// sent will never leave. Record it so Err() surfaces the fault rather
+			// than dropping it silently. A first-class human-visible alert needs a
+			// workerkit Notifier port (tracked in docs/11).
+			bridge.recordErr(fmt.Errorf("workerbridge: worker outbox quarantined a durable event; the corresponding reply will not be delivered"))
 		case message.Err != nil:
 			bridge.recordErr(message.Err)
 		}
@@ -139,9 +159,11 @@ func (bridge *Bridge) SendEvent(ctx context.Context, delivery llm.WorkerEventDel
 	key := string(delivery.Identity.CallerID) + "\x00" + string(delivery.Identity.IdempotencyKey)
 	bridge.mu.Lock()
 	assignment, known := bridge.byKey[key]
-	bridge.settled[key] = true
 	bridge.mu.Unlock()
 	if !known {
+		// A conversation recovered from the StateStore whose bridge assignment
+		// has not yet been redelivered: fail transiently without marking the
+		// session settled, so a later accepted event can still be sent.
 		return fmt.Errorf("workerbridge: no legacy assignment for %s/%s",
 			delivery.Identity.CallerID, delivery.Identity.IdempotencyKey)
 	}
@@ -155,7 +177,20 @@ func (bridge *Bridge) SendEvent(ctx context.Context, delivery llm.WorkerEventDel
 			ID: call.ID, Namespace: call.Namespace, Name: call.Name, Input: call.Input,
 		})
 	}
-	return bridge.client.SendEvent(ctx, assignment, event)
+	if err := bridge.client.SendEvent(ctx, assignment, event); err != nil {
+		return err
+	}
+	bridge.mu.Lock()
+	bridge.settled[key] = true
+	if delivery.Event.EndsResponse() {
+		// The completion is terminal; release its bookkeeping so a long-running
+		// worker does not retain every finished assignment's full request.
+		delete(bridge.byKey, key)
+		delete(bridge.settled, key)
+		delete(bridge.byDelivery, llm.WorkerDeliveryID("bridge-"+stableIdentity(assignment.CallerID, assignment.IdempotencyKey)))
+	}
+	bridge.mu.Unlock()
+	return nil
 }
 
 // ConfirmAssignment maps workerkit's accept to the legacy accepted event: the

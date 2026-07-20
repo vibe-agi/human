@@ -661,9 +661,23 @@ func (local *Local) Close() error {
 				closeErrors = append(closeErrors, fmt.Errorf("close local listener: %w", err))
 			}
 		}
+		// Shut the web server down first: it cancels the notification pump so
+		// long-lived SSE handlers return, letting the HTTP server drain instead
+		// of blocking until the shutdown timeout.
+		if local.webServer != nil {
+			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
+			if err := local.webServer.Shutdown(shutdownContext); err != nil {
+				closeErrors = append(closeErrors, fmt.Errorf("close local web server: %w", err))
+			}
+			shutdownCancel()
+		}
 		if local.webHTTP != nil {
 			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
-			if err := local.webHTTP.Shutdown(shutdownContext); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			err := local.webHTTP.Shutdown(shutdownContext)
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				err = local.webHTTP.Close()
+			}
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				closeErrors = append(closeErrors, fmt.Errorf("close local web HTTP server: %w", err))
 			}
 			shutdownCancel()
@@ -671,13 +685,6 @@ func (local *Local) Close() error {
 			if err := local.webListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 				closeErrors = append(closeErrors, fmt.Errorf("close local web listener: %w", err))
 			}
-		}
-		if local.webServer != nil {
-			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
-			if err := local.webServer.Shutdown(shutdownContext); err != nil {
-				closeErrors = append(closeErrors, fmt.Errorf("close local web server: %w", err))
-			}
-			shutdownCancel()
 		}
 		if local.webWorker != nil {
 			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)

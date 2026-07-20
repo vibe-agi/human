@@ -3,6 +3,7 @@ package humancmd
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -20,6 +21,11 @@ import (
 	workerkitsqlite "github.com/vibe-agi/human/workerkit/sqlite"
 )
 
+func sha256Sum(value string) []byte {
+	sum := sha256.Sum256([]byte(value))
+	return sum[:]
+}
+
 // runWebWorker connects a remote gateway over the worker bridge and serves
 // the browser human side on a dedicated loopback listener until ctx ends.
 func runWebWorker(ctx context.Context, gatewayURL, token, mirrorRoot, outboxPath, listenAddress string) error {
@@ -31,7 +37,12 @@ func runWebWorker(ctx context.Context, gatewayURL, token, mirrorRoot, outboxPath
 	}
 	defer bridge.Close()
 
-	statePath, err := userdata.Path("worker", "workerkit-state.db")
+	// Isolate the human-side state by gateway: pointing this worker at a
+	// different gateway must not recover the previous gateway's conversations
+	// (whose bridge assignments no longer exist), matching the outbox's own
+	// per-endpoint isolation.
+	scope := hex.EncodeToString(sha256Sum(gatewayURL))[:16]
+	statePath, err := userdata.Path("worker", scope, "workerkit-state.db")
 	if err != nil {
 		return fmt.Errorf("resolve workerkit state path: %w", err)
 	}
@@ -101,8 +112,16 @@ func runWebWorker(ctx context.Context, gatewayURL, token, mirrorRoot, outboxPath
 			return err
 		}
 	}
-	shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = httpServer.Shutdown(shutdownContext)
-	return server.Shutdown(shutdownContext)
+	// Cancel the web server's pump first so SSE handlers return, then drain the
+	// HTTP server; each gets a fresh context so a slow first step cannot starve
+	// the second.
+	serverContext, serverCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	serverErr := server.Shutdown(serverContext)
+	serverCancel()
+	httpContext, httpCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := httpServer.Shutdown(httpContext); errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		_ = httpServer.Close()
+	}
+	httpCancel()
+	return serverErr
 }
