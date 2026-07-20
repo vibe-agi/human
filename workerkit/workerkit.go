@@ -79,6 +79,14 @@ type Worker struct {
 	now           func() time.Time
 	ids           func(kind string) (string, error)
 
+	// command serializes every operation with a wire side effect (accept,
+	// reject, the reply/final/tool-call family, deliver/discard, and the loop's
+	// resume and auto-final branches) so a check-then-send sequence cannot
+	// interleave with another. It is always acquired before mu; mu still guards
+	// the short in-memory critical sections. Held across SendEvent, not across
+	// Snapshot, so read-only viewers never block on a command.
+	command sync.Mutex
+
 	mu            sync.Mutex
 	inbox         []InboxItem
 	inboxRequests map[llm.WorkerDeliveryID]llm.Request
@@ -253,6 +261,11 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 	delivery = llm.CloneWorkerAssignmentDelivery(delivery)
 	key := conversationKeyOf(delivery)
 
+	// Hold the command lock across the whole assignment so a resume or
+	// auto-final never interleaves with a concurrent human command.
+	worker.command.Lock()
+	defer worker.command.Unlock()
+
 	worker.mu.Lock()
 	if worker.closed {
 		worker.mu.Unlock()
@@ -289,9 +302,11 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 		}
 		_ = worker.wire.ConfirmAssignment(worker.loopCtx, delivery.ID)
 		if settlement != nil && worker.mirror != nil {
-			// Settle is idempotent, so a crash between save and this call
-			// re-settles on the next result replay rather than losing or
-			// double-advancing the baseline.
+			// Settle is idempotent. A crash before this call does not re-settle
+			// (the resume already cleared Delivery), but a filesystem mirror
+			// reseeds the still-undelivered change into the next review from the
+			// on-disk baseline, so the human re-delivers once — never a silent
+			// baseline advance or loss.
 			_ = worker.mirror.Settle(worker.loopCtx, *settlement)
 		}
 		worker.mu.Lock()
@@ -331,20 +346,25 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 	worker.notify()
 }
 
-// autoFinal confirms and finals one auto-answered assignment. It reports
-// whether both steps durably succeeded.
+// autoFinal answers one assignment with a final event. It sends before
+// confirming — the same ordering as Reject — so a failure returns false only
+// when nothing was delivered, and the caller safely falls back to the inbox.
+// Once the final is durably owned by the transport the task is answered, so a
+// later confirm failure (harmless redelivery, deduplicated by the core) does
+// not undo it.
 func (worker *Worker) autoFinal(delivery llm.WorkerAssignmentDelivery, text string) bool {
 	if strings.TrimSpace(text) == "" {
-		return false
-	}
-	if err := worker.wire.ConfirmAssignment(worker.loopCtx, delivery.ID); err != nil {
 		return false
 	}
 	event, err := worker.buildEvent(delivery, llm.Event{Type: llm.EventFinal, Text: text})
 	if err != nil {
 		return false
 	}
-	return worker.wire.SendEvent(worker.loopCtx, event) == nil
+	if err := worker.wire.SendEvent(worker.loopCtx, event); err != nil {
+		return false
+	}
+	_ = worker.wire.ConfirmAssignment(worker.loopCtx, delivery.ID)
+	return true
 }
 
 // pendingAssignments lazily allocates the delivery cache used by Accept and
@@ -407,6 +427,9 @@ func (worker *Worker) resumeInto(conversation *Conversation, delivery llm.Worker
 }
 
 func (worker *Worker) handleRejection(rejection Rejection) {
+	// Serialize with commands: this mutates conversation phase.
+	worker.command.Lock()
+	defer worker.command.Unlock()
 	key := ConversationKey{
 		Caller: rejection.Delivery.Identity.CallerID,
 		TaskID: rejection.Delivery.Identity.TaskID,
@@ -418,6 +441,16 @@ func (worker *Worker) handleRejection(rejection Rejection) {
 			At: worker.now().UTC(), Author: AuthorSystem, Kind: EntryRejected,
 			Text: rejection.Receipt.Message, Code: string(rejection.Receipt.Code),
 		})
+		// The rejected event never reached the caller, so an optimistically
+		// advanced phase (terminal after Final, parked after tool calls, or
+		// awaiting-caller after Clarify) would strand the human on a
+		// permanently-refused conversation. Return it to active so the human
+		// can correct and resend.
+		if conversation.Phase != PhaseActive {
+			conversation.Phase = PhaseActive
+			conversation.ParkedCalls = nil
+			conversation.Delivery = nil
+		}
 		conversation.UpdatedAt = worker.now().UTC()
 		saved := cloneConversation(*conversation)
 		worker.mu.Unlock()
@@ -441,6 +474,8 @@ func (worker *Worker) Accept(ctx context.Context, delivery llm.WorkerDeliveryID)
 	if err := worker.checkCommand(ctx); err != nil {
 		return ConversationKey{}, err
 	}
+	worker.command.Lock()
+	defer worker.command.Unlock()
 	worker.mu.Lock()
 	index := worker.inboxIndexLocked(delivery)
 	if index < 0 {
@@ -482,6 +517,8 @@ func (worker *Worker) Reject(ctx context.Context, delivery llm.WorkerDeliveryID,
 	if err := worker.checkCommand(ctx); err != nil {
 		return err
 	}
+	worker.command.Lock()
+	defer worker.command.Unlock()
 	worker.mu.Lock()
 	index := worker.inboxIndexLocked(delivery)
 	if index < 0 {
@@ -501,32 +538,48 @@ func (worker *Worker) Reject(ctx context.Context, delivery llm.WorkerDeliveryID,
 	if err := worker.wire.ConfirmAssignment(ctx, delivery); err != nil {
 		return fmt.Errorf("workerkit: confirm rejected assignment: %w", err)
 	}
+	// A prior Accept whose confirm failed can have left a durable record under
+	// this key; rejecting the task must not leave that orphan to be recovered
+	// as a live conversation on restart.
+	key := conversationKeyOf(assignment)
 	worker.mu.Lock()
+	_, live := worker.conversations[key]
 	worker.removeInboxLocked(delivery)
 	worker.mu.Unlock()
+	if !live {
+		_ = worker.state.DeleteConversation(ctx, key)
+	}
 	worker.notify()
 	return nil
 }
 
 // Reply sends a non-terminal progress segment; the human turn continues.
 func (worker *Worker) Reply(ctx context.Context, key ConversationKey, text string) error {
+	worker.command.Lock()
+	defer worker.command.Unlock()
 	return worker.sendConversationEvent(ctx, key, llm.Event{Type: llm.EventProgress, Text: text}, PhaseActive)
 }
 
 // Clarify hands the turn back to the caller with a question; the conversation
 // awaits the caller's next request on the same task.
 func (worker *Worker) Clarify(ctx context.Context, key ConversationKey, text string) error {
+	worker.command.Lock()
+	defer worker.command.Unlock()
 	return worker.sendConversationEvent(ctx, key, llm.Event{Type: llm.EventClarification, Text: text}, PhaseAwaitingCaller)
 }
 
 // Final ends the conversation.
 func (worker *Worker) Final(ctx context.Context, key ConversationKey, text string) error {
+	worker.command.Lock()
+	defer worker.command.Unlock()
 	return worker.sendConversationEvent(ctx, key, llm.Event{Type: llm.EventFinal, Text: text}, PhaseTerminal)
 }
 
 // SubmitToolCalls asks the caller agent to execute tools and parks the
 // conversation until the caller continues with their results.
 func (worker *Worker) SubmitToolCalls(ctx context.Context, key ConversationKey, calls []llm.ToolCall) error {
+	worker.command.Lock()
+	defer worker.command.Unlock()
 	return worker.sendToolCallBatch(ctx, key, calls, nil)
 }
 
@@ -569,6 +622,8 @@ func (worker *Worker) DeliverChanges(ctx context.Context, key ConversationKey, c
 	if worker.mirror == nil {
 		return ErrNoMirror
 	}
+	worker.command.Lock()
+	defer worker.command.Unlock()
 	if len(changeIDs) == 0 {
 		return fmt.Errorf("%w: at least one change is required", ErrInvalidCommand)
 	}
@@ -633,6 +688,8 @@ func (worker *Worker) DiscardChanges(ctx context.Context, changeIDs []string) er
 	if worker.mirror == nil {
 		return ErrNoMirror
 	}
+	worker.command.Lock()
+	defer worker.command.Unlock()
 	if len(changeIDs) == 0 {
 		return fmt.Errorf("%w: at least one change is required", ErrInvalidCommand)
 	}
@@ -650,6 +707,8 @@ func (worker *Worker) SaveDraft(ctx context.Context, key ConversationKey, draft 
 	if err := worker.checkCommand(ctx); err != nil {
 		return err
 	}
+	worker.command.Lock()
+	defer worker.command.Unlock()
 	worker.mu.Lock()
 	conversation, exists := worker.conversations[key]
 	if !exists {
