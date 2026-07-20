@@ -1,82 +1,58 @@
 # Human
 
-> The world's slowest LLM. Astonishing reasoning. Terrible latency. Unionized.
+An OpenAI/Anthropic-compatible model server where the model is a person.
 
 [简体中文](README.zh-CN.md)
 
-## What is this
+Your coding agent calls `POST /v1/chat/completions` like it always does. The
+request shows up in someone's browser. They read it, type an answer, maybe
+send back native tool calls for the agent to run in its own workspace, and
+hit deliver. The agent gets a normal SSE stream and is none the wiser.
 
-Every AI product pitch says "AI replaces humans." We went the other way:
-**this project replaces the AI with a human.** You.
+Yes, we know how this sounds. We built an entire idempotent, crash-recovering,
+TLA+-verified pipeline so that a human can type "have you tried restarting it"
+at 2 tokens per second. It's useful anyway:
 
-Human is an OpenAI/Anthropic-compatible model server where the "model" is a
-person with a browser tab. Your coding agent (OpenCode, or anything that
-speaks Chat Completions / Messages / Responses) calls `POST
-/v1/chat/completions` like always — and the request lands in a human's inbox.
-The human reads it, thinks (weights: ~86 billion neurons, training data: one
-childhood), types an answer, maybe sends back *native tool calls* that the
-agent executes in its own workspace, and clicks "Deliver final."
+- Your agent is stuck at 2am. A senior engineer takes over the *model seat*
+  for one turn — the agent keeps its own tool loop, permission gates, and
+  working tree. No screen sharing.
+- Human-in-the-loop where the human can actually do things: answer, ask back,
+  run commands through the agent's own execution gate, edit files in a live
+  mirror and deliver them as native `write`/`edit` calls.
+- Record what a competent human does in the model seat and you get evaluation
+  data nobody sells.
+- For longer work there's also an A2A 1.0 endpoint with durable tasks and
+  artifacts (HumanAgent), separate from the real-time path.
 
-The agent never knows. It gets a perfectly ordinary SSE stream. It says
-"thank you" to what it believes is a matrix multiplication.
+The plumbing is the serious part: fail-closed everywhere, byte-exact replay,
+durable outboxes, 90 formal gates, fault-injection doors that run the real
+OpenCode CLI. See [docs/](docs/) if that's your thing.
 
-Model card, for honesty:
+## Run it
 
-| Metric | Value |
-|---|---|
-| Parameters | 1 human |
-| Context window | depends on sleep |
-| Tokens/sec | 2, on a good day |
-| Hallucination rate | nonzero, but apologizes |
-| Alignment | negotiable |
-
-## Why would anyone want this
-
-Jokes aside — dropping a human into the model slot is genuinely useful:
-
-- **Escalation**: your agent is stuck at 2am; a senior engineer takes over
-  the *model* seat for one turn — with the agent's full tool loop, permission
-  gates, and workspace intact. No screen sharing, no "paste me the error".
-- **Human-in-the-loop that actually loops**: the human can answer, ask back,
-  run commands *through the agent's own execution gate*, edit files in a live
-  mirror and deliver them as native `write`/`edit` tool calls — the agent's
-  working tree stays the single source of truth.
-- **Ground truth**: record what a competent human does in the model seat, and
-  you have evaluation data no benchmark sells you.
-- **A durable task surface too**: besides the real-time HumanLLM, there's
-  HumanAgent — an A2A 1.0 endpoint with durable tasks, artifacts, and
-  clock-free leases, for work that takes longer than a coffee.
-
-Everything is fail-closed, byte-exact idempotent, crash-recovered through
-durable outboxes, and modeled in TLA+ — because if the human is going to be
-slow, the plumbing at least should be correct. (Details: [docs/](docs/), 90
-formal gates, real-CLI fault-injection doors. We are not joking about this
-part.)
-
-## Quickstart: become a model in 60 seconds
-
-Requirements: Go (or a release binary), a browser, one human (you qualify).
-
-**Terminal 1 — start the server + your inbox:**
+You need Go (or a [release binary](https://github.com/vibe-agi/human/releases)),
+a browser, and a human.
 
 ```sh
 human local --workspace .
-# ...
-# model base URL: http://127.0.0.1:19080/v1
-# human side (browser): http://127.0.0.1:19081/?token=...   ← open this
 ```
 
-Open the printed URL. That's your cockpit: inbox, conversations, a command
-console, a todo planner, and a Live Workspace review panel. English by
-default; 中文 one click away.
+It prints two URLs:
 
-**Terminal 2 — point an agent at yourself.** For OpenCode, add a provider:
+```
+model base URL: http://127.0.0.1:19080/v1
+human side (browser): http://127.0.0.1:19081/?token=...
+```
+
+Open the second one. That's your inbox.
+
+Then point an agent at the first one. OpenCode config:
 
 ```jsonc
 // opencode.json
 "human": {
   "npm": "@ai-sdk/openai-compatible",
-  "name": "Human (me)",
+  "name": "Human",
   "options": {
     "baseURL": "http://127.0.0.1:19080/v1",
     "apiKey": "{env:HUMAN_CALLER_TOKEN}"
@@ -90,45 +66,38 @@ export HUMAN_CALLER_TOKEN="$(human local credentials --workspace . --token-only)
 opencode --model human/human-expert
 ```
 
-Ask OpenCode anything. Your browser pings. You are now the model. Breathe.
+Ask it something. Your browser pings. You're the model now — take your time,
+the agent will wait.
 
-**No agent handy? curl yourself:**
+No agent handy? curl works:
 
 ```sh
 curl -N http://127.0.0.1:19080/v1/chat/completions \
   -H "Authorization: Bearer $HUMAN_CALLER_TOKEN" \
   -H "Content-Type: application/json" -H "Idempotency-Key: try-1" \
-  -d '{"model":"human-expert","stream":true,"messages":[{"role":"user","content":"hello, model"}]}'
+  -d '{"model":"human-expert","stream":true,"messages":[{"role":"user","content":"hello"}]}'
 ```
 
-The curl hangs politely until you answer in the browser. Congratulations:
-you have achieved artificial artificial intelligence.
+The curl hangs until you answer in the browser.
 
-## Remote / team
+Remote setup is two commands: `human gateway --listen :8080` on a server (put
+TLS in front), `human worker --gateway wss://.../internal/v1/worker/ws` on the
+human's machine.
 
-```sh
-human gateway --listen :8080          # deployment side (put TLS in front)
-human worker --gateway wss://your-gateway/internal/v1/worker/ws
-# prints your browser inbox URL; token via HUMAN_GATEWAY_TOKEN
-```
+## Embedding
 
-## Embedding (for Go people)
+`human.NewLLM()` / `human.NewAgent()` are transport-neutral cores. Store,
+auth, codecs, transports, and KMS are replaceable ports with public
+conformance suites in `humantest`; [`examples/custom-framework`](examples/custom-framework/README.md)
+runs entirely on its own store, auth, and transport. The web UI is a
+stateless projection over the `workerkit` domain layer, so you can replace it
+too.
 
-`human.NewLLM()` / `human.NewAgent()` are transport-neutral cores with
-replaceable Store / auth / codec / transport / KMS ports, public conformance
-suites in `humantest`, and a fully self-owned example in
-[`examples/custom-framework`](examples/custom-framework/README.md). The web
-UI is a stateless projection over the public `workerkit` domain layer — bring
-your own UI if ours offends you.
+Docs: [goals](docs/01-goals.md), [gateway](docs/02-gateway.md),
+[embedding](docs/07-embedding.md), [operations](docs/08-operations.md),
+[TLA+ model](docs/09-formal-model.md),
+[framework contract](docs/10-framework-contract.md),
+[the human-side stack](docs/11-human-side.md).
 
-## The fine print
-
-| Doc | What |
-|---|---|
-| [01 Goals](docs/01-goals.md) · [02 Gateway](docs/02-gateway.md) · [05 Contract](docs/05-m0-contract.md) | Product and protocol boundaries |
-| [07 Embedding](docs/07-embedding.md) · [10 Framework contract](docs/10-framework-contract.md) | Library ports, conformance, ownership |
-| [08 Operations](docs/08-operations.md) · [09 TLA+](docs/09-formal-model.md) · [11 Human side](docs/11-human-side.md) | Backup/restore, formal model, the web worker stack |
-
-Honest status: OpenCode 1.17.18 single-machine is the validated path (real
-CLI doors, network fault gates). Codex is partially validated, Claude is
-codec-only so far. The human, as shipped, is not fine-tunable.
+Status, honestly: OpenCode 1.17.18 on a single machine is the validated path.
+Codex is partially validated, Claude is codec-only so far.
