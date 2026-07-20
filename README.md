@@ -13,18 +13,26 @@ hit deliver. The agent gets a normal SSE stream and is none the wiser.
 
 Yes, we know how this sounds. We built an entire idempotent, crash-recovering,
 TLA+-verified pipeline so that a human can type "have you tried restarting it"
-at 2 tokens per second. It's useful anyway:
+at 2 tokens per second.
 
-- Your agent is stuck at 2am. A senior engineer takes over the *model seat*
-  for one turn — the agent keeps its own tool loop, permission gates, and
-  working tree. No screen sharing.
+What it verifiably does (real-CLI test doors and all):
+
 - Human-in-the-loop where the human can actually do things: answer, ask back,
   run commands through the agent's own execution gate, edit files in a live
-  mirror and deliver them as native `write`/`edit` calls.
-- Record what a competent human does in the model seat and you get evaluation
-  data nobody sells.
-- For longer work there's also an A2A 1.0 endpoint with durable tasks and
-  artifacts (HumanAgent), separate from the real-time path.
+  mirror and deliver them as native `write`/`edit` calls. The working tree
+  stays on the agent's side.
+- Wizard-of-Oz prototyping: your product doesn't have its AI yet? Ship a
+  human. Protocol compatibility means existing agents, harnesses, and clients
+  connect unchanged.
+
+Other uses we're not comfortable putting in official documentation, so you'll
+have to discover them yourself. For instance: live-demoing "our in-house
+foundation model" to a client; taking over a stuck agent at 2am (assuming the
+gateway was set up beforehand, not at 2am while reading this README);
+recording your own model-seat sessions as evaluation data (it's all in
+SQLite, the export tool doesn't exist yet, you know what to do); and, should
+the A2A ecosystem ever want to hire an actual human — we happen to have an
+endpoint ready.
 
 The plumbing is the serious part: fail-closed everywhere, byte-exact replay,
 durable outboxes, 90 formal gates, fault-injection doors that run the real
