@@ -35,6 +35,7 @@ import (
 	"github.com/vibe-agi/human/internal/store/sqlite"
 	"github.com/vibe-agi/human/internal/workerproto"
 	"github.com/vibe-agi/human/internal/workerws"
+	"github.com/vibe-agi/human/llm/callerhttp"
 )
 
 // WorkerPath is the worker WebSocket route mounted by Server.ServeHTTP.
@@ -508,6 +509,20 @@ func Open(ctx context.Context, config Config) (*Server, error) {
 	}
 	mux := http.NewServeMux()
 	mux.Handle(WorkerPath, workerServer)
+	// Claude Code probes count_tokens on startup; a 404 surfaces as "model may
+	// not exist". The estimator is caller-authenticated like every model route.
+	countTokens := callerhttp.CountTokensHandler()
+	mux.Handle("POST "+callerhttp.CountTokensPath, http.HandlerFunc(
+		func(response http.ResponseWriter, request *http.Request) {
+			principal, err := authenticator.AuthenticateRequest(request)
+			if err != nil || principal.Type != internalauth.PrincipalCaller {
+				response.Header().Set("Content-Type", "application/json")
+				response.WriteHeader(http.StatusUnauthorized)
+				_, _ = response.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"invalid credentials"}}`))
+				return
+			}
+			countTokens.ServeHTTP(response, request)
+		}))
 	mux.Handle("/", modelServer)
 	server := &Server{
 		database: database, ownerLock: databaseOwner,
