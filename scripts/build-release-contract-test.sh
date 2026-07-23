@@ -88,8 +88,6 @@ expected_archives=(
   "human_${version}_darwin_arm64.tar.gz"
   "human_${version}_linux_amd64.tar.gz"
   "human_${version}_linux_arm64.tar.gz"
-  "human_${version}_windows_amd64.zip"
-  "human_${version}_windows_arm64.zip"
 )
 for archive in "${expected_archives[@]}"; do
   test -s "$success_dist/$archive"
@@ -106,6 +104,13 @@ test "$(wc -l <"$success_dist/checksums.txt" | tr -d ' ')" = "${#expected_archiv
 
 host_os="$(go env GOOS)"
 host_arch="$(go env GOARCH)"
+case "$host_os" in
+  darwin|linux) ;;
+  *)
+    echo "release contract host OS is not in the supported release matrix: $host_os" >&2
+    exit 1
+    ;;
+esac
 case "$host_arch" in
   amd64|arm64) ;;
   *)
@@ -115,20 +120,10 @@ case "$host_arch" in
 esac
 host_stage="$temporary/host-stage"
 mkdir -p "$host_stage"
-if [[ "$host_os" == "windows" ]]; then
-  host_archive="$success_dist/human_${version}_${host_os}_${host_arch}.zip"
-  command -v unzip >/dev/null 2>&1 || {
-    echo "unzip is required to verify the Windows release archive" >&2
-    exit 1
-  }
-  unzip -q "$host_archive" -d "$host_stage"
-  host_binary="$host_stage/human.exe"
-else
-  host_archive="$success_dist/human_${version}_${host_os}_${host_arch}.tar.gz"
-  test -s "$host_archive"
-  tar -xzf "$host_archive" -C "$host_stage"
-  host_binary="$host_stage/human"
-fi
+host_archive="$success_dist/human_${version}_${host_os}_${host_arch}.tar.gz"
+test -s "$host_archive"
+tar -xzf "$host_archive" -C "$host_stage"
+host_binary="$host_stage/human"
 for entry in "$host_binary" "$host_stage/README.md" "$host_stage/LICENSE" \
   "$host_stage/docs/contract.md" "$host_stage/examples/example.txt"; do
   test -e "$entry"

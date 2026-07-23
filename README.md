@@ -56,6 +56,15 @@ You need Go (or a [release binary](https://github.com/vibe-agi/human/releases)),
 a browser, and a human.
 
 ```sh
+brew install vibe-agi/tap/human
+```
+
+Official release binaries and runtime CI currently cover macOS and Linux on
+amd64 and arm64. Windows remains compile-checked, but is not yet a supported
+runtime: its durable locking, ACL, path, and SQLite contracts do not have the
+same evidence, so we do not publish a misleading Windows binary.
+
+```sh
 human local --workspace ~/human-workspace
 ```
 

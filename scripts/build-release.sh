@@ -43,8 +43,6 @@ platforms=(
   "darwin arm64"
   "linux amd64"
   "linux arm64"
-  "windows amd64"
-  "windows arm64"
 )
 
 for platform in "${platforms[@]}"; do
@@ -53,9 +51,6 @@ for platform in "${platforms[@]}"; do
   stage="$work/$archive"
   mkdir -p "$stage"
   binary="human"
-  if [[ "$goos" == "windows" ]]; then
-    binary="human.exe"
-  fi
   (
     cd "$root"
     CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build \
@@ -67,18 +62,9 @@ for platform in "${platforms[@]}"; do
   if [[ -f "$root/LICENSE" ]]; then
     cp "$root/LICENSE" "$stage/LICENSE"
   fi
-  if [[ "$goos" == "windows" ]]; then
-    (
-      cd "$stage"
-      entries=("$binary" README.md docs examples)
-      [[ -f LICENSE ]] && entries+=(LICENSE)
-      zip -q -9 -r "$dist/$archive.zip" "${entries[@]}"
-    )
-  else
-    entries=("$binary" README.md docs examples)
-    [[ -f "$stage/LICENSE" ]] && entries+=(LICENSE)
-    tar -C "$stage" -czf "$dist/$archive.tar.gz" "${entries[@]}"
-  fi
+  entries=("$binary" README.md docs examples)
+  [[ -f "$stage/LICENSE" ]] && entries+=(LICENSE)
+  tar -C "$stage" -czf "$dist/$archive.tar.gz" "${entries[@]}"
 done
 
 (

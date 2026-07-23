@@ -39,6 +39,14 @@ Agent 侧仍然是熟悉的工作流。这里 OpenCode 接收 Human 给出的计
 需要 Go（或 [release 二进制](https://github.com/vibe-agi/human/releases)）、一个浏览器、一个人。
 
 ```sh
+brew install vibe-agi/tap/human
+```
+
+官方 release 二进制和运行时 CI 当前覆盖 macOS/Linux 的 amd64 与 arm64。Windows
+仍保留编译门，但 durable lock、ACL、路径和 SQLite 合同尚未取得同等实证，因此暂不发布
+一个看似可用、实际不可靠的 Windows 二进制。
+
+```sh
 human local --workspace ~/human-workspace
 ```
 
