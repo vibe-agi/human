@@ -27,9 +27,12 @@ import (
 // idempotent. It intentionally uses the project-owned exact adapter rather
 // than inferring capabilities from a tool schema.
 func TestM0TwentyRemoteToolLoops(t *testing.T) {
-	fixture := newGatewayFixtureWithConfig(t, true, Config{RateLimit: ratelimit.Config{
-		RatePerSecond: 10_000, Burst: 10_000,
-	}})
+	fixture := newGatewayFixtureWithConfig(t, true, Config{
+		MaxPending: 30 * time.Second,
+		RateLimit: ratelimit.Config{
+			RatePerSecond: 10_000, Burst: 10_000,
+		},
+	})
 	if err := fixture.registry.Register(adapter.HumanShimProfile()); err != nil {
 		t.Fatal(err)
 	}

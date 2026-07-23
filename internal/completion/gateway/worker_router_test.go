@@ -44,6 +44,7 @@ func TestWorkerRouterIsolatesTenantsAndReceivesValidatedIdentity(t *testing.T) {
 	var mu sync.Mutex
 	routed := make(map[string]WorkerRouteRequest)
 	fixture := newGatewayFixtureWithAuthenticator(t, false, Config{
+		MaxPending: 30 * time.Second,
 		WorkerRouter: workerRouterFunc(func(ctx context.Context, request WorkerRouteRequest) (string, error) {
 			if ctx != request.HTTPRequest.Context() {
 				return "", errors.New("router request lost its context")
