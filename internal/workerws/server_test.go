@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -272,7 +273,8 @@ func TestWorkerSequenceGapClosesConnection(t *testing.T) {
 	}
 	var reply workerproto.Envelope
 	err = wsjson.Read(ctx, connection, &reply)
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) && websocket.CloseStatus(err) == -1 {
+	closed := websocket.CloseStatus(err) != -1 || errors.Is(err, io.EOF)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || !closed {
 		t.Fatalf("sequence gap did not close connection: %v", err)
 	}
 }
