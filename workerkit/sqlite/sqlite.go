@@ -22,14 +22,17 @@ import (
 )
 
 const (
-	schemaVersion     = 1
-	schemaFingerprint = "human-workerkit-state-v1-20260720a"
-	databasePurpose   = "workerkit state database"
+	schemaVersion           = 2
+	schemaFingerprint       = "human-workerkit-state-v2-20260722a"
+	legacySchemaVersion     = 1
+	legacySchemaFingerprint = "human-workerkit-state-v1-20260720a"
+	databasePurpose         = "workerkit state database"
 
 	// maxRecordBytes bounds one encoded conversation. Conversations are display
 	// and recovery state, not payload storage; a record this large indicates a
 	// runaway transcript rather than legitimate use.
 	maxRecordBytes = 8 << 20
+	maxAlertBytes  = 64 << 10
 )
 
 var (
@@ -132,6 +135,7 @@ type store struct {
 }
 
 var _ workerkit.StateStore = (*store)(nil)
+var _ workerkit.AlertStore = (*store)(nil)
 
 func (store *store) acquire(ctx context.Context) (func(), error) {
 	if ctx == nil {
@@ -223,6 +227,81 @@ func (store *store) ListConversations(ctx context.Context) ([]workerkit.Conversa
 	return conversations, nil
 }
 
+func (store *store) SaveAlert(ctx context.Context, notice workerkit.Notice) error {
+	release, err := store.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := notice.Validate(); err != nil {
+		return err
+	}
+	record, err := json.Marshal(notice)
+	if err != nil {
+		return fmt.Errorf("encode workerkit alert: %w", err)
+	}
+	if len(record) > maxAlertBytes {
+		return fmt.Errorf("workerkit alert exceeds the state record limit: %d bytes", len(record))
+	}
+	if _, err := store.database.ExecContext(ctx, `
+		INSERT INTO workerkit_alerts (seq, record) VALUES (?, ?)
+		ON CONFLICT(seq) DO UPDATE SET record = excluded.record`, notice.Seq, record); err != nil {
+		return fmt.Errorf("persist workerkit alert: %w", err)
+	}
+	return nil
+}
+
+func (store *store) DeleteAlert(ctx context.Context, seq uint64) error {
+	release, err := store.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if _, err := store.database.ExecContext(ctx, `DELETE FROM workerkit_alerts WHERE seq = ?`, seq); err != nil {
+		return fmt.Errorf("delete workerkit alert: %w", err)
+	}
+	return nil
+}
+
+func (store *store) ListAlerts(ctx context.Context) ([]workerkit.Notice, error) {
+	release, err := store.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	rows, err := store.database.QueryContext(ctx, `SELECT seq, record FROM workerkit_alerts ORDER BY seq`)
+	if err != nil {
+		return nil, fmt.Errorf("list workerkit alerts: %w", err)
+	}
+	defer rows.Close()
+	var alerts []workerkit.Notice
+	for rows.Next() {
+		var sequence uint64
+		var record []byte
+		if err := rows.Scan(&sequence, &record); err != nil {
+			return nil, fmt.Errorf("scan workerkit alert: %w", err)
+		}
+		if len(record) > maxAlertBytes {
+			return nil, fmt.Errorf("stored workerkit alert exceeds the state record limit: %d bytes", len(record))
+		}
+		var notice workerkit.Notice
+		if err := json.Unmarshal(record, &notice); err != nil {
+			return nil, fmt.Errorf("decode workerkit alert: %w", err)
+		}
+		if notice.Seq != sequence {
+			return nil, errors.New("stored workerkit alert sequence does not match its key")
+		}
+		if err := notice.Validate(); err != nil {
+			return nil, fmt.Errorf("validate stored workerkit alert: %w", err)
+		}
+		alerts = append(alerts, notice)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workerkit alerts: %w", err)
+	}
+	return alerts, nil
+}
+
 func configureDatabase(ctx context.Context, database *sql.DB) error {
 	var journalMode string
 	if err := database.QueryRowContext(ctx, "PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
@@ -284,16 +363,9 @@ func requireCurrentOrEmptySchema(ctx context.Context, database *sql.DB) error {
 	if len(tables) == 0 {
 		return nil
 	}
-	expected := []string{"workerkit_state_meta", "workerkit_conversations"}
-	sort.Strings(expected)
-	if len(tables) != len(expected) {
-		return unsupportedSchema("tables %v, want %v", tables, expected)
-	}
-	for index := range expected {
-		if tables[index] != expected[index] {
-			return unsupportedSchema("tables %v, want %v", tables, expected)
-		}
-	}
+	legacyTables := []string{"workerkit_conversations", "workerkit_state_meta"}
+	currentTables := []string{"workerkit_alerts", "workerkit_conversations", "workerkit_state_meta"}
+	sort.Strings(tables)
 	var version int
 	var fingerprint string
 	if err := database.QueryRowContext(ctx, `
@@ -302,11 +374,48 @@ func requireCurrentOrEmptySchema(ctx context.Context, database *sql.DB) error {
 		WHERE singleton = 1`).Scan(&version, &fingerprint); err != nil {
 		return unsupportedSchema("missing schema marker: %v", err)
 	}
-	if version != schemaVersion || fingerprint != schemaFingerprint {
+	if version == legacySchemaVersion && fingerprint == legacySchemaFingerprint && slicesEqual(tables, legacyTables) {
+		return migrateLegacySchema(ctx, database)
+	}
+	if version != schemaVersion || fingerprint != schemaFingerprint || !slicesEqual(tables, currentTables) {
 		return unsupportedSchema(
 			"version %d (%q), want %d (%q)",
 			version, fingerprint, schemaVersion, schemaFingerprint,
 		)
+	}
+	return nil
+}
+
+func slicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func migrateLegacySchema(ctx context.Context, database *sql.DB) error {
+	tx, err := database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return fmt.Errorf("begin workerkit state migration: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE workerkit_alerts (
+		  seq INTEGER PRIMARY KEY CHECK(seq > 0),
+		  record BLOB NOT NULL CHECK(length(record) > 0 AND length(record) <= 65536)
+		);
+		UPDATE workerkit_state_meta
+		SET schema_version = 2, schema_fingerprint = 'human-workerkit-state-v2-20260722a'
+		WHERE singleton = 1`); err != nil {
+		return fmt.Errorf("migrate workerkit state schema: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit workerkit state migration: %w", err)
 	}
 	return nil
 }
@@ -337,7 +446,7 @@ CREATE TABLE IF NOT EXISTS workerkit_state_meta (
   schema_fingerprint TEXT NOT NULL
 );
 INSERT INTO workerkit_state_meta (singleton, schema_version, schema_fingerprint)
-VALUES (1, 1, 'human-workerkit-state-v1-20260720a')
+VALUES (1, 2, 'human-workerkit-state-v2-20260722a')
 ON CONFLICT(singleton) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS workerkit_conversations (
@@ -345,5 +454,10 @@ CREATE TABLE IF NOT EXISTS workerkit_conversations (
   task TEXT NOT NULL CHECK(task <> ''),
   record BLOB NOT NULL CHECK(length(record) > 0 AND length(record) <= 8388608),
   PRIMARY KEY (caller, task)
+);
+
+CREATE TABLE IF NOT EXISTS workerkit_alerts (
+  seq INTEGER PRIMARY KEY CHECK(seq > 0),
+  record BLOB NOT NULL CHECK(length(record) > 0 AND length(record) <= 65536)
 );
 `

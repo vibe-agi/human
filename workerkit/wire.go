@@ -37,6 +37,13 @@ type Wire interface {
 	Err() error
 }
 
+// NoticeSource is an optional Wire extension surfacing transport-level alerts
+// a human must see (for example a quarantined durable outbox row). workerkit
+// consumes it when present and shows the notices in State.Alerts.
+type NoticeSource interface {
+	Notices() <-chan Notice
+}
+
 // WrapClient adapts the official durable remote client to Wire. The client
 // remains caller-owned: shut it down after the workerkit Worker.
 func WrapClient(client *workerws.Client) Wire {
@@ -98,13 +105,77 @@ func (wire *clientWire) ConfirmRejection(ctx context.Context, id llm.WorkerDeliv
 // the service's lifetime, and the service redelivers pending assignments on
 // reconnect exactly as it does for remote workers.
 func WrapConnection(connection llm.WorkerConnection) Wire {
-	return &connectionWire{connection: connection, rejections: make(chan Rejection, 64)}
+	wire := &connectionWire{
+		connection: connection,
+		rejections: make(chan Rejection, 64),
+		notices:    make(chan Notice, 8),
+		noticeStop: make(chan struct{}),
+		noticeDone: make(chan struct{}),
+	}
+	if noticer, ok := connection.(llm.WorkerNoticer); ok {
+		go wire.pumpNotices(noticer)
+	} else {
+		close(wire.notices)
+		close(wire.noticeDone)
+	}
+	return wire
 }
 
 type connectionWire struct {
 	connection llm.WorkerConnection
 	mu         sync.Mutex
 	rejections chan Rejection
+	notices    chan Notice
+	noticeStop chan struct{}
+	noticeDone chan struct{}
+	stopOnce   sync.Once
+}
+
+var _ NoticeSource = (*connectionWire)(nil)
+
+// Notices implements NoticeSource so transport-level alerts the in-process
+// service surfaces (e.g. a caller disconnect) reach the human's State.Alerts.
+// A connection that is not a WorkerNoticer simply yields an idle channel.
+func (wire *connectionWire) Notices() <-chan Notice { return wire.notices }
+
+// pumpNotices forwards the connection's advisory WorkerNotices to workerkit's
+// Notice surface, exiting when the connection is Done or workerkit shuts down.
+// Closing wire.notices is safe because this goroutine is its only sender.
+func (wire *connectionWire) pumpNotices(noticer llm.WorkerNoticer) {
+	defer close(wire.notices)
+	defer close(wire.noticeDone)
+	source := noticer.Notices()
+	for {
+		select {
+		case notice, open := <-source:
+			if !open {
+				return
+			}
+			select {
+			case wire.notices <- Notice{
+				Code: notice.Code, Message: notice.Message,
+				Caller: notice.Caller, TaskID: notice.TaskID, RequestID: notice.RequestID,
+			}:
+			case <-wire.connection.Done():
+				return
+			case <-wire.noticeStop:
+				return
+			}
+		case <-wire.connection.Done():
+			return
+		case <-wire.noticeStop:
+			return
+		}
+	}
+}
+
+// stopNotices releases the adapter-owned forwarding goroutine without closing
+// the borrowed WorkerConnection. Worker invokes it during Shutdown; this keeps
+// adapter lifetime aligned with its sole consumer even when the host keeps the
+// underlying connection alive a little longer.
+func (wire *connectionWire) stopNotices() {
+	wire.stopOnce.Do(func() { close(wire.noticeStop) })
+	<-wire.noticeDone
 }
 
 func (wire *connectionWire) Assignments() <-chan llm.WorkerAssignmentDelivery {

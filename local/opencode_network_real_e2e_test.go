@@ -22,7 +22,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vibe-agi/human/gateway"
 	"github.com/vibe-agi/human/internal/completion/adapter"
 )
 
@@ -94,7 +93,7 @@ func runRealOpenCodeNetworkScenario(t *testing.T, binary string, scenario realOp
 
 	root := t.TempDir()
 	callerWorkspace := filepath.Join(root, "caller-workspace")
-	mirrorRoot := filepath.Join(root, "human-mirrors")
+	humanWorkspaceRoot := filepath.Join(root, "human-workspaces")
 	privateRoot := filepath.Join(root, "private")
 	home := filepath.Join(root, "opencode-home")
 	configHome := filepath.Join(root, "opencode-config")
@@ -103,7 +102,7 @@ func runRealOpenCodeNetworkScenario(t *testing.T, binary string, scenario realOp
 	cacheHome := filepath.Join(root, "opencode-cache")
 	temporaryHome := filepath.Join(root, "opencode-tmp")
 	for _, directory := range []string{
-		callerWorkspace, mirrorRoot, privateRoot, home, configHome, dataHome, stateHome, cacheHome, temporaryHome,
+		callerWorkspace, humanWorkspaceRoot, privateRoot, home, configHome, dataHome, stateHome, cacheHome, temporaryHome,
 	} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			t.Fatal(err)
@@ -119,20 +118,17 @@ func runRealOpenCodeNetworkScenario(t *testing.T, binary string, scenario realOp
 	runContext, cancel := context.WithTimeout(context.Background(), runTimeout)
 	defer cancel()
 	instance, err := Open(runContext, Config{
-		Gateway: gateway.Config{
-			DatabasePath:      filepath.Join(privateRoot, "gateway.db"),
-			HeartbeatInterval: 100 * time.Millisecond,
-			MaxPending:        maxPending,
+		Public: PublicStackConfig{
+			DatabasePath:    filepath.Join(privateRoot, "store.db"),
+			CallerHeartbeat: 100 * time.Millisecond,
+			MaxPending:      maxPending,
 		},
-		Worker: WorkerPaths{
-			MirrorRoot: mirrorRoot,
-			OutboxPath: filepath.Join(privateRoot, "worker-outbox.db"),
-		},
-		ListenAddress:    "127.0.0.1:0",
-		WebListenAddress: "127.0.0.1:0",
-		WebStatePath:     filepath.Join(privateRoot, "workerkit-state.db"),
-		CallerSubject:    "network-e2e-caller",
-		WorkerSubject:    "network-e2e-worker",
+		HumanWorkspaceRoot: humanWorkspaceRoot,
+		ListenAddress:      "127.0.0.1:0",
+		WebListenAddress:   "127.0.0.1:0",
+		WebStatePath:       filepath.Join(privateRoot, "workerkit-state.db"),
+		CallerSubject:      "network-e2e-caller",
+		WorkerSubject:      "network-e2e-worker",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -376,7 +372,6 @@ func writeRealOpenCodeNetworkConfig(t *testing.T, workspace, baseURL, callerToke
 					"X-Human-Workspace-Key":   "opencode-network-e2e",
 					"X-Human-Harness-Id":      adapter.OpenCodeID,
 					"X-Human-Harness-Version": adapter.OpenCodeVersion,
-					"X-Human-Workspace-Root":  workspace,
 					"X-Human-Allow-Exec":      "true",
 				},
 			},

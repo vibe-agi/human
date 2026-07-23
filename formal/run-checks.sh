@@ -179,6 +179,7 @@ expect_success llm-liveness "$FORMAL/HumanLLM.tla" "$FORMAL/HumanLLMLiveness.cfg
 expect_success llm-no-caller "$FORMAL/HumanLLM.tla" "$FORMAL/HumanLLMNoCaller.cfg" 50
 expect_success llm-transition-oracles "$FORMAL/HumanLLM.tla" "$FORMAL/HumanLLMTransitionOracles.cfg" 1000
 expect_success llm-continuous-progress "$FORMAL/HumanLLM.tla" "$FORMAL/HumanLLMProgress.cfg" 5
+expect_success llm-resume-preempt "$FORMAL/HumanLLM.tla" "$FORMAL/HumanLLMPreempt.cfg" 10000
 
 expect_success agent-safety "$FORMAL/HumanAgent.tla" "$FORMAL/HumanAgentSafety.cfg" 250000
 expect_success agent-liveness "$FORMAL/HumanAgent.tla" "$FORMAL/HumanAgentLiveness.cfg" 500

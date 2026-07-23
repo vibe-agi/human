@@ -2,11 +2,17 @@ package workerws_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -565,6 +571,169 @@ func TestClientSupportsStaticHTTPHeaderWithoutHeaderProvider(t *testing.T) {
 	shutdownClientTestClient(t, client)
 }
 
+func TestClientRefreshesShortLivedCredentialOnEveryReconnect(t *testing.T) {
+	journal, _ := humantest.NewMemoryLLMWorkerJournal()
+	endpoint := newClientTestEndpoint()
+	var credential atomic.Value
+	credential.Store("worker-token-1")
+	var providerCalls atomic.Int64
+	transport, err := workerws.New(workerws.Config{
+		GatewayID: "gateway-a",
+		Authenticator: workerws.AuthenticateFunc(func(_ context.Context, request *http.Request) (workerws.Identity, error) {
+			want := "Bearer " + credential.Load().(string)
+			if request.Header.Get("Authorization") != want {
+				return workerws.Identity{}, errors.New("stale worker credential")
+			}
+			return workerws.Identity{Worker: "worker-a"}, nil
+		}),
+		PingInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := transport.Start(t.Context(), endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hijacked := make(chan net.Conn, 4)
+	server := httptest.NewUnstartedServer(transport)
+	server.Config.ConnState = func(connection net.Conn, state http.ConnState) {
+		if state == http.StateHijacked {
+			hijacked <- connection
+		}
+	}
+	server.Start()
+	defer server.Close()
+	defer runtime.Shutdown(context.Background())
+	config := clientTestConfig(
+		"ws"+strings.TrimPrefix(server.URL, "http"), framework.Borrow[workerws.Journal](journal),
+	)
+	config.HeaderProvider = workerws.HeaderProviderFunc(func(context.Context) (http.Header, error) {
+		providerCalls.Add(1)
+		return http.Header{"Authorization": []string{"Bearer " + credential.Load().(string)}}, nil
+	})
+	client, err := workerws.NewClient(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdownClientTestClient(t, client)
+
+	first := endpoint.connection(t)
+	var firstSocket net.Conn
+	select {
+	case firstSocket = <-hijacked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker WebSocket was not observed as a hijacked HTTP connection")
+	}
+	credential.Store("worker-token-2")
+	// A deployment proxy or listener restart drops the socket without a
+	// protocol close frame. The durable client must redial and ask the provider
+	// for a fresh short-lived credential rather than replaying stale headers.
+	if err := firstSocket.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second := endpoint.connection(t)
+	if second.principal.WorkerID != "worker-a" || second.principal.SessionID == first.principal.SessionID {
+		t.Fatalf("rotated reconnect principal = %#v, first = %#v", second.principal, first.principal)
+	}
+	if providerCalls.Load() < 2 {
+		t.Fatalf("header provider calls = %d, want at least two", providerCalls.Load())
+	}
+}
+
+func TestClientReconnectsAcrossHostManagedTLSCertificateRotation(t *testing.T) {
+	journal, _ := humantest.NewMemoryLLMWorkerJournal()
+	endpoint := newClientTestEndpoint()
+	transport, err := workerws.New(workerws.Config{
+		GatewayID: "gateway-a",
+		Authenticator: workerws.AuthenticateFunc(func(context.Context, *http.Request) (workerws.Identity, error) {
+			return workerws.Identity{Worker: "worker-a"}, nil
+		}),
+		PingInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := transport.Start(t.Context(), endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Shutdown(context.Background())
+
+	firstCertificate, firstRoots := clientTestTLSIdentity(t, 1)
+	secondCertificate, secondRoots := clientTestTLSIdentity(t, 2)
+	var activeCertificate atomic.Value
+	activeCertificate.Store(firstCertificate)
+	var activeRoots atomic.Value
+	activeRoots.Store(firstRoots)
+	var handshakes atomic.Int64
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			handshakes.Add(1)
+			certificate := activeCertificate.Load().(tls.Certificate)
+			return &certificate, nil
+		},
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hijacked := make(chan net.Conn, 4)
+	httpServer := &http.Server{Handler: transport, ConnState: func(connection net.Conn, state http.ConnState) {
+		if state == http.StateHijacked {
+			hijacked <- connection
+		}
+	}}
+	go func() { _ = httpServer.Serve(tls.NewListener(listener, tlsConfig)) }()
+	defer httpServer.Close()
+
+	dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: time.Second}}
+	httpTransport := &http.Transport{
+		DialTLSContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			clone := *dialer
+			clone.Config = &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				RootCAs:    activeRoots.Load().(*x509.CertPool),
+			}
+			return clone.DialContext(ctx, network, address)
+		},
+	}
+	defer httpTransport.CloseIdleConnections()
+	config := clientTestConfig(
+		"wss://"+listener.Addr().String(), framework.Borrow[workerws.Journal](journal),
+	)
+	config.HTTPClient = &http.Client{Transport: httpTransport}
+	client, err := workerws.NewClient(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdownClientTestClient(t, client)
+
+	first := endpoint.connection(t)
+	var firstSocket net.Conn
+	select {
+	case firstSocket = <-hijacked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first WSS connection was not observed")
+	}
+	// Rotate both the served certificate and the host-owned trust bundle, then
+	// emulate a proxy rolling restart. The durable client must reconnect using
+	// its injected HTTP transport; HumanLLM itself never owns certificate files.
+	activeCertificate.Store(secondCertificate)
+	activeRoots.Store(secondRoots)
+	if err := firstSocket.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second := endpoint.connection(t)
+	if second.principal.SessionID == first.principal.SessionID {
+		t.Fatalf("certificate rotation reused worker session %q", second.principal.SessionID)
+	}
+	if handshakes.Load() < 2 {
+		t.Fatalf("TLS handshakes = %d, want at least two", handshakes.Load())
+	}
+}
+
 func TestClientUsesInjectedReconnectBackoff(t *testing.T) {
 	journal, _ := humantest.NewMemoryLLMWorkerJournal()
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
@@ -776,6 +945,38 @@ func clientTestConfig(target string, journal framework.Resource[workerws.Journal
 	}
 }
 
+func clientTestTLSIdentity(t *testing.T, serial int64) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	encoded, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(leaf)
+	return tls.Certificate{
+		Certificate: [][]byte{encoded}, PrivateKey: privateKey, Leaf: leaf,
+	}, pool
+}
+
 func shutdownClientTestClient(t *testing.T, client *workerws.Client) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -794,7 +995,6 @@ func clientTestAssignment(id llm.WorkerDeliveryID) llm.WorkerAssignmentDelivery 
 			Task: llm.TaskContext{
 				TaskID: "task-a", WorkspaceKey: "workspace-a", CapabilityTier: llm.TierWorkspace,
 				HarnessID: "harness-a", HarnessVersion: "1", HarnessSessionID: "session-a",
-				WorkspaceRoot: "/workspace/a",
 			},
 			Request: llm.Request{
 				Model: "human", Stream: true,

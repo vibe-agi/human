@@ -1,16 +1,11 @@
-// Package local runs a complete Human Agent instance in one process.
-//
-// It owns a loopback HTTP listener, an embedded SQLite-backed gateway, and
-// the browser human side (workerkit + web over the worker bridge). Local
-// intentionally uses built-in tokens and never persists their plaintext
-// values. Credentials issued by Open are revoked on Close by default; an
-// embedding application may explicitly preserve and persist the returned pair.
+// Package local runs the batteries-included HumanLLM desktop composition in
+// one process: a loopback caller endpoint, an SQLite-backed llm.Service, and a
+// browser human side connected in-process through workerkit.
 package local
 
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -23,10 +18,8 @@ import (
 	"time"
 
 	"github.com/vibe-agi/human/framework"
-	"github.com/vibe-agi/human/gateway"
 	"github.com/vibe-agi/human/internal/sqlitefile"
 	"github.com/vibe-agi/human/internal/userdata"
-	"github.com/vibe-agi/human/internal/workerbridge"
 	"github.com/vibe-agi/human/llm"
 	"github.com/vibe-agi/human/web"
 	"github.com/vibe-agi/human/workerkit"
@@ -42,30 +35,12 @@ const (
 	defaultShutdownWait  = 5 * time.Second
 )
 
-// IssuedCredentialPolicy defines who owns credentials created by Local.Open.
-// The zero value is intentionally safe for short-lived embedders.
-type IssuedCredentialPolicy uint8
-
-const (
-	// IssuedCredentialsRevokeOnClose keeps newly issued credentials process-local
-	// and revokes them during Close. Existing credentials and credentials returned
-	// by CredentialProvider are always owned by their caller and are not revoked.
-	IssuedCredentialsRevokeOnClose IssuedCredentialPolicy = iota
-	// IssuedCredentialsPreserve transfers ownership of newly issued credentials
-	// to the embedder, which must persist or revoke both values deliberately.
-	IssuedCredentialsPreserve
-)
-
-// Config controls a one-process local deployment. Gateway.Authenticator must
-// be nil: local provisions built-in caller and worker tokens, reuses an
-// existing pair, or obtains one from CredentialProvider so the private
-// WebSocket and public model routes use the same embedded identity store.
-//
-// Library paths are passed through literally; shell syntax such as ~ is not
-// expanded.
+// Config controls the reference one-process deployment. It intentionally
+// exposes only policy and durable locations owned by this composition. Hosts
+// needing different authentication, stores, routing, transports, or UIs
+// compose the public llm, callerhttp, and workerkit ports directly.
 type Config struct {
-	Gateway gateway.Config
-	Worker  WorkerPaths
+	Public PublicStackConfig
 
 	ListenAddress   string
 	CallerSubject   string
@@ -76,105 +51,116 @@ type Config struct {
 	// Empty asks the kernel for a free loopback port.
 	WebListenAddress string
 	// WebStatePath is the durable workerkit conversation state used by the web
-	// human side. Empty derives a private workerkit-state.db in OS user data
-	// next to the other local databases.
+	// human side. Empty derives workerkit-state.db in workspace-scoped user data.
 	WebStatePath string
-	// WebDisableAutoTitle turns off the default web-mode auto-responder that
-	// answers tool-less chat requests (OpenCode's hidden title/summary
-	// generation) with a derived title so only real turns reach the inbox.
-	// Disable it for callers whose genuine conversations declare no tools.
+	// WebStateStore optionally supplies an application-owned implementation.
+	// Local borrows it and ignores WebStatePath. The built-in implementation is
+	// SQLite; this is the replacement seam for embedders.
+	WebStateStore workerkit.StateStore
+	// WebStateDisabled selects the reference in-memory implementation and turns
+	// off the filesystem mirror baseline.
+	WebStateDisabled bool
+	// WebDisableAutoTitle routes tool-less chat requests to the inbox instead of
+	// using the built-in title responder.
 	WebDisableAutoTitle bool
 
-	// IssuedCredentialPolicy applies only when neither Existing* credentials nor
-	// CredentialProvider are supplied and Local.Open therefore issues a new pair.
-	// The zero value revokes that pair on Close. Select Preserve before Open only
-	// when the embedding application durably owns both returned secrets.
-	IssuedCredentialPolicy IssuedCredentialPolicy
+	// HumanWorkspaceRoot is the Human-side base directory. New workspace-tier
+	// conversations receive stable child directories here; the Human may later
+	// select a different existing repo per conversation in the Web UI.
+	// It never describes the Agent user's cwd.
+	HumanWorkspaceRoot string
 
-	// ExistingCallerToken and ExistingWorkerToken reuse credentials already
-	// issued into Gateway.DatabasePath. Supply both or neither. Local binds both
-	// tokens to their expected principal type and configured subject before any
-	// request is served; the worker then also crosses the real WebSocket
-	// handshake. Existing key IDs are optional, but when known they must also be
-	// supplied as a pair and match the authenticated tokens exactly.
+	// ExistingCallerToken reuses a host-owned bearer/API key. Empty creates an
+	// ephemeral token returned by CallerToken/Credentials; Local never persists
+	// or revokes host credentials.
 	ExistingCallerToken string
-	ExistingWorkerToken string
-	ExistingCallerKeyID string
-	ExistingWorkerKeyID string
-
-	// CredentialProvider runs after the embedded gateway has recovered but
-	// before HTTP serving or the worker starts. It lets an embedding application
-	// complete a durable two-phase credential journal against the exact gateway
-	// instance that Local will use. When set, Existing* fields must be empty and
-	// the returned pair is validated against CallerSubject and WorkerSubject.
-	CredentialProvider func(context.Context, *gateway.Server) (Credentials, error)
 }
 
-// WorkerPaths selects the human-side durable locations: the Live Workspace
-// mirror root and the durable worker outbox carrying events across restarts.
-type WorkerPaths struct {
-	MirrorRoot  string
-	OutboxPath  string
-	OutboxScope string
+// PublicStackConfig selects operational policy for the reference composition.
+// Scheduling remains a host concern: Local drives the public RunExpiry and
+// RunRetention operations using these intervals.
+type PublicStackConfig struct {
+	DatabasePath           string
+	CallerWriteTimeout     time.Duration
+	CallerHeartbeat        time.Duration
+	MaxPending             time.Duration
+	ExpirySweepInterval    time.Duration
+	ReplayPayloadGrace     time.Duration
+	RetentionSweepInterval time.Duration
+	AssignmentBuffer       int
 }
 
-// Credentials are the plaintext values needed by a local caller and worker.
-// NewlyIssued is true only when Open created both credentials. The library
-// keeps these values in memory. Newly issued values are revoked on Close unless
-// Config explicitly selects IssuedCredentialsPreserve; a preserving application
-// owns encrypted or mode-0600 persistence and later revocation outside this
-// package.
+// Credentials are the caller-side secret for the local model endpoint.
+// NewlyIssued is true only for an ephemeral token allocated by Open. The
+// in-process worker has no credential surface.
 type Credentials struct {
 	CallerToken string
-	WorkerToken string
-	CallerKeyID string
-	WorkerKeyID string
 	NewlyIssued bool
 }
 
-// DefaultConfig returns local desktop defaults. Private databases are absolute
-// paths in OS user data, scoped by the real nearest Git workspace (or the real
-// current directory when no Git root exists), so opening Local cannot create
-// state inside a customer checkout implicitly.
+// DefaultConfig returns a complete workspace-scoped public-stack
+// configuration. Private databases live in OS user data; the Human workspace
+// base is the only intentionally user-visible tree.
 func DefaultConfig() (Config, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return Config{}, fmt.Errorf("resolve default local mirror root: %w", err)
+		return Config{}, fmt.Errorf("resolve default Human workspace: %w", err)
 	}
-	workspaceRoot, err := userdata.ResolveGitWorkspace(".")
+	workspaceRoot, err := resolveHumanWorkspaceRoot(filepath.Join(home, "human-workspace"))
 	if err != nil {
-		return Config{}, fmt.Errorf("resolve default local workspace: %w", err)
+		return Config{}, err
 	}
-	gatewayPath, err := userdata.WorkspacePath("local", workspaceRoot, "gateway.db")
+	return defaultsForHumanWorkspace(workspaceRoot)
+}
+
+func defaultsForHumanWorkspace(workspaceRoot string) (Config, error) {
+	storePath, err := userdata.WorkspacePath("local", workspaceRoot, "store.db")
 	if err != nil {
-		return Config{}, fmt.Errorf("resolve default local gateway path: %w", err)
+		return Config{}, fmt.Errorf("resolve default local service path: %w", err)
 	}
-	outboxPath, err := userdata.WorkspacePath("local", workspaceRoot, "worker-outbox.db")
-	if err != nil {
-		return Config{}, fmt.Errorf("resolve default local worker outbox path: %w", err)
-	}
-	webStatePath, err := userdata.WorkspacePath("local", workspaceRoot, "workerkit-state.db")
+	statePath, err := userdata.WorkspacePath("local", workspaceRoot, "workerkit-state.db")
 	if err != nil {
 		return Config{}, fmt.Errorf("resolve default local web state path: %w", err)
 	}
-	gatewayConfig := gateway.DefaultConfig()
-	gatewayConfig.DatabasePath = gatewayPath
-	workerConfig := WorkerPaths{MirrorRoot: filepath.Join(home, "mirror"), OutboxPath: outboxPath}
 	return Config{
-		Gateway:         gatewayConfig,
-		Worker:          workerConfig,
-		ListenAddress:   DefaultListenAddress,
-		CallerSubject:   defaultCallerSubject,
-		WorkerSubject:   defaultWorkerSubject,
-		ShutdownTimeout: defaultShutdownWait,
-		WebStatePath:    webStatePath,
+		Public: PublicStackConfig{
+			DatabasePath: storePath, CallerWriteTimeout: 10 * time.Second,
+			CallerHeartbeat: 15 * time.Second, MaxPending: 10 * time.Minute,
+			ExpirySweepInterval: 30 * time.Second, ReplayPayloadGrace: 24 * time.Hour,
+			RetentionSweepInterval: time.Hour, AssignmentBuffer: 32,
+		},
+		ListenAddress:      DefaultListenAddress,
+		CallerSubject:      defaultCallerSubject,
+		WorkerSubject:      defaultWorkerSubject,
+		ShutdownTimeout:    defaultShutdownWait,
+		WebListenAddress:   "127.0.0.1:0",
+		WebStatePath:       statePath,
+		HumanWorkspaceRoot: workspaceRoot,
 	}, nil
 }
 
 func (config Config) withDefaults() (Config, error) {
-	defaults, err := DefaultConfig()
+	if strings.TrimSpace(config.HumanWorkspaceRoot) == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return Config{}, fmt.Errorf("resolve default Human workspace: %w", err)
+		}
+		config.HumanWorkspaceRoot = filepath.Join(home, "human-workspace")
+	}
+	var err error
+	config.HumanWorkspaceRoot, err = resolveHumanWorkspaceRoot(config.HumanWorkspaceRoot)
 	if err != nil {
 		return Config{}, err
+	}
+	defaults, err := defaultsForHumanWorkspace(config.HumanWorkspaceRoot)
+	if err != nil {
+		return Config{}, err
+	}
+	if strings.TrimSpace(config.Public.DatabasePath) == "" {
+		config.Public.DatabasePath, err = userdata.WorkspacePath("local", config.HumanWorkspaceRoot, "store.db")
+		if err != nil {
+			return Config{}, fmt.Errorf("resolve local service path: %w", err)
+		}
 	}
 	if strings.TrimSpace(config.ListenAddress) == "" {
 		config.ListenAddress = defaults.ListenAddress
@@ -192,58 +178,77 @@ func (config Config) withDefaults() (Config, error) {
 		return Config{}, errors.New("open local: shutdown timeout must be positive")
 	}
 	if strings.TrimSpace(config.WebListenAddress) == "" {
-		config.WebListenAddress = "127.0.0.1:0"
+		config.WebListenAddress = defaults.WebListenAddress
 	}
-	if strings.TrimSpace(config.WebStatePath) == "" {
-		config.WebStatePath = defaults.WebStatePath
+	if config.WebStateDisabled && config.WebStateStore != nil {
+		return Config{}, errors.New("open local: WebStateDisabled and WebStateStore are mutually exclusive")
 	}
-	if config.IssuedCredentialPolicy != IssuedCredentialsRevokeOnClose &&
-		config.IssuedCredentialPolicy != IssuedCredentialsPreserve {
-		return Config{}, errors.New("open local: issued credential policy is invalid")
+	if !config.WebStateDisabled && config.WebStateStore == nil && strings.TrimSpace(config.WebStatePath) == "" {
+		config.WebStatePath, err = userdata.WorkspacePath("local", config.HumanWorkspaceRoot, "workerkit-state.db")
+		if err != nil {
+			return Config{}, fmt.Errorf("resolve local web state path: %w", err)
+		}
 	}
-	if strings.TrimSpace(config.Gateway.DatabasePath) == "" {
-		config.Gateway.DatabasePath = defaults.Gateway.DatabasePath
+	if config.Public.CallerWriteTimeout == 0 {
+		config.Public.CallerWriteTimeout = defaults.Public.CallerWriteTimeout
 	}
-	if strings.TrimSpace(config.Worker.MirrorRoot) == "" {
-		config.Worker.MirrorRoot = defaults.Worker.MirrorRoot
+	if config.Public.CallerHeartbeat == 0 {
+		config.Public.CallerHeartbeat = defaults.Public.CallerHeartbeat
 	}
-	if strings.TrimSpace(config.Worker.OutboxPath) == "" {
-		config.Worker.OutboxPath = defaults.Worker.OutboxPath
+	if config.Public.MaxPending == 0 {
+		config.Public.MaxPending = defaults.Public.MaxPending
 	}
-	config.ExistingCallerToken = strings.TrimSpace(config.ExistingCallerToken)
-	config.ExistingWorkerToken = strings.TrimSpace(config.ExistingWorkerToken)
-	config.ExistingCallerKeyID = strings.TrimSpace(config.ExistingCallerKeyID)
-	config.ExistingWorkerKeyID = strings.TrimSpace(config.ExistingWorkerKeyID)
-	if (config.ExistingCallerToken == "") != (config.ExistingWorkerToken == "") {
-		return Config{}, errors.New("open local: existing caller and worker tokens must be supplied together")
+	if config.Public.ExpirySweepInterval == 0 {
+		config.Public.ExpirySweepInterval = defaults.Public.ExpirySweepInterval
 	}
-	if (config.ExistingCallerKeyID == "") != (config.ExistingWorkerKeyID == "") {
-		return Config{}, errors.New("open local: existing caller and worker key IDs must be supplied together")
+	if config.Public.ReplayPayloadGrace == 0 {
+		config.Public.ReplayPayloadGrace = defaults.Public.ReplayPayloadGrace
 	}
-	if config.ExistingCallerToken == "" && config.ExistingCallerKeyID != "" {
-		return Config{}, errors.New("open local: existing key IDs require existing caller and worker tokens")
+	if config.Public.RetentionSweepInterval == 0 {
+		config.Public.RetentionSweepInterval = defaults.Public.RetentionSweepInterval
 	}
-	if config.CredentialProvider != nil && config.ExistingCallerToken != "" {
-		return Config{}, errors.New("open local: credential provider and existing credentials are mutually exclusive")
+	if config.Public.CallerWriteTimeout < 0 || config.Public.CallerHeartbeat < 0 ||
+		config.Public.MaxPending < 0 || config.Public.ExpirySweepInterval < 0 ||
+		config.Public.ReplayPayloadGrace < 0 || config.Public.RetentionSweepInterval < 0 {
+		return Config{}, errors.New("open local: public stack durations must be positive")
 	}
-	if config.Gateway.Authenticator != nil {
-		return Config{}, errors.New("open local: custom gateway authenticator is not supported; compose gateway and worker directly")
+	if config.Public.AssignmentBuffer < 0 || config.Public.AssignmentBuffer > 4096 {
+		return Config{}, errors.New("open local: assignment buffer must be 1..4096 (or zero for the default)")
 	}
 	config.ListenAddress = strings.TrimSpace(config.ListenAddress)
+	config.WebListenAddress = strings.TrimSpace(config.WebListenAddress)
 	config.CallerSubject = strings.TrimSpace(config.CallerSubject)
 	config.WorkerSubject = strings.TrimSpace(config.WorkerSubject)
+	config.ExistingCallerToken = strings.TrimSpace(config.ExistingCallerToken)
 	return config, nil
 }
 
-// Local owns one embedded gateway, loopback HTTP server, and worker. Close is
-// idempotent. Run owns one Bubble Tea program lifetime; open a new Local to run
-// another program after it returns, matching worker.Worker.
-type Local struct {
-	gateway      *gateway.Server
-	gatewayWSURL string
+func resolveHumanWorkspaceRoot(value string) (string, error) {
+	absolute, err := filepath.Abs(strings.TrimSpace(value))
+	if err != nil || strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("resolve Human workspace: path is required")
+	}
+	if err := os.MkdirAll(absolute, 0o700); err != nil {
+		return "", fmt.Errorf("create Human workspace: %w", err)
+	}
+	canonical, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("resolve Human workspace: %w", err)
+	}
+	info, err := os.Stat(canonical)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("resolve Human workspace: path is not a directory")
+	}
+	return canonical, nil
+}
 
-	// Web human-side composition, populated only in web mode.
-	webBridge       *workerbridge.Bridge
+// Local owns the reference service, caller transport, loopback HTTP servers,
+// workerkit worker, mirror, and built-in StateStore resource. Close is
+// idempotent.
+type Local struct {
+	service       *llm.Service
+	callerRuntime llm.CallerTransportRuntime
+
 	webMirror       *fsmirror.Mirror
 	webWorker       *workerkit.Worker
 	webServer       *web.Server
@@ -265,16 +270,13 @@ type Local struct {
 	serveMu   sync.Mutex
 	serveErr  error
 
-	closeOnce        sync.Once
-	closeErr         error
-	revokeOnClose    bool // safe default policy, and always true while rolling back a failed Open
-	issuedDuringOpen bool // true as soon as the first built-in token is issued
+	closeOnce sync.Once
+	closeErr  error
 }
 
-// Open starts a complete local instance. It binds only an IP loopback
-// interface, opens and recovers the gateway, issues or validates built-in
-// tokens, starts HTTP serving, and connects the in-process worker to the actual
-// WebSocket address. Any partial failure closes every component already opened.
+// Open starts the public reference composition. Any partial failure closes all
+// components already opened. The local package is intentionally in-process;
+// distributed gateway/worker transports are composed by their own products.
 func Open(ctx context.Context, config Config) (*Local, error) {
 	if ctx == nil {
 		return nil, errors.New("open local: context is required")
@@ -283,224 +285,37 @@ func Open(ctx context.Context, config Config) (*Local, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := rejectPendingOfflineRestore(config.Gateway.DatabasePath); err != nil {
+	if err := rejectPendingOfflineRestore(config.Public.DatabasePath); err != nil {
 		return nil, err
 	}
-
-	listener, err := net.Listen("tcp", config.ListenAddress)
-	if err != nil {
-		return nil, fmt.Errorf("open local listener: %w", err)
-	}
-	if err := requireLoopback(listener.Addr()); err != nil {
-		_ = listener.Close()
-		return nil, err
-	}
-
-	runContext, cancel := context.WithCancel(ctx)
-	gatewayServer, err := gateway.Open(runContext, config.Gateway)
-	if err != nil {
-		cancel()
-		_ = listener.Close()
-		return nil, fmt.Errorf("open local gateway: %w", err)
-	}
-
-	instance := &Local{
-		gateway:         gatewayServer,
-		listener:        listener,
-		baseURL:         "http://" + listener.Addr().String(),
-		runContext:      runContext,
-		cancel:          cancel,
-		shutdownTimeout: config.ShutdownTimeout,
-		serveDone:       make(chan struct{}),
-		revokeOnClose:   config.IssuedCredentialPolicy == IssuedCredentialsRevokeOnClose,
-	}
-	cleanupFailure := func(openErr error) (*Local, error) {
-		instance.revokeOnClose = true
-		if closeErr := instance.Close(); closeErr != nil {
-			openErr = errors.Join(openErr, fmt.Errorf("clean up local instance: %w", closeErr))
-		}
-		return nil, openErr
-	}
-
-	if config.CredentialProvider != nil {
-		provided, err := config.CredentialProvider(runContext, gatewayServer)
-		if err != nil {
-			return cleanupFailure(fmt.Errorf("provide local credentials: %w", err))
-		}
-		callerPrincipal, err := bindExistingCredential(
-			runContext, gatewayServer, "caller", provided.CallerToken,
-			gateway.PrincipalCaller, config.CallerSubject, provided.CallerKeyID,
-		)
-		if err != nil {
-			return cleanupFailure(err)
-		}
-		workerPrincipal, err := bindExistingCredential(
-			runContext, gatewayServer, "worker", provided.WorkerToken,
-			gateway.PrincipalWorker, config.WorkerSubject, provided.WorkerKeyID,
-		)
-		if err != nil {
-			return cleanupFailure(err)
-		}
-		instance.credentials = Credentials{
-			CallerToken: provided.CallerToken, WorkerToken: provided.WorkerToken,
-			CallerKeyID: callerPrincipal.KeyID, WorkerKeyID: workerPrincipal.KeyID,
-		}
-	} else if config.ExistingCallerToken == "" {
-		callerToken, err := gatewayServer.Issue(runContext, gateway.PrincipalCaller, config.CallerSubject)
-		if err != nil {
-			return cleanupFailure(fmt.Errorf("issue local caller token: %w", err))
-		}
-		instance.credentials.CallerToken = callerToken.Secret
-		instance.credentials.CallerKeyID = callerToken.KeyID
-		// Set this before issuing the worker token. If that second Issue fails,
-		// rollback must still revoke the already-created caller credential.
-		instance.issuedDuringOpen = true
-
-		workerToken, err := gatewayServer.Issue(runContext, gateway.PrincipalWorker, config.WorkerSubject)
-		if err != nil {
-			return cleanupFailure(fmt.Errorf("issue local worker token: %w", err))
-		}
-		instance.credentials.WorkerToken = workerToken.Secret
-		instance.credentials.WorkerKeyID = workerToken.KeyID
-		instance.credentials.NewlyIssued = true
-	} else {
-		callerPrincipal, err := bindExistingCredential(
-			runContext, gatewayServer, "caller", config.ExistingCallerToken,
-			gateway.PrincipalCaller, config.CallerSubject, config.ExistingCallerKeyID,
-		)
-		if err != nil {
-			return cleanupFailure(err)
-		}
-		workerPrincipal, err := bindExistingCredential(
-			runContext, gatewayServer, "worker", config.ExistingWorkerToken,
-			gateway.PrincipalWorker, config.WorkerSubject, config.ExistingWorkerKeyID,
-		)
-		if err != nil {
-			return cleanupFailure(err)
-		}
-		instance.credentials = Credentials{
-			CallerToken: config.ExistingCallerToken,
-			WorkerToken: config.ExistingWorkerToken,
-			CallerKeyID: callerPrincipal.KeyID,
-			WorkerKeyID: workerPrincipal.KeyID,
-		}
-	}
-
-	instance.httpServer = &http.Server{
-		Handler:           gatewayServer,
-		BaseContext:       func(net.Listener) context.Context { return runContext },
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	go instance.serve()
-
-	instance.gatewayWSURL = "ws://" + listener.Addr().String() + gateway.WorkerPath
-	if strings.TrimSpace(config.Worker.OutboxScope) == "" {
-		scope, resolveErr := localOutboxScope(config.Gateway.DatabasePath)
-		if resolveErr != nil {
-			return cleanupFailure(fmt.Errorf("resolve local gateway outbox identity: %w", resolveErr))
-		}
-		config.Worker.OutboxScope = scope
-	}
-	if err := instance.openWebHumanSide(runContext, config); err != nil {
-		return cleanupFailure(err)
-	}
-
-	select {
-	case <-instance.serveDone:
-		serveErr := instance.loadServeError()
-		if serveErr == nil {
-			serveErr = errors.New("HTTP server stopped during startup")
-		}
-		return cleanupFailure(fmt.Errorf("open local HTTP server: %w", serveErr))
-	default:
-	}
-	go func() {
-		<-runContext.Done()
-		_ = instance.Close()
-	}()
-	return instance, nil
+	return openPublicStackInstance(ctx, config)
 }
 
-// openWebHumanSide composes the browser human side: the legacy worker bridge
-// over the same durable outbox identity the TUI would use, workerkit with its
-// own durable conversation state, and the web UI on a dedicated loopback
-// listener with a per-start session token.
-func (local *Local) openWebHumanSide(ctx context.Context, config Config) error {
-	bridge, err := workerbridge.Dial(ctx, workerbridge.Config{
-		URL: local.gatewayWSURL, Token: local.credentials.WorkerToken,
-		OutboxPath: config.Worker.OutboxPath, OutboxScope: config.Worker.OutboxScope,
-	})
-	if err != nil {
-		return fmt.Errorf("open local web worker bridge: %w", err)
+func (local *Local) openWebState(ctx context.Context, config Config) (workerkit.StateStore, string, error) {
+	if config.WebStateStore != nil {
+		return config.WebStateStore, "", nil
 	}
-	local.webBridge = bridge
-
+	if config.WebStateDisabled {
+		state, release := workerkit.NewMemoryStateStore()
+		local.webStateRelease = release
+		return state, "", nil
+	}
 	stateResource, err := workerkitsqlite.Open(ctx, workerkitsqlite.Config{Path: config.WebStatePath})
 	if err != nil {
-		return fmt.Errorf("open local web worker state: %w", err)
+		return nil, "", fmt.Errorf("open local web worker state: %w", err)
 	}
 	local.webStateRelease = stateResource.Release
 	stateStore, err := stateResource.Value()
 	if err != nil {
-		return fmt.Errorf("acquire local web worker state: %w", err)
+		_ = stateResource.Release(context.Background())
+		local.webStateRelease = nil
+		return nil, "", fmt.Errorf("acquire local web worker state: %w", err)
 	}
-	mirrorRoot := filepath.Join(config.Worker.MirrorRoot, "web")
-	if err := os.MkdirAll(mirrorRoot, 0o700); err != nil {
-		return fmt.Errorf("create local web mirror root: %w", err)
-	}
-	mirror, err := fsmirror.Open(ctx, fsmirror.Config{
-		Root:         mirrorRoot,
-		Build:        fsmirror.OpenCodeWriteBuilder(),
-		BaselineFile: filepath.Join(filepath.Dir(config.WebStatePath), "workerkit-mirror-baseline.json"),
-	})
-	if err != nil {
-		return fmt.Errorf("open local web mirror: %w", err)
-	}
-	local.webMirror = mirror
-
-	workerConfig := workerkit.Config{Wire: bridge, State: stateStore, Mirror: mirror}
-	if !config.WebDisableAutoTitle {
-		workerConfig.AutoResponder = autoTitleResponder
-	}
-	webWorker, err := workerkit.Open(ctx, workerConfig)
-	if err != nil {
-		return fmt.Errorf("open local web workerkit: %w", err)
-	}
-	local.webWorker = webWorker
-
-	tokenBytes := make([]byte, 24)
-	if _, err := rand.Read(tokenBytes); err != nil {
-		return fmt.Errorf("allocate local web session token: %w", err)
-	}
-	sessionToken := hex.EncodeToString(tokenBytes)
-	webServer, err := web.New(web.Config{Worker: webWorker, SessionToken: sessionToken})
-	if err != nil {
-		return fmt.Errorf("open local web server: %w", err)
-	}
-	local.webServer = webServer
-
-	webListener, err := net.Listen("tcp", config.WebListenAddress)
-	if err != nil {
-		return fmt.Errorf("open local web listener: %w", err)
-	}
-	if err := requireLoopback(webListener.Addr()); err != nil {
-		_ = webListener.Close()
-		return err
-	}
-	local.webListener = webListener
-	local.webHTTP = &http.Server{
-		Handler:           webServer,
-		BaseContext:       func(net.Listener) context.Context { return local.runContext },
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	go func() { _ = local.webHTTP.Serve(webListener) }()
-	local.webURL = "http://" + webListener.Addr().String() + "/?token=" + sessionToken
-	return nil
+	return stateStore, filepath.Join(filepath.Dir(config.WebStatePath), "workerkit-mirror-baseline.json"), nil
 }
 
 // autoTitleResponder answers tool-less chat assignments (OpenCode's hidden
-// title/summary generation) with a short title derived from the latest user
-// text, so only real conversation turns reach the human inbox.
+// title/summary generation) so only real turns reach the inbox.
 func autoTitleResponder(delivery llm.WorkerAssignmentDelivery) (string, bool) {
 	if len(delivery.Assignment.Request.Tools) != 0 ||
 		delivery.Assignment.Task.CapabilityTier != llm.TierChat {
@@ -527,8 +342,7 @@ func autoTitleResponder(delivery llm.WorkerAssignmentDelivery) (string, bool) {
 	return title, true
 }
 
-// WebURL returns the browser login URL (including the one-time session token)
-// in web mode, and "" when the terminal TUI is composed instead.
+// WebURL returns the browser login URL including its per-start session token.
 func (local *Local) WebURL() string {
 	if local == nil {
 		return ""
@@ -565,20 +379,7 @@ func rejectPendingOfflineRestore(databasePath string) error {
 	return nil
 }
 
-func localOutboxScope(databasePath string) (string, error) {
-	location, err := sqlitefile.Resolve(databasePath)
-	if err != nil {
-		return "", err
-	}
-	if !location.FileBacked {
-		return "", nil
-	}
-	sum := sha256.Sum256([]byte(location.Path))
-	return "human-local-gateway:" + hex.EncodeToString(sum[:]), nil
-}
-
-// BaseURL returns the loopback model API base URL using the kernel-selected
-// port when ListenAddress ended in :0.
+// BaseURL returns the loopback model API base URL.
 func (local *Local) BaseURL() string {
 	if local == nil {
 		return ""
@@ -586,8 +387,7 @@ func (local *Local) BaseURL() string {
 	return local.baseURL
 }
 
-// CallerToken returns the configured or newly issued plaintext bearer token
-// for local model API clients. Only its hash is retained by the gateway.
+// CallerToken returns the caller bearer/API key held in memory.
 func (local *Local) CallerToken() string {
 	if local == nil {
 		return ""
@@ -595,8 +395,7 @@ func (local *Local) CallerToken() string {
 	return local.credentials.CallerToken
 }
 
-// Credentials returns a copy of the local caller and worker credentials and
-// whether Open issued them. Treat both token fields as secrets.
+// Credentials returns a copy of the local caller credential metadata.
 func (local *Local) Credentials() Credentials {
 	if local == nil {
 		return Credentials{}
@@ -604,17 +403,17 @@ func (local *Local) Credentials() Credentials {
 	return local.credentials
 }
 
-// Gateway returns the embedded gateway for applications that need its
-// separately mountable handlers or token administration API.
-func (local *Local) Gateway() *gateway.Server {
+// Service returns the public correctness core owned by Local. Callers may use
+// its read-only/status and explicit maintenance APIs while Local is alive; they
+// must not shut it down independently.
+func (local *Local) Service() *llm.Service {
 	if local == nil {
 		return nil
 	}
-	return local.gateway
+	return local.service
 }
 
-// WebWorker returns the in-process workerkit Worker behind the browser UI,
-// for embedders that add their own surfaces next to the official web one.
+// WebWorker returns the headless human-side domain object behind the stock UI.
 func (local *Local) WebWorker() *workerkit.Worker {
 	if local == nil {
 		return nil
@@ -622,8 +421,7 @@ func (local *Local) WebWorker() *workerkit.Worker {
 	return local.webWorker
 }
 
-// Wait waits for the embedded HTTP server to stop and reports an unexpected
-// serving error. A normal Close returns nil.
+// Wait waits for the model HTTP server to stop.
 func (local *Local) Wait() error {
 	if local == nil || local.serveDone == nil {
 		return nil
@@ -632,17 +430,18 @@ func (local *Local) Wait() error {
 	return local.loadServeError()
 }
 
-// Close stops accepting HTTP requests, closes the worker, and finally closes
-// the gateway and SQLite. Credentials issued directly by Open are revoked by
-// default; Config may explicitly transfer their persistence and revocation to
-// the embedder. Existing/provider credentials are never implicitly revoked.
-// Close waits for the HTTP serving goroutine and is safe to call more than once.
+// Close cancels active handlers and maintenance loops, drains both loopback
+// servers, stops the human side, and finally shuts down Service (which owns its
+// Store). It is safe to call more than once.
 func (local *Local) Close() error {
 	if local == nil {
 		return nil
 	}
 	local.closeOnce.Do(func() {
 		var closeErrors []error
+		if local.cancel != nil {
+			local.cancel()
+		}
 		if local.httpServer != nil {
 			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
 			err := local.httpServer.Shutdown(shutdownContext)
@@ -661,9 +460,13 @@ func (local *Local) Close() error {
 				closeErrors = append(closeErrors, fmt.Errorf("close local listener: %w", err))
 			}
 		}
-		// Shut the web server down first: it cancels the notification pump so
-		// long-lived SSE handlers return, letting the HTTP server drain instead
-		// of blocking until the shutdown timeout.
+		if local.callerRuntime != nil {
+			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
+			if err := local.callerRuntime.Shutdown(shutdownContext); err != nil {
+				closeErrors = append(closeErrors, fmt.Errorf("close local caller transport: %w", err))
+			}
+			shutdownCancel()
+		}
 		if local.webServer != nil {
 			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
 			if err := local.webServer.Shutdown(shutdownContext); err != nil {
@@ -677,10 +480,10 @@ func (local *Local) Close() error {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 				err = local.webHTTP.Close()
 			}
+			shutdownCancel()
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				closeErrors = append(closeErrors, fmt.Errorf("close local web HTTP server: %w", err))
 			}
-			shutdownCancel()
 		} else if local.webListener != nil {
 			if err := local.webListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 				closeErrors = append(closeErrors, fmt.Errorf("close local web listener: %w", err))
@@ -698,82 +501,21 @@ func (local *Local) Close() error {
 				closeErrors = append(closeErrors, fmt.Errorf("close local web mirror: %w", err))
 			}
 		}
-		if local.webBridge != nil {
-			if err := local.webBridge.Close(); err != nil {
-				closeErrors = append(closeErrors, fmt.Errorf("close local web worker bridge: %w", err))
-			}
-		}
 		if local.webStateRelease != nil {
 			if err := local.webStateRelease(context.Background()); err != nil {
 				closeErrors = append(closeErrors, fmt.Errorf("release local web worker state: %w", err))
 			}
 		}
-		if local.gateway != nil {
-			if local.revokeOnClose {
-				if err := local.revokeNewCredentials(); err != nil {
-					closeErrors = append(closeErrors, fmt.Errorf("revoke failed local credentials: %w", err))
-				}
+		if local.service != nil {
+			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
+			if err := local.service.Shutdown(shutdownContext); err != nil {
+				closeErrors = append(closeErrors, fmt.Errorf("close local llm service: %w", err))
 			}
-			if err := local.gateway.Close(); err != nil {
-				closeErrors = append(closeErrors, fmt.Errorf("close local gateway: %w", err))
-			}
-		}
-		if local.cancel != nil {
-			local.cancel()
+			shutdownCancel()
 		}
 		local.closeErr = errors.Join(closeErrors...)
 	})
 	return local.closeErr
-}
-
-func bindExistingCredential(
-	ctx context.Context,
-	server *gateway.Server,
-	label, secret string,
-	wantType gateway.PrincipalType,
-	wantSubject, wantKeyID string,
-) (gateway.Principal, error) {
-	principal, err := server.ValidateToken(ctx, secret)
-	if err != nil {
-		return gateway.Principal{}, fmt.Errorf("validate existing local %s token: %w", label, err)
-	}
-	if principal.Type != wantType {
-		return gateway.Principal{}, fmt.Errorf(
-			"validate existing local %s token: principal type %q does not match %q",
-			label, principal.Type, wantType,
-		)
-	}
-	if principal.SubjectID != wantSubject {
-		return gateway.Principal{}, fmt.Errorf(
-			"validate existing local %s token: subject %q does not match configured subject %q",
-			label, principal.SubjectID, wantSubject,
-		)
-	}
-	if wantKeyID != "" && principal.KeyID != wantKeyID {
-		return gateway.Principal{}, fmt.Errorf(
-			"validate existing local %s token: key ID does not match the persisted key ID",
-			label,
-		)
-	}
-	return principal, nil
-}
-
-func (local *Local) revokeNewCredentials() error {
-	if local == nil || local.gateway == nil || !local.issuedDuringOpen {
-		return nil
-	}
-	revokeContext, cancel := context.WithTimeout(context.Background(), local.shutdownTimeout)
-	defer cancel()
-	var revokeErrors []error
-	for _, keyID := range []string{local.credentials.WorkerKeyID, local.credentials.CallerKeyID} {
-		if keyID == "" {
-			continue
-		}
-		if err := local.gateway.Revoke(revokeContext, keyID); err != nil {
-			revokeErrors = append(revokeErrors, err)
-		}
-	}
-	return errors.Join(revokeErrors...)
 }
 
 func (local *Local) serve() {
@@ -782,7 +524,9 @@ func (local *Local) serve() {
 		local.serveMu.Lock()
 		local.serveErr = err
 		local.serveMu.Unlock()
-		local.cancel()
+		if local.cancel != nil {
+			local.cancel()
+		}
 	}
 	close(local.serveDone)
 }
@@ -799,4 +543,12 @@ func requireLoopback(address net.Addr) error {
 		return fmt.Errorf("open local listener: address %q is not loopback", address.String())
 	}
 	return nil
+}
+
+func randomToken() (string, error) {
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("allocate random token: %w", err)
+	}
+	return hex.EncodeToString(raw), nil
 }

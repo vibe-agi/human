@@ -14,6 +14,8 @@ import (
 	"github.com/spf13/viper"
 	"github.com/vibe-agi/human/internal/gatewaycmd"
 	"github.com/vibe-agi/human/internal/userdata"
+	"github.com/vibe-agi/human/llm"
+	"github.com/vibe-agi/human/workerkit"
 )
 
 const automaticPrivatePath = "auto"
@@ -41,7 +43,8 @@ func New() *cobra.Command {
 	addWorkerFlags(workerCommand.Flags())
 	for key, name := range map[string]string{
 		"gateway.url": "gateway", "gateway.token_file": "token-file",
-		"workspace.mirror_root": "mirror-root", "workspace.auto_send": "workspace-auto-send",
+		"workspace.root":      "workspace",
+		"worker.caller_scope": "caller-scope", "worker.workspace_scope": "workspace-scope",
 		"worker.outbox": "outbox", "worker.state_db": "state-db", "worker.web": "web",
 	} {
 		mustBind(settings, key, workerCommand.Flags().Lookup(name))
@@ -59,8 +62,9 @@ func New() *cobra.Command {
 func addWorkerFlags(flags *pflag.FlagSet) {
 	flags.String("gateway", "ws://127.0.0.1:8080/internal/v1/worker/ws", "gateway worker WebSocket URL")
 	flags.String("token-file", "", "private file containing the worker token (or set HUMAN_GATEWAY_TOKEN)")
-	flags.String("mirror-root", "~/mirror", "worker-local workspace mirror root")
-	flags.Bool("workspace-auto-send", false, "send clean mirror changes after live detection and fresh review")
+	flags.String("workspace", "~/human-workspace", "Human-side base directory; each agent session gets a stable child working directory")
+	flags.String("caller-scope", "", "authenticated Agent-user caller ID authorized for this mirror")
+	flags.String("workspace-scope", "", "opaque Agent-user workspace key authorized for this mirror")
 	flags.String("outbox", automaticPrivatePath, "private SQLite outbox; auto uses the OS user-data directory")
 	flags.String("state-db", automaticPrivatePath, "reserved; legacy TUI state flag kept for config compatibility")
 	flags.String("web", "", "loopback address of the browser human side; the printed login URL carries a per-start session token, so keep it off shared terminals and proxy logs (default 127.0.0.1:19082)")
@@ -75,7 +79,7 @@ func run(ctx context.Context, settings *viper.Viper) error {
 	if err != nil {
 		return err
 	}
-	mirrorRoot, err := resolveMirrorRoot(settings.GetString("workspace.mirror_root"))
+	mirrorRoot, err := resolveHumanWorkspace(settings.GetString("workspace.root"))
 	if err != nil {
 		return err
 	}
@@ -92,11 +96,29 @@ func run(ctx context.Context, settings *viper.Viper) error {
 	if webAddress == "" {
 		webAddress = "127.0.0.1:19082"
 	}
-	return runWebWorker(ctx, url, token, mirrorRoot, outboxPath, webAddress)
+	mirrorScope := workerkit.WorkspaceScope{
+		Caller:       llm.CallerID(strings.TrimSpace(settings.GetString("worker.caller_scope"))),
+		WorkspaceKey: strings.TrimSpace(settings.GetString("worker.workspace_scope")),
+	}
+	if err := mirrorScope.Validate(); err != nil {
+		return fmt.Errorf("configure remote Human mirror: %w", err)
+	}
+	return runWebWorker(ctx, url, token, mirrorRoot, outboxPath, webAddress, mirrorScope)
 }
 
-func resolveMirrorRoot(value string) (string, error) {
-	return resolvePrivatePath(value, "workspace mirror root")
+func resolveHumanWorkspace(value string) (string, error) {
+	path, err := resolvePrivatePath(value, "Human workspace")
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return "", fmt.Errorf("create Human workspace: %w", err)
+	}
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve Human workspace: %w", err)
+	}
+	return canonical, nil
 }
 
 func resolveUserDataPath(value, description string, elements ...string) (string, error) {

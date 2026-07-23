@@ -24,6 +24,7 @@ type fakeWire struct {
 	mu          sync.Mutex
 	assignments chan llm.WorkerAssignmentDelivery
 	rejections  chan workerkit.Rejection
+	notices     chan workerkit.Notice
 	done        chan struct{}
 	sent        []llm.WorkerEventDelivery
 }
@@ -32,12 +33,14 @@ func newFakeWire() *fakeWire {
 	return &fakeWire{
 		assignments: make(chan llm.WorkerAssignmentDelivery, 16),
 		rejections:  make(chan workerkit.Rejection, 16),
+		notices:     make(chan workerkit.Notice, 16),
 		done:        make(chan struct{}),
 	}
 }
 
 func (wire *fakeWire) Assignments() <-chan llm.WorkerAssignmentDelivery              { return wire.assignments }
 func (wire *fakeWire) Rejections() <-chan workerkit.Rejection                        { return wire.rejections }
+func (wire *fakeWire) Notices() <-chan workerkit.Notice                              { return wire.notices }
 func (wire *fakeWire) Done() <-chan struct{}                                         { return wire.done }
 func (wire *fakeWire) Err() error                                                    { return nil }
 func (wire *fakeWire) ConfirmAssignment(context.Context, llm.WorkerDeliveryID) error { return nil }
@@ -216,6 +219,52 @@ func TestWebRequiresSession(t *testing.T) {
 	}
 }
 
+func TestWebAPIHardensSensitiveResponsesAndJSONCommands(t *testing.T) {
+	_, _, listener := openWebServer(t)
+
+	request := authedRequest(t, http.MethodGet, listener.URL+"/api/state", nil)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.Header.Get("Cache-Control") != "no-store" ||
+		response.Header.Get("X-Content-Type-Options") != "nosniff" ||
+		response.Header.Get("Content-Security-Policy") == "" {
+		t.Fatalf("security headers = %v", response.Header)
+	}
+
+	request, err = http.NewRequest(http.MethodPost, listener.URL+"/api/accept", strings.NewReader(`{"delivery":"delivery-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("missing JSON content type = %d, want 415", response.StatusCode)
+	}
+
+	request, err = http.NewRequest(http.MethodPost, listener.URL+"/api/accept",
+		strings.NewReader(`{"delivery":"delivery-1"} {"delivery":"delivery-2"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	request.Header.Set("Content-Type", "application/json; charset=utf-8")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("multiple JSON values = %d, want 400", response.StatusCode)
+	}
+}
+
 func TestWebAcceptReplyFinalFlow(t *testing.T) {
 	wire, _, listener := openWebServer(t)
 	wire.assignments <- chatAssignment("task-1", "delivery-1", "please help")
@@ -367,7 +416,6 @@ func TestWebToolCallsRoundTrip(t *testing.T) {
 	assignment.Assignment.Task = llm.TaskContext{
 		TaskID: "task-1", CapabilityTier: llm.TierWorkspace, WorkspaceKey: "workspace-a",
 		HarnessID: "harness-a", HarnessVersion: "v1", HarnessSessionID: "session-a",
-		WorkspaceRoot: "/workspace",
 	}
 	assignment.Assignment.Request.Tools = []llm.Tool{{Name: "bash", InputSchema: []byte(`{"type":"object"}`)}}
 	wire.assignments <- assignment
@@ -397,4 +445,59 @@ func TestWebToolCallsRoundTrip(t *testing.T) {
 		return conversation["phase"] == "awaiting_results"
 	})
 	_ = fmt.Sprint()
+}
+
+func TestWebStateExposesOpaqueScopeAndProjectRelativeToolPaths(t *testing.T) {
+	wire, _, listener := openWebServer(t)
+	assignment := chatAssignment("task-private", "delivery-private", "inspect the project")
+	assignment.Assignment.Identity.WorkspaceKey = "workspace-opaque-a"
+	assignment.Assignment.Task = llm.TaskContext{
+		TaskID: "task-private", CapabilityTier: llm.TierWorkspace,
+		WorkspaceKey: "workspace-opaque-a", HarnessID: "harness-a", HarnessVersion: "v1",
+		HarnessSessionID: "caller-private-session",
+	}
+	assignment.Assignment.Request.Tools = []llm.Tool{{
+		Name: "write", InputSchema: []byte(`{"type":"object"}`),
+	}}
+	wire.assignments <- assignment
+	waitForState(t, listener.URL, func(state map[string]any) bool {
+		inbox, _ := state["inbox"].([]any)
+		return len(inbox) == 1
+	})
+	doJSON(t, authedRequest(t, http.MethodPost, listener.URL+"/api/accept",
+		map[string]string{"delivery": "delivery-private"}), http.StatusOK)
+	doJSON(t, authedRequest(t, http.MethodPost, listener.URL+"/api/tool-calls", map[string]any{
+		"caller": "caller-a", "task_id": "task-private",
+		"calls": []map[string]any{{
+			"id": "call-private", "name": "write",
+			"input": map[string]any{
+				"filePath": "private.txt",
+			},
+		}},
+	}), http.StatusOK)
+	state := waitForState(t, listener.URL, func(state map[string]any) bool {
+		conversations, _ := state["conversations"].([]any)
+		return len(conversations) == 1
+	})
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, private := range []string{
+		"/agent-user/private/workspace", "caller-private-session",
+		`"workspace_root"`, `"workspace_path_style"`, `"assignment"`,
+	} {
+		if bytes.Contains(encoded, []byte(private)) {
+			t.Fatalf("Human Web state leaked caller-private value %q: %s", private, encoded)
+		}
+	}
+	conversations, _ := state["conversations"].([]any)
+	conversation, _ := conversations[0].(map[string]any)
+	if state["schema_version"] != float64(3) ||
+		conversation["workspace_scope"] != "workspace-opaque-a" {
+		t.Fatalf("Human Web scope projection = %s", encoded)
+	}
+	if !bytes.Contains(encoded, []byte(`"filePath":"private.txt"`)) {
+		t.Fatalf("Human Web state did not retain the project-relative tool path: %s", encoded)
+	}
 }

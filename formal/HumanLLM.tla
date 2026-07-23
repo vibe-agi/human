@@ -40,9 +40,10 @@ RequestAdmitted  == "request_admitted"
 RequestDecided   == "request_decided"
 RequestStreaming == "request_streaming"
 RequestClosed    == "request_closed"
+RequestSuperseded == "request_superseded"
 RequestStates == {
   RequestUnused, RequestAdmitted, RequestDecided,
-  RequestStreaming, RequestClosed
+  RequestStreaming, RequestClosed, RequestSuperseded
 }
 
 DecisionNone     == "decision_none"
@@ -113,6 +114,7 @@ VARIABLES
   closedCursor,
   responseKind,
   responseTrace,
+  callerDetached,
   lastSubmission
 
 TaskScope(task) == <<taskCaller[task], taskWorkspace[task]>>
@@ -138,7 +140,7 @@ durable == <<
   baselineVersion, clarificationCount, terminalTasks, terminalRequestCount,
   requestStatus, requestTask, requestCaller, requestWorkspace, requestDigest,
   requestResults, httpDecision, streamCursor, streamTerminal, closedCursor,
-  responseKind, responseTrace
+  responseKind, responseTrace, callerDetached
 >>
 
 vars == <<durable, lastSubmission>>
@@ -169,6 +171,7 @@ Init ==
   /\ closedCursor = [request \in Requests |-> 0]
   /\ responseKind = [request \in Requests |-> NoTerminalKind]
   /\ responseTrace = [request \in Requests |-> <<>>]
+  /\ callerDetached = [request \in Requests |-> FALSE]
   /\ lastSubmission = NoSubmission
 
 ObserveAdmission(request, digest) == [
@@ -199,7 +202,7 @@ AdmitFresh(caller, workspace, task, request, digest) ==
        issuedVersions, pendingVersions, successfulVersions, failedVersions,
        baselineVersion, clarificationCount, terminalTasks, terminalRequestCount,
        requestResults, httpDecision, streamCursor, streamTerminal,
-       closedCursor, responseKind, responseTrace
+       closedCursor, responseKind, responseTrace, callerDetached
      >>
 
 Replay(request, digest) ==
@@ -259,7 +262,7 @@ AdmitResultTurn(caller, workspace, task, request, digest, results) ==
        issuedVersions, pendingVersions, successfulVersions, failedVersions,
        baselineVersion, clarificationCount, terminalTasks, terminalRequestCount,
        httpDecision, streamCursor, streamTerminal, closedCursor, responseKind,
-       responseTrace
+       responseTrace, callerDetached
      >>
 
 (* A clarification closes one model response but keeps the logical task     *)
@@ -285,7 +288,68 @@ AdmitCallerTurn(caller, workspace, task, request, digest) ==
        issuedVersions, pendingVersions, successfulVersions, failedVersions,
        baselineVersion, clarificationCount, terminalTasks, terminalRequestCount,
        requestResults, httpDecision, streamCursor, streamTerminal,
-       closedCursor, responseKind, responseTrace
+       closedCursor, responseKind, responseTrace, callerDetached
+     >>
+
+(* A request is in-flight while it holds a caller but has not durably closed.   *)
+(* A stream commits its HTTP 200 at admission to open the SSE channel, so a      *)
+(* request parked awaiting the human is RequestDecided/RequestStreaming, not     *)
+(* RequestAdmitted — the caller has a status line but no answer yet. Caller      *)
+(* detach and detached-preemption both key off this in-flight window, not the   *)
+(* pre-decision instant, so a resume can take over a parked stream too.         *)
+RequestInFlight(request) ==
+  requestStatus[request] \in {RequestAdmitted, RequestDecided, RequestStreaming}
+
+(* The in-flight request's caller socket went away before its response closed.  *)
+(* This advisory liveness fact is what gates AdmitPreemptDetached: a resume     *)
+(* takes over only a genuinely abandoned request, never a live caller or a      *)
+(* transport retry (which keeps callerDetached FALSE and is reconciled via      *)
+(* Replay). It can be observed anywhere in the in-flight window — including a    *)
+(* parked stream that has already sent its 200 — but never once the response    *)
+(* has durably closed.                                                          *)
+DetachCaller(request) ==
+  /\ RequestInFlight(request)
+  /\ ~callerDetached[request]
+  /\ callerDetached' = [callerDetached EXCEPT ![request] = TRUE]
+  /\ UNCHANGED <<
+       taskStatus, taskCaller, taskWorkspace, taskRequests, taskCurrentRequest,
+       issuedVersions, pendingVersions, successfulVersions, failedVersions,
+       baselineVersion, clarificationCount, terminalTasks, terminalRequestCount,
+       requestStatus, requestTask, requestCaller, requestWorkspace, requestDigest,
+       requestResults, httpDecision, streamCursor, streamTerminal, closedCursor,
+       responseKind, responseTrace, lastSubmission
+     >>
+
+(* A resuming completion preempts the in-flight request ONLY when that         *)
+(* request's caller has detached (callerDetached). A live caller or a          *)
+(* transport retry is never preempted — the detach fact, not a digest guess,   *)
+(* is the precondition. The superseded request may be anywhere in its in-flight *)
+(* window (a parked stream that already sent its 200 included); it is superseded*)
+(* and the task taken over, so a gone caller never blocks the resume (charter,  *)
+(* C). It is never a closed response: that would resurrect a delivered answer.  *)
+AdmitPreemptDetached(caller, workspace, task, request, digest) ==
+  /\ taskStatus[task] = TaskActive
+  /\ taskCaller[task] = caller
+  /\ taskWorkspace[task] = workspace
+  /\ RequestInFlight(taskCurrentRequest[task])
+  /\ callerDetached[taskCurrentRequest[task]]
+  /\ taskCurrentRequest[task] # request
+  /\ requestStatus[request] = RequestUnused
+  /\ requestStatus' = [requestStatus EXCEPT
+       ![taskCurrentRequest[task]] = RequestSuperseded, ![request] = RequestAdmitted]
+  /\ requestTask' = [requestTask EXCEPT ![request] = task]
+  /\ requestCaller' = [requestCaller EXCEPT ![request] = caller]
+  /\ requestWorkspace' = [requestWorkspace EXCEPT ![request] = workspace]
+  /\ requestDigest' = [requestDigest EXCEPT ![request] = digest]
+  /\ taskRequests' = [taskRequests EXCEPT ![task] = @ \cup {request}]
+  /\ taskCurrentRequest' = [taskCurrentRequest EXCEPT ![task] = request]
+  /\ lastSubmission' = ObserveAdmission(request, digest)
+  /\ UNCHANGED <<
+       taskStatus, taskCaller, taskWorkspace,
+       issuedVersions, pendingVersions, successfulVersions, failedVersions,
+       baselineVersion, clarificationCount, terminalTasks, terminalRequestCount,
+       requestResults, httpDecision, streamCursor, streamTerminal,
+       closedCursor, responseKind, responseTrace, callerDetached
      >>
 
 ReconcileResult(task, request, version) ==
@@ -318,7 +382,7 @@ ReconcileResult(task, request, version) ==
        issuedVersions, clarificationCount, terminalTasks, terminalRequestCount,
        requestStatus, requestTask, requestCaller, requestWorkspace,
        requestDigest, requestResults, httpDecision, streamCursor,
-       streamTerminal, closedCursor, responseKind, responseTrace
+       streamTerminal, closedCursor, responseKind, responseTrace, callerDetached
      >>
 
 DecideHTTP(request) ==
@@ -338,7 +402,7 @@ DecideHTTP(request) ==
        baselineVersion, clarificationCount, terminalTasks, terminalRequestCount,
        requestTask, requestCaller, requestWorkspace, requestDigest,
        requestResults, streamCursor, streamTerminal, closedCursor,
-       responseKind, responseTrace
+       responseKind, responseTrace, callerDetached
      >>
 
 StartStream(request) ==
@@ -352,7 +416,7 @@ StartStream(request) ==
        successfulVersions, failedVersions, baselineVersion, clarificationCount, terminalTasks,
        terminalRequestCount, requestTask, requestCaller, requestWorkspace,
        requestDigest, requestResults, httpDecision, streamCursor,
-       streamTerminal, closedCursor, responseKind, responseTrace
+       streamTerminal, closedCursor, responseKind, responseTrace, callerDetached
      >>
 
 EmitProgress(request) ==
@@ -369,7 +433,7 @@ EmitProgress(request) ==
        successfulVersions, failedVersions, baselineVersion, clarificationCount, terminalTasks,
        terminalRequestCount, requestStatus, requestTask, requestCaller,
        requestWorkspace, requestDigest, requestResults, httpDecision,
-       streamTerminal, closedCursor, responseKind
+       streamTerminal, closedCursor, responseKind, callerDetached
      >>
 
 CloseResponse(request, kind) ==
@@ -397,7 +461,7 @@ FinalText(request) ==
        taskCaller, taskWorkspace, taskRequests, taskCurrentRequest,
        issuedVersions, pendingVersions, successfulVersions, failedVersions,
        baselineVersion, clarificationCount, requestTask, requestCaller, requestWorkspace,
-       requestDigest, requestResults, httpDecision
+       requestDigest, requestResults, httpDecision, callerDetached
      >>
 
 DispatchToolCalls(request, versions) ==
@@ -420,7 +484,7 @@ DispatchToolCalls(request, versions) ==
        taskCaller, taskWorkspace, taskRequests, taskCurrentRequest,
        successfulVersions, failedVersions, baselineVersion, clarificationCount, terminalTasks,
        terminalRequestCount, requestTask, requestCaller, requestWorkspace,
-       requestDigest, requestResults, httpDecision
+       requestDigest, requestResults, httpDecision, callerDetached
      >>
 
 Clarify(request) ==
@@ -440,7 +504,7 @@ Clarify(request) ==
        issuedVersions, pendingVersions, successfulVersions, failedVersions,
        baselineVersion, terminalTasks, terminalRequestCount,
        requestTask, requestCaller, requestWorkspace,
-       requestDigest, requestResults, httpDecision
+       requestDigest, requestResults, httpDecision, callerDetached
      >>
 
 FailResponse(request) ==
@@ -461,7 +525,7 @@ FailResponse(request) ==
        issuedVersions, pendingVersions, successfulVersions, failedVersions,
        baselineVersion, clarificationCount,
        requestTask, requestCaller, requestWorkspace,
-       requestDigest, requestResults, httpDecision
+       requestDigest, requestResults, httpDecision, callerDetached
      >>
 
 AdmitFreshSome ==
@@ -487,6 +551,13 @@ AdmitCallerTurnSome ==
      task \in Tasks, request \in Requests, digest \in Digests :
     AdmitCallerTurn(caller, workspace, task, request, digest)
 
+AdmitPreemptDetachedSome ==
+  \E caller \in Callers, workspace \in Workspaces,
+     task \in Tasks, request \in Requests, digest \in Digests :
+    AdmitPreemptDetached(caller, workspace, task, request, digest)
+
+DetachCallerSome == \E request \in Requests : DetachCaller(request)
+
 ReconcileResultSome ==
   \E task \in Tasks, request \in Requests, version \in Versions :
     ReconcileResult(task, request, version)
@@ -509,7 +580,7 @@ HumanResponseSome ==
 (* environment step is part of this model run.                              *)
 ProtocolQuiescent ==
   /\ \A request \in Requests :
-       requestStatus[request] \in {RequestUnused, RequestClosed}
+       requestStatus[request] \in {RequestUnused, RequestClosed, RequestSuperseded}
   /\ \A task \in Tasks :
        \/ taskStatus[task] \in {TaskUnused} \union TaskTerminalStates
        \/ /\ taskStatus[task] \in {TaskAwaitingResults, TaskAwaitingCaller}
@@ -518,12 +589,23 @@ ProtocolQuiescent ==
 
 Terminating == ProtocolQuiescent /\ UNCHANGED vars
 
+(* A state constraint for configs that verify the non-preemption liveness      *)
+(* envelope: with no caller ever detaching, AdmitPreemptDetached stays          *)
+(* disabled, so the base config checks ordinary task termination without        *)
+(* preemption consuming the bounded request pool. The preempt config omits it   *)
+(* to exercise takeover (and correspondingly omits TasksEventuallyTerminal,     *)
+(* since a preempt legitimately spends a request id — an environment boundary   *)
+(* ProtocolQuiescent already admits, not a protocol deadlock).                  *)
+NoDetach == \A request \in Requests : ~callerDetached[request]
+
 Next ==
   \/ AdmitFreshSome
   \/ ReplaySome
   \/ RejectDigestConflictSome
   \/ AdmitResultTurnSome
   \/ AdmitCallerTurnSome
+  \/ AdmitPreemptDetachedSome
+  \/ DetachCallerSome
   \/ ReconcileResultSome
   \/ DecideHTTPSome
   \/ StartStreamSome
@@ -539,6 +621,7 @@ LivenessSpec ==
   /\ WF_vars(AdmitResultTurnSome)
   /\ WF_vars(AdmitCallerTurnSome)
   /\ WF_vars(ReconcileResultSome)
+  /\ WF_vars(AdmitPreemptDetachedSome)
   /\ WF_vars(DecideHTTPSome)
   /\ WF_vars(StartStreamSome)
   /\ WF_vars(EmitProgressSome)
@@ -606,6 +689,7 @@ TypeOK ==
   /\ closedCursor \in [Requests -> 0..MaxCursor]
   /\ responseKind \in [Requests -> ResponseKinds]
   /\ responseTrace \in [Requests -> BoundedTraces]
+  /\ callerDetached \in [Requests -> BOOLEAN]
   /\ lastSubmission \in [
        request     : Requests,
        digest      : Digests,
@@ -822,7 +906,20 @@ NoCallerLeavesResultsPending ==
 ResponsesEventuallyClose ==
   \A request \in Requests :
     [](requestStatus[request] # RequestUnused =>
-       <> (requestStatus[request] = RequestClosed))
+       <> (requestStatus[request] \in {RequestClosed, RequestSuperseded}))
+
+(* Availability under a gone caller (scenario C): a task held by a stale       *)
+(* in-flight request (Active, current still Admitted) never blocks a resume    *)
+(* forever.  The current request eventually advances (decided/closed) or is    *)
+(* superseded by a resuming turn, or the task terminates — a resume is never   *)
+(* permanently reconciliation-conflicted.  This is the liveness the takeover   *)
+(* restores.                                                                    *)
+ResumeNeverPermanentlyBlocked ==
+  \A task \in Tasks :
+    []( ( taskStatus[task] = TaskActive
+          /\ requestStatus[taskCurrentRequest[task]] = RequestAdmitted )
+        => <>( requestStatus[taskCurrentRequest[task]] # RequestAdmitted
+               \/ taskStatus[task] \in TaskTerminalStates ) )
 
 TasksEventuallyTerminal ==
   \A task \in Tasks :

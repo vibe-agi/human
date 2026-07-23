@@ -12,8 +12,6 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/vibe-agi/human/internal/completion/adapter"
-	"github.com/vibe-agi/human/internal/userdata"
 )
 
 const defaultOpenCodeBaseURL = "http://127.0.0.1:19080/v1"
@@ -34,7 +32,7 @@ type openCodeProviderOptions struct {
 	BaseURL string            `json:"baseURL"`
 	APIKey  string            `json:"apiKey"`
 	Timeout bool              `json:"timeout"`
-	Headers map[string]string `json:"headers"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 type openCodeModel struct {
@@ -59,7 +57,6 @@ func newInitCommand() *cobra.Command {
 }
 
 func newInitOpenCodeCommand() *cobra.Command {
-	var workspace string
 	var baseURL string
 	var outputPath string
 	var force bool
@@ -68,7 +65,7 @@ func newInitOpenCodeCommand() *cobra.Command {
 		Short: "generate an exact OpenCode 1.17.18 Workspace provider",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
-			payload, err := generateOpenCodeConfig(workspace, baseURL)
+			payload, err := generateOpenCodeConfig(baseURL)
 			if err != nil {
 				return err
 			}
@@ -84,22 +81,13 @@ func newInitOpenCodeCommand() *cobra.Command {
 			return err
 		},
 	}
-	command.Flags().StringVar(&workspace, "workspace", ".", "workspace identity and absolute root; the nearest Git root is selected")
 	command.Flags().StringVar(&baseURL, "base-url", defaultOpenCodeBaseURL, "Human OpenAI-compatible model base URL")
 	command.Flags().StringVarP(&outputPath, "output", "o", "", "atomically write the generated config to this file instead of stdout")
 	command.Flags().BoolVar(&force, "force", false, "atomically replace an existing output file")
 	return command
 }
 
-func generateOpenCodeConfig(workspaceValue, baseURLValue string) ([]byte, error) {
-	workspace, err := userdata.ResolveGitWorkspace(workspaceValue)
-	if err != nil {
-		return nil, fmt.Errorf("resolve OpenCode workspace: %w", err)
-	}
-	workspaceKey, err := userdata.WorkspaceKey(workspace)
-	if err != nil {
-		return nil, fmt.Errorf("derive OpenCode workspace key: %w", err)
-	}
+func generateOpenCodeConfig(baseURLValue string) ([]byte, error) {
 	baseURL, err := normalizeOpenCodeBaseURL(baseURLValue)
 	if err != nil {
 		return nil, err
@@ -114,14 +102,6 @@ func generateOpenCodeConfig(workspaceValue, baseURLValue string) ([]byte, error)
 					BaseURL: baseURL,
 					APIKey:  "{env:HUMAN_CALLER_TOKEN}",
 					Timeout: false,
-					Headers: map[string]string{
-						"X-Human-Capability-Tier": "workspace",
-						"X-Human-Workspace-Key":   workspaceKey,
-						"X-Human-Harness-Id":      adapter.OpenCodeID,
-						"X-Human-Harness-Version": adapter.OpenCodeVersion,
-						"X-Human-Workspace-Root":  workspace,
-						"X-Human-Allow-Exec":      "true",
-					},
 				},
 				Models: map[string]openCodeModel{
 					"human-expert": {

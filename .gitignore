@@ -9,6 +9,7 @@
 # 本地环境
 .human/
 .codegraph/
+/opencode.json
 *.db
 *.db-journal
 *.db-shm

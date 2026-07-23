@@ -689,7 +689,6 @@ func durableTask() llm.StoreTaskRecord {
 		HarnessID:        "example-harness",
 		HarnessVersion:   "1",
 		HarnessSessionID: "session-reopen",
-		WorkspaceRoot:    "/workspace/reopen",
 		ExecAllowed:      true,
 		State:            llm.TaskAwaitingCaller,
 		Revision:         1,

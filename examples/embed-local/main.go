@@ -1,5 +1,5 @@
 // Command embed-local starts a complete Human instance inside another Go
-// process: loopback model API, SQLite gateway, worker, and the stock TUI.
+// process: loopback model API, SQLite service, worker, and browser human side.
 package main
 
 import (
@@ -28,10 +28,6 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load local defaults: %w", err)
 	}
-	// The default issued-credential policy is process-local: credentials created
-	// by Open are revoked by Close. A host that needs restart reuse must select
-	// local.IssuedCredentialsPreserve before Open and durably protect both tokens.
-
 	instance, err := local.Open(ctx, config)
 	if err != nil {
 		return fmt.Errorf("open embedded Human: %w", err)

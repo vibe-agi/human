@@ -146,7 +146,7 @@ func validInternalTask(id string) llm.StoreTaskRecord {
 			ID:       "example.codec", Version: "1", Fingerprint: llm.Fingerprint([]byte("example-codec")),
 		},
 		HarnessID: "harness", HarnessVersion: "1", HarnessSessionID: "session-" + id,
-		WorkspaceRoot: "/workspace", State: llm.TaskAwaitingCaller,
+		State:    llm.TaskAwaitingCaller,
 		Revision: 1, CreatedAt: created, UpdatedAt: created,
 	}
 }

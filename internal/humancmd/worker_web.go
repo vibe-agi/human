@@ -28,7 +28,11 @@ func sha256Sum(value string) []byte {
 
 // runWebWorker connects a remote gateway over the worker bridge and serves
 // the browser human side on a dedicated loopback listener until ctx ends.
-func runWebWorker(ctx context.Context, gatewayURL, token, mirrorRoot, outboxPath, listenAddress string) error {
+func runWebWorker(
+	ctx context.Context,
+	gatewayURL, token, mirrorRoot, outboxPath, listenAddress string,
+	mirrorScope workerkit.WorkspaceScope,
+) error {
 	bridge, err := workerbridge.Dial(ctx, workerbridge.Config{
 		URL: gatewayURL, Token: token, OutboxPath: outboxPath,
 	})
@@ -41,7 +45,9 @@ func runWebWorker(ctx context.Context, gatewayURL, token, mirrorRoot, outboxPath
 	// different gateway must not recover the previous gateway's conversations
 	// (whose bridge assignments no longer exist), matching the outbox's own
 	// per-endpoint isolation.
-	scope := hex.EncodeToString(sha256Sum(gatewayURL))[:16]
+	scope := hex.EncodeToString(sha256Sum(
+		gatewayURL + "\x00" + string(mirrorScope.Caller) + "\x00" + mirrorScope.WorkspaceKey,
+	))[:16]
 	statePath, err := userdata.Path("worker", scope, "workerkit-state.db")
 	if err != nil {
 		return fmt.Errorf("resolve workerkit state path: %w", err)
@@ -56,14 +62,14 @@ func runWebWorker(ctx context.Context, gatewayURL, token, mirrorRoot, outboxPath
 		return err
 	}
 
-	webMirrorRoot := filepath.Join(mirrorRoot, "web")
-	if err := os.MkdirAll(webMirrorRoot, 0o700); err != nil {
-		return fmt.Errorf("create web mirror root: %w", err)
+	if err := os.MkdirAll(mirrorRoot, 0o700); err != nil {
+		return fmt.Errorf("create Human workspace base: %w", err)
 	}
 	mirror, err := fsmirror.Open(ctx, fsmirror.Config{
-		Root:         webMirrorRoot,
-		Build:        fsmirror.OpenCodeWriteBuilder(),
-		BaselineFile: filepath.Join(filepath.Dir(statePath), "workerkit-mirror-baseline.json"),
+		Root:          mirrorRoot,
+		Scope:         mirrorScope,
+		BuildSnapshot: fsmirror.OpenCodeNativeBuilder(),
+		BaselineFile:  filepath.Join(filepath.Dir(statePath), "workerkit-mirror-baseline.json"),
 	})
 	if err != nil {
 		return err
@@ -103,7 +109,8 @@ func runWebWorker(ctx context.Context, gatewayURL, token, mirrorRoot, outboxPath
 	httpServer := &http.Server{Handler: server, ReadHeaderTimeout: 10 * time.Second}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- httpServer.Serve(listener) }()
-	fmt.Printf("human side (browser): http://%s/?token=%s\n", listener.Addr(), sessionToken)
+	fmt.Printf("Human workspace base: %s\nhuman side (browser): http://%s/?token=%s\n",
+		mirrorRoot, listener.Addr(), sessionToken)
 
 	select {
 	case <-ctx.Done():

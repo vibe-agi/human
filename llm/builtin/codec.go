@@ -23,14 +23,16 @@ import (
 )
 
 const (
-	builtinVersion = "1.0.0"
+	openAIChatVersion = "1.1.0"
+	anthropicVersion  = "1.1.0"
+	responsesVersion  = "1.3.0"
 
 	// These manifests are the compatibility pins for the current built-in wire
 	// projections. Any byte-affecting parser or encoder change must bump both
 	// the version and the corresponding manifest before release.
-	openAIChatManifest = "human.llm.builtin/openai.chat@1.0.0\nwire=openai-chat-completions-v1\nprojection=2026-07-19\n"
-	anthropicManifest  = "human.llm.builtin/anthropic.messages@1.0.0\nwire=anthropic-messages-v1\nprojection=2026-07-19\n"
-	responsesManifest  = "human.llm.builtin/openai.responses@1.0.0\nwire=openai-responses-v1\nprojection=2026-07-19\n"
+	openAIChatManifest = "human.llm.builtin/openai.chat@1.1.0\nwire=openai-chat-completions-v1\nprojection=2026-07-22\nsdk=openai-go/v3@v3.37.0\ncontrols=explicit-noop-or-reject\n"
+	anthropicManifest  = "human.llm.builtin/anthropic.messages@1.1.0\nwire=anthropic-messages-v1\nprojection=2026-07-22\nsdk=anthropic-sdk-go@v1.58.1\ncontrols=explicit-noop-or-reject\n"
+	responsesManifest  = "human.llm.builtin/openai.responses@1.3.0\nwire=openai-responses-v1\nprojection=2026-07-23\nsdk=openai-go/v3@v3.37.0\ninclude=reasoning.encrypted_content\ncustom_tools=text,grammar\ncontrols=explicit-noop-or-reject\n"
 )
 
 var builtinLimits = llm.CodecLimits{
@@ -63,17 +65,17 @@ func Registrations() []llm.CodecRegistration {
 
 // OpenAIChat returns the built-in OpenAI Chat Completions codec.
 func OpenAIChat() llm.Codec {
-	return newCodec("openai.chat", openAIChatManifest, internalopenai.New())
+	return newCodec("openai.chat", openAIChatVersion, openAIChatManifest, internalopenai.New())
 }
 
 // AnthropicMessages returns the built-in Anthropic Messages codec.
 func AnthropicMessages() llm.Codec {
-	return newCodec("anthropic.messages", anthropicManifest, internalanthropic.New())
+	return newCodec("anthropic.messages", anthropicVersion, anthropicManifest, internalanthropic.New())
 }
 
 // OpenAIResponses returns the built-in OpenAI Responses codec.
 func OpenAIResponses() llm.Codec {
-	return newCodec("openai.responses", responsesManifest, internalresponses.New())
+	return newCodec("openai.responses", responsesVersion, responsesManifest, internalresponses.New())
 }
 
 type codec struct {
@@ -83,7 +85,7 @@ type codec struct {
 
 var _ llm.Codec = (*codec)(nil)
 
-func newCodec(id llm.CodecID, manifest string, inner dialect.Codec) *codec {
+func newCodec(id llm.CodecID, version, manifest string, inner dialect.Codec) *codec {
 	return &codec{
 		inner: inner,
 		description: llm.CodecDescription{
@@ -92,7 +94,7 @@ func newCodec(id llm.CodecID, manifest string, inner dialect.Codec) *codec {
 				Major: llm.CodecContractMajor,
 			},
 			ID:               id,
-			Version:          builtinVersion,
+			Version:          version,
 			Fingerprint:      llm.Fingerprint([]byte(manifest)),
 			Limits:           builtinLimits,
 			OverloadedStatus: inner.OverloadedStatus(),
@@ -240,7 +242,9 @@ func requestFromInternal(request canonical.Request) (llm.Request, error) {
 				Namespace:   tool.Namespace,
 				Name:        tool.Name,
 				Description: tool.Description,
+				InputKind:   llm.ToolInputKind(tool.InputKind),
 				InputSchema: bytes.Clone(tool.InputSchema),
+				InputFormat: bytes.Clone(tool.InputFormat),
 			}
 		}
 	}
@@ -292,6 +296,7 @@ func blockFromInternal(block canonical.Block) (llm.Block, error) {
 		ToolNamespace: block.ToolNamespace,
 		ToolName:      block.ToolName,
 		Input:         input,
+		TextInput:     cloneString(block.TextInput),
 		Output:        output,
 		IsError:       block.IsError,
 	}, nil
@@ -348,10 +353,19 @@ func eventToInternal(event llm.Event) (completion.Event, error) {
 			}
 			converted.ToolCalls[index] = completion.ToolCall{
 				ID: call.ID, Namespace: call.Namespace, Name: call.Name, Input: input,
+				TextInput: cloneString(call.TextInput),
 			}
 		}
 	}
 	return converted, nil
+}
+
+func cloneString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func cloneJSONObject(value map[string]any) (map[string]any, error) {
@@ -429,6 +443,8 @@ func blockTypeFromInternal(blockType canonical.BlockType) (llm.BlockType, error)
 
 func toolCallPolicyFromInternal(policy canonical.ToolCallPolicy) (llm.ToolCallPolicy, error) {
 	switch policy {
+	case canonical.ToolCallsDisabled:
+		return llm.ToolCallsDisabled, nil
 	case canonical.ToolCallsSerial:
 		return llm.ToolCallsSerial, nil
 	case canonical.ToolCallsParallel:
@@ -444,6 +460,8 @@ func toolCallPolicyToInternal(policy llm.ToolCallPolicy) (canonical.ToolCallPoli
 	switch policy {
 	case "":
 		return "", nil
+	case llm.ToolCallsDisabled:
+		return canonical.ToolCallsDisabled, nil
 	case llm.ToolCallsSerial:
 		return canonical.ToolCallsSerial, nil
 	case llm.ToolCallsParallel:

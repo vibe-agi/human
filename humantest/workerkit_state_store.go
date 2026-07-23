@@ -183,7 +183,7 @@ func workerStateConversation(caller, task string) workerkit.Conversation {
 				Task: llm.TaskContext{
 					TaskID: llm.TaskID(task), CapabilityTier: llm.TierWorkspace,
 					WorkspaceKey: "workspace-a", HarnessID: "harness-a", HarnessVersion: "v1",
-					HarnessSessionID: "session-a", WorkspaceRoot: "/workspace",
+					HarnessSessionID: "session-a",
 				},
 				Request: llm.Request{
 					Model: "human", Stream: true,

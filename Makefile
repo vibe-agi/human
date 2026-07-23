@@ -1,9 +1,14 @@
-.PHONY: all build test fault-test formal-check real-opencode-web-test real-opencode-network-test release-build release-semantics-test release-build-contract-test fmt fmt-check tidy-check vet check
+.PHONY: all build test fault-test formal-check real-client-test real-opencode-web-test real-opencode-browser-test real-opencode-network-test real-codex-test real-claude-test real-container-client-test container-client-harness-test release-build release-semantics-test release-build-contract-test fmt fmt-check tidy-check vet check
 
-GO_FILES := $(shell git ls-files --cached --others --exclude-standard -- '*.go')
+# --cached includes tracked files deleted in the working tree. Filter them so
+# cleanup branches do not make fmt-check invoke gofmt on paths that no longer
+# exist (command substitution otherwise hides gofmt's non-zero status).
+GO_FILES := $(shell git ls-files --cached --others --exclude-standard -- '*.go' | while IFS= read -r file; do test -f "$$file" && printf '%s\n' "$$file"; done)
 FAULT_COUNT ?= 1
 REAL_COUNT ?= 1
 REAL_NETWORK_DROPS ?= 5
+REAL_LLM_BASE_URL ?= http://127.0.0.1:23333
+REAL_LLM_MODEL ?= dashscope:glm-5
 
 all: check
 
@@ -27,11 +32,33 @@ formal-check:
 	./formal/run-checks.sh
 
 real-opencode-web-test:
-	HUMAN_REAL_OPENCODE_E2E=1 go test -count=$(REAL_COUNT) -timeout=5m ./local -run '^TestRealOpenCodeLocalWebMode$$' -v
+	HUMAN_REAL_OPENCODE_E2E=1 go test -count=$(REAL_COUNT) -timeout=5m ./local -run '^TestRealOpenCodeLocalPublicStack$$' -v
 	HUMAN_REAL_OPENCODE_E2E=1 go test -count=$(REAL_COUNT) -timeout=5m ./web -run '^TestRealOpenCode' -v
+
+real-opencode-browser-test:
+	HUMAN_REAL_OPENCODE_BROWSER_E2E=1 go test -count=$(REAL_COUNT) -timeout=5m ./local -run '^TestRealOpenCodeWorkspaceBrowserFinal$$' -v
 
 real-opencode-network-test:
 	HUMAN_REAL_OPENCODE_NETWORK_E2E=1 HUMAN_REAL_OPENCODE_NETWORK_DROPS=$(REAL_NETWORK_DROPS) go test -count=$(REAL_COUNT) -timeout=8m ./local -run '^TestRealOpenCodeRecoversAcrossNetworkFaultMatrix$$' -v
+
+real-codex-test:
+	HUMAN_REAL_CODEX_E2E=1 go test -count=$(REAL_COUNT) -timeout=5m ./local -run '^TestRealCodexLocalPublicStackToolLoop$$' -v
+
+real-claude-test:
+	HUMAN_REAL_CLAUDE_E2E=1 go test -count=$(REAL_COUNT) -timeout=5m ./web -run '^TestRealClaudeCodeWebBasicLoop$$' -v
+
+real-client-test: real-opencode-web-test real-codex-test real-claude-test
+
+real-container-client-test:
+	@test -n "$$HUMAN_TEST_LLM_API_KEY" || (echo "HUMAN_TEST_LLM_API_KEY is required" >&2; exit 2)
+	HUMAN_TESTCONTAINERS_E2E=1 HUMAN_TEST_LLM_FAKE=0 \
+	HUMAN_TEST_LLM_BASE_URL="$(REAL_LLM_BASE_URL)" \
+	HUMAN_TEST_LLM_MODEL="$(REAL_LLM_MODEL)" \
+	go -C tests/container-clients test -count=$(REAL_COUNT) -timeout=25m . -run '^TestContainer(Protocols|AgentCLIs)ViaLLMWebHuman$$' -v
+
+container-client-harness-test:
+	HUMAN_TESTCONTAINERS_E2E=1 HUMAN_TEST_LLM_FAKE=1 \
+	go -C tests/container-clients test -count=$(REAL_COUNT) -timeout=25m . -run '^TestContainer(Protocols|AgentCLIs)ViaLLMWebHuman$$' -v
 
 release-build:
 	test -n "$(VERSION)"
@@ -50,8 +77,7 @@ fmt-check:
 	test -z "$$(gofmt -l $(GO_FILES))"
 
 tidy-check:
-	go mod tidy
-	git diff --exit-code -- go.mod go.sum
+	go mod tidy -diff
 
 vet:
 	go vet ./...

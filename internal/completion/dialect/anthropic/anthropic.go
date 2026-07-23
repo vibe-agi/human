@@ -29,13 +29,31 @@ func (Codec) Dialect() canonical.Dialect {
 }
 
 type messagesRequest struct {
-	Model      string             `json:"model"`
-	Stream     bool               `json:"stream"`
-	System     json.RawMessage    `json:"system"`
-	Messages   []anthropicMessage `json:"messages"`
-	Tools      []anthropicTool    `json:"tools"`
-	Metadata   map[string]string  `json:"metadata"`
-	ToolChoice json.RawMessage    `json:"tool_choice"`
+	Model               string             `json:"model"`
+	MaxTokens           *int64             `json:"max_tokens"`
+	Stream              bool               `json:"stream"`
+	System              json.RawMessage    `json:"system"`
+	Messages            []anthropicMessage `json:"messages"`
+	Tools               []anthropicTool    `json:"tools"`
+	Metadata            map[string]string  `json:"metadata"`
+	ToolChoice          json.RawMessage    `json:"tool_choice"`
+	Temperature         *float64           `json:"temperature"`
+	TopK                *int64             `json:"top_k"`
+	TopP                *float64           `json:"top_p"`
+	StopSequences       []string           `json:"stop_sequences"`
+	Thinking            json.RawMessage    `json:"thinking"`
+	ContextManagement   json.RawMessage    `json:"context_management"`
+	OutputConfig        json.RawMessage    `json:"output_config"`
+	OutputFormat        json.RawMessage    `json:"output_format"`
+	Container           json.RawMessage    `json:"container"`
+	CacheControl        json.RawMessage    `json:"cache_control"`
+	Diagnostics         json.RawMessage    `json:"diagnostics"`
+	Fallbacks           []json.RawMessage  `json:"fallbacks"`
+	MCPServers          []json.RawMessage  `json:"mcp_servers"`
+	FallbackCreditToken string             `json:"fallback_credit_token"`
+	InferenceGeo        string             `json:"inference_geo"`
+	ServiceTier         string             `json:"service_tier"`
+	Speed               string             `json:"speed"`
 }
 
 type anthropicMessage struct {
@@ -70,10 +88,14 @@ type imageSource struct {
 
 func (Codec) Decode(payload []byte) (canonical.Request, error) {
 	var wire messagesRequest
-	if err := dialect.DecodeJSON(payload, &wire); err != nil {
+	if err := dialect.DecodeJSONStrict(payload, &wire); err != nil {
 		return canonical.Request{}, fmt.Errorf("decode Anthropic Messages request: %w", err)
 	}
-	if err := validateToolChoice(wire.ToolChoice); err != nil {
+	if err := validateRequestControls(wire); err != nil {
+		return canonical.Request{}, err
+	}
+	toolCallPolicy, err := parseToolChoice(wire.ToolChoice)
+	if err != nil {
 		return canonical.Request{}, err
 	}
 
@@ -82,11 +104,12 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 		return canonical.Request{}, fmt.Errorf("system: %w", err)
 	}
 	request := canonical.Request{
-		Dialect:  canonical.DialectAnthropic,
-		Model:    wire.Model,
-		Stream:   wire.Stream,
-		System:   system,
-		Metadata: wire.Metadata,
+		Dialect:        canonical.DialectAnthropic,
+		Model:          wire.Model,
+		Stream:         wire.Stream,
+		System:         system,
+		Metadata:       wire.Metadata,
+		ToolCallPolicy: toolCallPolicy,
 	}
 	for index, message := range wire.Messages {
 		role, err := parseRole(message.Role)
@@ -115,20 +138,129 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 	if err := request.Validate(); err != nil {
 		return canonical.Request{}, err
 	}
+	if request.ToolCallPolicy == canonical.ToolCallsDisabled {
+		// tool_choice:none is a capability boundary, not merely a generation hint.
+		// Do not expose otherwise valid tool definitions to the Human worker.
+		request.Tools = nil
+	}
 	return request, nil
 }
 
-func validateToolChoice(raw json.RawMessage) error {
+// validateRequestControls classifies every field in the current stable and
+// beta Messages envelopes. Provider scheduling/sampling hints have no meaning
+// for a human model, but are still type/range checked before becoming explicit
+// no-ops. Stateful provider features and output-shape guarantees are rejected
+// because silently pretending to implement them would be unsafe.
+func validateRequestControls(wire messagesRequest) error {
+	if wire.MaxTokens != nil && *wire.MaxTokens < 0 {
+		return errors.New("max_tokens must be non-negative")
+	}
+	if wire.Temperature != nil && (*wire.Temperature < 0 || *wire.Temperature > 1) {
+		return errors.New("temperature must be between 0 and 1")
+	}
+	if wire.TopK != nil && *wire.TopK < 0 {
+		return errors.New("top_k must be non-negative")
+	}
+	if wire.TopP != nil && (*wire.TopP < 0 || *wire.TopP > 1) {
+		return errors.New("top_p must be between 0 and 1")
+	}
+	// stop_sequences is a token-generation control. A human response has no
+	// provider tokenizer, so a well-typed list is accepted as an explicit no-op.
+	for _, object := range []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{name: "thinking", raw: wire.Thinking},
+		{name: "context_management", raw: wire.ContextManagement},
+		{name: "cache_control", raw: wire.CacheControl},
+		{name: "diagnostics", raw: wire.Diagnostics},
+	} {
+		if err := validateJSONObject(object.name, object.raw); err != nil {
+			return err
+		}
+	}
+	if err := validateOutputConfig(wire.OutputConfig); err != nil {
+		return err
+	}
+	if !isNullJSON(wire.OutputFormat) {
+		return errors.New("structured output_format is not supported")
+	}
+	if !isNullJSON(wire.Container) {
+		return errors.New("container continuation is not supported")
+	}
+	if wire.FallbackCreditToken != "" || len(wire.Fallbacks) != 0 {
+		return errors.New("model fallbacks are not supported")
+	}
+	if len(wire.MCPServers) != 0 {
+		return errors.New("provider-hosted MCP servers are not supported")
+	}
+	if wire.ServiceTier != "" && wire.ServiceTier != "auto" && wire.ServiceTier != "standard_only" {
+		return fmt.Errorf("unsupported service_tier %q", wire.ServiceTier)
+	}
+	if wire.Speed != "" && wire.Speed != "standard" && wire.Speed != "fast" {
+		return fmt.Errorf("unsupported speed %q", wire.Speed)
+	}
+	return nil
+}
+
+func validateJSONObject(name string, raw json.RawMessage) error {
+	if isNullJSON(raw) {
+		return nil
+	}
+	var value map[string]any
+	if err := dialect.DecodeJSON(raw, &value); err != nil || value == nil {
+		return fmt.Errorf("%s must be a JSON object", name)
+	}
+	return nil
+}
+
+func validateOutputConfig(raw json.RawMessage) error {
+	if isNullJSON(raw) {
+		return nil
+	}
+	var config struct {
+		Effort     string          `json:"effort"`
+		Format     json.RawMessage `json:"format"`
+		TaskBudget json.RawMessage `json:"task_budget"`
+	}
+	if err := dialect.DecodeJSONStrict(raw, &config); err != nil {
+		return fmt.Errorf("output_config: %w", err)
+	}
+	if config.Effort != "" {
+		switch config.Effort {
+		case "low", "medium", "high", "xhigh", "max":
+		default:
+			return fmt.Errorf("unsupported output_config.effort %q", config.Effort)
+		}
+	}
+	if !isNullJSON(config.Format) {
+		return errors.New("structured output_config.format is not supported")
+	}
+	if err := validateJSONObject("output_config.task_budget", config.TaskBudget); err != nil {
+		return err
+	}
+	return nil
+}
+
+func isNullJSON(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
+}
+
+func parseToolChoice(raw json.RawMessage) (canonical.ToolCallPolicy, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return nil
+		return "", nil
 	}
 	var stringChoice string
 	if err := json.Unmarshal(trimmed, &stringChoice); err == nil {
-		if stringChoice == "auto" {
-			return nil
+		switch stringChoice {
+		case "auto":
+			return "", nil
+		case "none":
+			return canonical.ToolCallsDisabled, nil
 		}
-		return errors.New("tool_choice is unsupported; omit it or use auto")
+		return "", errors.New("tool_choice is unsupported; omit it or use auto/none")
 	}
 	var choice struct {
 		Type                   string `json:"type"`
@@ -138,12 +270,21 @@ func validateToolChoice(raw json.RawMessage) error {
 	decoder := json.NewDecoder(bytes.NewReader(trimmed))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&choice); err != nil {
-		return fmt.Errorf("tool_choice: %w", err)
+		return "", fmt.Errorf("tool_choice: %w", err)
 	}
-	if choice.Type != "auto" || choice.Name != "" || choice.DisableParallelToolUse {
-		return errors.New("tool_choice is unsupported; omit it or use auto with parallel tool use enabled")
+	if choice.Name != "" {
+		return "", errors.New("specific tool_choice is not supported")
 	}
-	return nil
+	if choice.Type == "none" {
+		return canonical.ToolCallsDisabled, nil
+	}
+	if choice.Type != "auto" {
+		return "", errors.New("tool_choice is unsupported; omit it or use auto/none")
+	}
+	if choice.DisableParallelToolUse {
+		return canonical.ToolCallsSerial, nil
+	}
+	return canonical.ToolCallsParallel, nil
 }
 
 func parseRole(value string) (canonical.Role, error) {
@@ -355,14 +496,28 @@ func (stream *stream) Start() ([][]byte, error) {
 		"message": map[string]any{
 			"id": stream.responseID, "type": "message", "role": "assistant",
 			"content": []any{}, "model": stream.model, "stop_reason": nil,
-			"stop_sequence": nil,
-			"usage":         map[string]int{"input_tokens": 0, "output_tokens": 0},
+			"stop_sequence": nil, "stop_details": nil, "container": nil,
+			"usage": anthropicUsage(),
 		},
 	})
 	if err != nil {
 		return nil, err
 	}
 	return [][]byte{frame}, nil
+}
+
+func anthropicUsage() map[string]any {
+	return map[string]any{
+		"input_tokens": 0, "output_tokens": 0,
+		"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+		"cache_creation": map[string]int{
+			"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0,
+		},
+		"server_tool_use":       map[string]int{"web_search_requests": 0, "web_fetch_requests": 0},
+		"output_tokens_details": map[string]int{"thinking_tokens": 0},
+		"service_tier":          "standard",
+		"inference_geo":         "not_applicable",
+	}
 }
 
 func (*stream) Heartbeat() []byte {
@@ -417,6 +572,9 @@ func (stream *stream) Encode(event completion.Event, _ ...dialect.EventSeed) ([]
 			frames = append(frames, closed)
 		}
 		for _, call := range event.ToolCalls {
+			if call.TextInput != nil {
+				return nil, false, fmt.Errorf("Anthropic tool call %q cannot use text input", call.ID)
+			}
 			toolFrames, err := stream.toolUse(call)
 			if err != nil {
 				return nil, false, err

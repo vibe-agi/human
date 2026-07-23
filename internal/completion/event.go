@@ -23,7 +23,8 @@ type ToolCall struct {
 	ID        string         `json:"id"`
 	Namespace string         `json:"namespace,omitempty"`
 	Name      string         `json:"name"`
-	Input     map[string]any `json:"input"`
+	Input     map[string]any `json:"input,omitempty"`
+	TextInput *string        `json:"text_input,omitempty"`
 }
 
 func (call ToolCall) QualifiedName() string {

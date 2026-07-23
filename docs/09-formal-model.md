@@ -83,4 +83,4 @@ receipt 实现这一约束，Agent 显式暴露 no-clock `LeaseGrant` 并在 mut
 
 ## 5. 验收口径
 
-`make formal-check` 是协议设计门；`make check` 和真实 fault/e2e gate 是实现门。只有两者都过，某项才可以从 “TLA 已裁决” 提升为 “Go 已实现并验证”。当前 runner 共有 **90 个 gate**：34 个正向检查、7 个指定环境/coverage 反例与 49 个 mutant；其中新增 **11 个 Agent transport mutant** 专门攻击 owner-only 验权、stale prepare/revision、错误 replay、非原子 effect/receipt、过早 ACK、终态遗留 grant、未提交 grant 可见、异 digest 伪回放与 NACK 不出队。有限状态结果、mutant 列表、环境假设和未建模边界记录在 [`formal/README.md`](../formal/README.md)，不能用“完整正确”省略这些限定词。
+`make formal-check` 是协议设计门；`make check` 和真实 fault/e2e gate 是实现门。只有两者都过，某项才可以从 “TLA 已裁决” 提升为 “Go 已实现并验证”。当前 runner 共有 **91 个 gate**：35 个正向检查、7 个指定环境/coverage 反例与 49 个 mutant；其中新增的 LLM preempt 正向门要求 caller 已断开且 cleanup 身份仍匹配 exact active request，live caller 或旧 handler 的迟到 cleanup 都不能授权夺权；另有 **11 个 Agent transport mutant** 专门攻击 owner-only 验权、stale prepare/revision、错误 replay、非原子 effect/receipt、过早 ACK、终态遗留 grant、未提交 grant 可见、异 digest 伪回放与 NACK 不出队。有限状态结果、mutant 列表、环境假设和未建模边界记录在 [`formal/README.md`](../formal/README.md)，不能用“完整正确”省略这些限定词。

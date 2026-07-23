@@ -503,7 +503,7 @@ func sqliteFixture(t *testing.T) (llm.StoreTaskRecord, llm.StoreRequestRecord) {
 		Key:          llm.StoreTaskKey{Caller: "caller-a", Task: "task-a"},
 		WorkspaceKey: "workspace-a", CapabilityTier: llm.TierRemoteTools, Codec: codec,
 		HarnessID: "codex", HarnessVersion: "1", HarnessSessionID: "session-a",
-		WorkspaceRoot: "/workspace", State: llm.TaskAwaitingCaller,
+		State:    llm.TaskAwaitingCaller,
 		Revision: 1, CreatedAt: now, UpdatedAt: now,
 	}
 	request := llm.StoreRequestRecord{

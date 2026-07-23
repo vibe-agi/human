@@ -1,10 +1,9 @@
 package local
 
 // The migrated-product door: real OpenCode 1.17.18 against the REAL local
-// product in web mode — the legacy gateway with issued credentials, the real
-// worker WebSocket and durable outbox, the workerbridge conversion, and the
-// human side operated exclusively through the web HTTP API. No TUI process is
-// involved.
+// product in web mode — the public llm.Service/callerhttp composition, its
+// in-process workerkit connection, and the human side operated exclusively
+// through the web HTTP API. No TUI process is involved.
 //
 //	HUMAN_REAL_OPENCODE_E2E=1 go test ./local -run TestRealOpenCodeLocalWebMode -count=1
 
@@ -22,8 +21,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/vibe-agi/human/gateway"
 )
 
 func TestRealOpenCodeLocalWebMode(t *testing.T) {
@@ -45,16 +42,13 @@ func TestRealOpenCodeLocalWebMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	instance, err := Open(context.Background(), Config{
-		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
-		Worker: WorkerPaths{
-			MirrorRoot: filepath.Join(root, "mirror"),
-			OutboxPath: filepath.Join(privateRoot, "outbox.db"),
-		},
-		ListenAddress:    "127.0.0.1:0",
-		WebListenAddress: "127.0.0.1:0",
-		WebStatePath:     filepath.Join(privateRoot, "workerkit-state.db"),
-		CallerSubject:    "door-caller",
-		WorkerSubject:    "door-worker",
+		Public:             PublicStackConfig{DatabasePath: filepath.Join(root, "store.db")},
+		HumanWorkspaceRoot: filepath.Join(root, "mirror"),
+		ListenAddress:      "127.0.0.1:0",
+		WebListenAddress:   "127.0.0.1:0",
+		WebStatePath:       filepath.Join(privateRoot, "workerkit-state.db"),
+		CallerSubject:      "door-caller",
+		WorkerSubject:      "door-worker",
 	})
 	if err != nil {
 		t.Fatal(err)

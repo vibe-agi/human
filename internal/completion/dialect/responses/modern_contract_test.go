@@ -15,8 +15,8 @@ func TestDecodeModernCodexToolsReasoningAndSerialPolicy(t *testing.T) {
 	t.Parallel()
 	payload := []byte(`{
 	"model":"human-expert","stream":true,"parallel_tool_calls":false,
-	"store":false,"include":[],"client_metadata":{"origin":"codex"},
-	"prompt_cache_key":"cache-key","reasoning":null,"max_output_tokens":null,
+	"store":false,"include":["reasoning.encrypted_content"],"client_metadata":{"origin":"codex"},
+	"prompt_cache_key":"cache-key","reasoning":{"summary":"auto"},"max_output_tokens":null,
   "input":[
     {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"private-provider-state"},
     {"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"}]},
@@ -98,32 +98,43 @@ func TestDecodeModernCodexToolsReasoningAndSerialPolicy(t *testing.T) {
 	}
 }
 
-func TestTopLevelReasoningFailsClosedWhileNullPasses(t *testing.T) {
+func TestTopLevelReasoningAcceptsOfficialHintsAndRejectsUnknownControls(t *testing.T) {
 	t.Parallel()
-	if _, err := New().Decode([]byte(`{
-  "model":"m","stream":true,"input":"hello","reasoning":null
+	for _, reasoning := range []string{
+		`{"summary":"auto"}`,
+		`{"effort":"medium","summary":"detailed"}`,
+		`{"effort":"none","generate_summary":"concise"}`,
+	} {
+		if _, err := New().Decode([]byte(`{
+  "model":"m","stream":true,"input":"hello","reasoning":` + reasoning + `
 }`)); err != nil {
-		t.Fatalf("reasoning:null rejected: %v", err)
+			t.Fatalf("official reasoning hint %s rejected: %v", reasoning, err)
+		}
 	}
 	if _, err := New().Decode([]byte(`{
   "model":"m","stream":true,"input":"hello",
-  "reasoning":{"effort":"medium","summary":"auto"}
-}`)); err == nil || !strings.Contains(err.Error(), "top-level reasoning controls are not supported") {
-		t.Fatalf("non-null top-level reasoning error = %v", err)
+  "reasoning":{"summary":"auto","future_control":true}
+}`)); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("unknown top-level reasoning error = %v", err)
 	}
 }
 
 func TestTopLevelBehaviorControlsFailClosed(t *testing.T) {
 	t.Parallel()
 	tests := []string{
+		`"background":true`,
 		`"store":true`,
-		`"include":["reasoning.encrypted_content"]`,
-		`"max_output_tokens":100`,
+		`"include":["unsupported.provider_state"]`,
+		`"include":["reasoning.encrypted_content","reasoning.encrypted_content"]`,
+		`"max_output_tokens":-1`,
+		`"temperature":2.1`,
+		`"top_logprobs":1`,
+		`"conversation":"conv_1"`,
+		`"prompt":{"id":"pmpt_1"}`,
 		`"client_metadata":"not-an-object"`,
 		`"prompt_cache_key":{"bad":true}`,
 		`"reasoning":"medium"`,
-		`"reasoning":{"effort":"medium"}`,
-		`"temperature":0.2`,
+		`"reasoning":{"summary":"verbose"}`,
 	}
 	for _, control := range tests {
 		control := control

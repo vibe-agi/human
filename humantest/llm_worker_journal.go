@@ -1292,7 +1292,6 @@ func llmConformanceJournalAssignment(id llm.WorkerDeliveryID) workerws.JournalAs
 			Task: llm.TaskContext{
 				TaskID: "task-a", WorkspaceKey: "workspace-a", CapabilityTier: llm.TierWorkspace,
 				HarnessID: "harness-a", HarnessVersion: "1", HarnessSessionID: "session-a",
-				WorkspaceRoot: "/workspace/a",
 			},
 			Request: llm.Request{
 				Model: "human", Stream: true,

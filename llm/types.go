@@ -46,8 +46,12 @@ type Block struct {
 	ToolNamespace string         `json:"tool_namespace,omitempty"`
 	ToolName      string         `json:"tool_name,omitempty"`
 	Input         map[string]any `json:"input,omitempty"`
-	Output        any            `json:"output,omitempty"`
-	IsError       bool           `json:"is_error,omitempty"`
+	// TextInput carries the opaque freeform payload of a text-input tool call.
+	// It is a pointer so an intentionally empty payload remains distinguishable
+	// from a JSON-input tool call.
+	TextInput *string `json:"text_input,omitempty"`
+	Output    any     `json:"output,omitempty"`
+	IsError   bool    `json:"is_error,omitempty"`
 }
 
 // Message is one canonical conversation message.
@@ -56,12 +60,27 @@ type Message struct {
 	Blocks []Block `json:"blocks"`
 }
 
-// Tool is a caller-executed function made available to HumanLLM.
+// ToolInputKind identifies how a caller-executed tool receives its input.
+// The zero value is JSON for backwards compatibility with function tools.
+type ToolInputKind string
+
+const (
+	ToolInputJSON ToolInputKind = ""
+	ToolInputText ToolInputKind = "text"
+)
+
+// Tool is a caller-executed operation made available to HumanLLM. JSON-input
+// tools map to ordinary OpenAI/Anthropic functions. Text-input tools map to
+// Responses custom tools such as Codex's freeform apply_patch.
 type Tool struct {
 	Namespace   string          `json:"namespace,omitempty"`
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema"`
+	InputKind   ToolInputKind   `json:"input_kind,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+	// InputFormat preserves a provider's validated text format contract (for
+	// example a Responses grammar object) as part of request identity.
+	InputFormat json.RawMessage `json:"input_format,omitempty"`
 }
 
 // ToolCallPolicy is the caller's explicit scheduling contract for one model
@@ -69,6 +88,9 @@ type Tool struct {
 type ToolCallPolicy string
 
 const (
+	// ToolCallsDisabled means the caller explicitly prohibited tool use for this
+	// response, even if its provider request carried tool definitions.
+	ToolCallsDisabled ToolCallPolicy = "disabled"
 	ToolCallsSerial   ToolCallPolicy = "serial"
 	ToolCallsParallel ToolCallPolicy = "parallel"
 )
@@ -112,7 +134,7 @@ func (request Request) Validate() error {
 		return errors.New("llm: at least one message is required")
 	}
 	switch request.ToolCallPolicy {
-	case "", ToolCallsSerial, ToolCallsParallel:
+	case "", ToolCallsDisabled, ToolCallsSerial, ToolCallsParallel:
 	default:
 		return fmt.Errorf("llm: unsupported tool-call policy %q", request.ToolCallPolicy)
 	}
@@ -128,8 +150,23 @@ func (request Request) Validate() error {
 			return fmt.Errorf("llm: duplicate tool %q", QualifiedToolName(tool.Namespace, tool.Name))
 		}
 		toolNames[identity] = struct{}{}
-		if !json.Valid(tool.InputSchema) {
-			return fmt.Errorf("llm: tool %q has invalid input schema", tool.QualifiedName())
+		switch tool.InputKind {
+		case ToolInputJSON:
+			if !json.Valid(tool.InputSchema) {
+				return fmt.Errorf("llm: tool %q has invalid input schema", tool.QualifiedName())
+			}
+			if len(tool.InputFormat) != 0 {
+				return fmt.Errorf("llm: JSON-input tool %q has a text input format", tool.QualifiedName())
+			}
+		case ToolInputText:
+			if len(tool.InputSchema) != 0 {
+				return fmt.Errorf("llm: text-input tool %q has an input schema", tool.QualifiedName())
+			}
+			if len(tool.InputFormat) != 0 && !json.Valid(tool.InputFormat) {
+				return fmt.Errorf("llm: text-input tool %q has invalid input format", tool.QualifiedName())
+			}
+		default:
+			return fmt.Errorf("llm: tool %q has unsupported input kind %q", tool.QualifiedName(), tool.InputKind)
 		}
 	}
 	for index, capability := range request.HostedCapabilities {
@@ -201,6 +238,9 @@ func (block Block) Validate() error {
 		if err := ValidateToolIdentity(block.ToolNamespace, block.ToolName); err != nil {
 			return fmt.Errorf("invalid tool use identity: %w", err)
 		}
+		if block.Input != nil && block.TextInput != nil {
+			return errors.New("tool use cannot have both JSON and text input")
+		}
 	case BlockToolResult:
 		if block.ToolCallID == "" {
 			return errors.New("tool result requires a tool call id")
@@ -267,7 +307,8 @@ type ToolCall struct {
 	ID        string         `json:"id"`
 	Namespace string         `json:"namespace,omitempty"`
 	Name      string         `json:"name"`
-	Input     map[string]any `json:"input"`
+	Input     map[string]any `json:"input,omitempty"`
+	TextInput *string        `json:"text_input,omitempty"`
 }
 
 // QualifiedName returns the complete tool identity.

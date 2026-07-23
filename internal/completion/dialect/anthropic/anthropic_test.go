@@ -98,6 +98,37 @@ func TestDecodeAcceptsNonStreamingAndRejectsInvalidRoles(t *testing.T) {
 	}
 }
 
+func TestDecodeAnthropicClassifiesCurrentSDKControls(t *testing.T) {
+	t.Parallel()
+	accepted := `{
+  "model":"m","max_tokens":1024,"stream":true,
+  "messages":[{"role":"user","content":"hello"}],
+  "temperature":0.2,"top_k":20,"top_p":0.9,
+  "stop_sequences":["<stop>"],"thinking":{"type":"disabled"},
+  "context_management":{"edits":[]},"output_config":{"effort":"low"},
+  "cache_control":{"type":"ephemeral"},"diagnostics":{},
+  "service_tier":"auto","speed":"standard"
+}`
+	if _, err := New().Decode([]byte(accepted)); err != nil {
+		t.Fatalf("current SDK controls rejected: %v", err)
+	}
+	for name, field := range map[string]string{
+		"unknown top-level field": `"future_control":true`,
+		"structured output":       `"output_config":{"format":{"type":"json_schema"}}`,
+		"container continuation":  `"container":"container_1"`,
+		"hosted MCP":              `"mcp_servers":[{"type":"url","url":"https://example.com"}]`,
+	} {
+		name, field := name, field
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			payload := `{"model":"m","max_tokens":1024,"messages":[{"role":"user","content":"hello"}],` + field + `}`
+			if _, err := New().Decode([]byte(payload)); err == nil {
+				t.Fatalf("unsupported control accepted: %s", payload)
+			}
+		})
+	}
+}
+
 func TestDecodeAnthropicToolChoiceDefaultsAndEmptyInput(t *testing.T) {
 	t.Parallel()
 	for _, choice := range []string{`"auto"`, `{"type":"auto"}`, `{"type":"auto","disable_parallel_tool_use":false}`} {
@@ -119,12 +150,38 @@ func TestDecodeAnthropicToolChoiceDefaultsAndEmptyInput(t *testing.T) {
 	}
 }
 
+func TestDecodeAnthropicSerialToolChoice(t *testing.T) {
+	t.Parallel()
+	request, err := New().Decode([]byte(`{
+  "model":"m","max_tokens":1024,
+  "messages":[{"role":"user","content":"hello"}],
+  "tool_choice":{"type":"auto","disable_parallel_tool_use":true}
+}`))
+	if err != nil || request.ToolCallPolicy != canonical.ToolCallsSerial {
+		t.Fatalf("serial Anthropic tool choice = %q, %v", request.ToolCallPolicy, err)
+	}
+}
+
+func TestDecodeAnthropicDisabledToolChoice(t *testing.T) {
+	t.Parallel()
+	for _, choice := range []string{`"none"`, `{"type":"none"}`} {
+		request, err := New().Decode([]byte(`{
+		  "model":"m","max_tokens":1024,
+		  "messages":[{"role":"user","content":"hello"}],
+		  "tools":[{"name":"read_file","input_schema":{"type":"object"}}],
+		  "tool_choice":` + choice + `
+		}`))
+		if err != nil || request.ToolCallPolicy != canonical.ToolCallsDisabled || len(request.Tools) != 0 {
+			t.Fatalf("disabled Anthropic tool choice %s = %q, tools=%+v, %v", choice, request.ToolCallPolicy, request.Tools, err)
+		}
+	}
+}
+
 func TestDecodeAnthropicRejectsUnsupportedToolChoice(t *testing.T) {
 	t.Parallel()
 	for _, choice := range []string{
 		`{"type":"any"}`,
 		`{"type":"tool","name":"read_file"}`,
-		`{"type":"auto","disable_parallel_tool_use":true}`,
 		`{"type":"auto","future_control":true}`,
 	} {
 		payload := `{"model":"m","stream":true,"messages":[{"role":"user","content":"hello"}],"tool_choice":` + choice + `}`

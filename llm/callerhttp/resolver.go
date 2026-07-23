@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/vibe-agi/human/llm"
 )
@@ -17,7 +16,6 @@ const (
 	HeaderHarnessID      = "X-Human-Harness-Id"
 	HeaderHarnessVersion = "X-Human-Harness-Version"
 	HeaderHarnessSession = "X-Human-Harness-Session-Id"
-	HeaderWorkspaceRoot  = "X-Human-Workspace-Root"
 	HeaderAllowExec      = "X-Human-Allow-Exec"
 )
 
@@ -112,15 +110,10 @@ func (HeaderResolver) ResolveRequest(
 		if err != nil {
 			return Resolution{}, err
 		}
-		root, err := requiredHeader(request.Header, HeaderWorkspaceRoot)
-		if err != nil || len(root) > 4096 || !utf8.ValidString(root) || strings.ContainsAny(root, "\x00\r\n") {
-			return Resolution{}, fmt.Errorf("%w: %s is required", ErrResolution, HeaderWorkspaceRoot)
-		}
 		task.WorkspaceKey = workspace
 		task.HarnessID = harness
 		task.HarnessVersion = version
 		task.HarnessSessionID = session
-		task.WorkspaceRoot = root
 		if value, exists, optionalErr := optionalHeader(request.Header, HeaderTaskID); optionalErr != nil {
 			return Resolution{}, optionalErr
 		} else if exists {
@@ -147,7 +140,7 @@ func (HeaderResolver) ResolveRequest(
 func taskHeaders() []string {
 	return []string{
 		HeaderTaskID, HeaderWorkspaceKey, HeaderHarnessID, HeaderHarnessVersion,
-		HeaderHarnessSession, HeaderWorkspaceRoot, HeaderAllowExec,
+		HeaderHarnessSession, HeaderAllowExec,
 	}
 }
 

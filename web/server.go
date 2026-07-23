@@ -13,10 +13,13 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net/http"
 	"strings"
 	"sync"
@@ -42,6 +45,13 @@ type Config struct {
 	SessionToken string
 	// Heartbeat bounds SSE keep-alive comments. Zero selects 25 seconds.
 	Heartbeat time.Duration
+	// PlanProfiles selects the normalized Tasks/Plan panel from an exact harness
+	// request. Nil installs OfficialPlanProfiles. A typed nil is rejected.
+	PlanProfiles PlanProfileResolver
+	// CommandProfiles selects the normalized command editor from an exact
+	// harness request. Nil installs OfficialCommandProfiles. A typed nil is
+	// rejected.
+	CommandProfiles CommandProfileResolver
 }
 
 // Server is an http.Handler serving the embedded UI, the JSON command API,
@@ -49,8 +59,10 @@ type Config struct {
 // pump and closes every SSE session.
 type Server struct {
 	worker    *workerkit.Worker
-	token     string
+	tokenHash [sha256.Size]byte
 	heartbeat time.Duration
+	plan      PlanProfileResolver
+	command   CommandProfileResolver
 
 	mu          sync.Mutex
 	closed      bool
@@ -71,6 +83,18 @@ func New(config Config) (*Server, error) {
 	if len(config.SessionToken) < 16 {
 		return nil, fmt.Errorf("%w: SessionToken of at least 16 bytes is required", ErrInvalidConfig)
 	}
+	plan := config.PlanProfiles
+	if plan == nil {
+		plan = OfficialPlanProfiles()
+	} else if nilPlanProfileResolver(plan) {
+		return nil, fmt.Errorf("%w: PlanProfiles is typed nil", ErrInvalidConfig)
+	}
+	command := config.CommandProfiles
+	if command == nil {
+		command = OfficialCommandProfiles()
+	} else if nilCommandProfileResolver(command) {
+		return nil, fmt.Errorf("%w: CommandProfiles is typed nil", ErrInvalidConfig)
+	}
 	heartbeat := config.Heartbeat
 	if heartbeat == 0 {
 		heartbeat = 25 * time.Second
@@ -80,7 +104,9 @@ func New(config Config) (*Server, error) {
 	}
 	pumpCtx, pumpCancel := context.WithCancel(context.Background())
 	server := &Server{
-		worker: config.Worker, token: config.SessionToken, heartbeat: heartbeat,
+		worker: config.Worker, tokenHash: sha256.Sum256([]byte(config.SessionToken)), heartbeat: heartbeat,
+		plan:        plan,
+		command:     command,
 		subscribers: make(map[chan struct{}]struct{}),
 		pumpCtx:     pumpCtx, pumpCancel: pumpCancel, pumpDone: make(chan struct{}),
 	}
@@ -95,14 +121,19 @@ func New(config Config) (*Server, error) {
 	mux.HandleFunc("POST /api/final", server.withAuth(server.conversationText(server.worker.Final)))
 	mux.HandleFunc("POST /api/draft", server.withAuth(server.conversationText(server.worker.SaveDraft)))
 	mux.HandleFunc("POST /api/tool-calls", server.withAuth(server.handleToolCalls))
+	mux.HandleFunc("POST /api/workspace", server.withAuth(server.handleWorkspace))
 	mux.HandleFunc("POST /api/review/deliver", server.withAuth(server.handleDeliverChanges))
 	mux.HandleFunc("POST /api/review/discard", server.withAuth(server.handleDiscardChanges))
+	mux.HandleFunc("POST /api/alerts/dismiss", server.withAuth(server.handleDismissAlert))
+	mux.HandleFunc("POST /api/abandon", server.withAuth(server.handleAbandon))
 	server.mux = mux
 	go server.pump()
 	return server, nil
 }
 
 func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	securityHeaders(response)
+	response.Header().Set("Cache-Control", "no-store")
 	server.mux.ServeHTTP(response, request)
 }
 
@@ -162,15 +193,20 @@ func (server *Server) subscribe() (chan struct{}, func(), error) {
 
 func (server *Server) authenticated(request *http.Request) bool {
 	if cookie, err := request.Cookie(sessionCookie); err == nil {
-		if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(server.token)) == 1 {
+		if server.tokenMatches(cookie.Value) {
 			return true
 		}
 	}
 	header := request.Header.Get("Authorization")
 	if token, found := strings.CutPrefix(header, "Bearer "); found {
-		return subtle.ConstantTimeCompare([]byte(token), []byte(server.token)) == 1
+		return server.tokenMatches(token)
 	}
 	return false
+}
+
+func (server *Server) tokenMatches(candidate string) bool {
+	candidateHash := sha256.Sum256([]byte(candidate))
+	return subtle.ConstantTimeCompare(candidateHash[:], server.tokenHash[:]) == 1
 }
 
 func (server *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -188,7 +224,7 @@ func (server *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 func (server *Server) handleIndex(response http.ResponseWriter, request *http.Request) {
 	securityHeaders(response)
 	if token := request.URL.Query().Get("token"); token != "" {
-		if subtle.ConstantTimeCompare([]byte(token), []byte(server.token)) != 1 {
+		if !server.tokenMatches(token) {
 			writeError(response, http.StatusUnauthorized, "unauthenticated", "invalid session token")
 			return
 		}
@@ -210,7 +246,7 @@ func (server *Server) handleIndex(response http.ResponseWriter, request *http.Re
 }
 
 func (server *Server) handleState(response http.ResponseWriter, request *http.Request) {
-	writeJSON(response, http.StatusOK, stateView(server.worker.Snapshot()))
+	writeJSON(response, http.StatusOK, server.stateView(server.worker.Snapshot()))
 }
 
 func (server *Server) handleEvents(response http.ResponseWriter, request *http.Request) {
@@ -253,7 +289,7 @@ func (server *Server) handleEvents(response http.ResponseWriter, request *http.R
 }
 
 func (server *Server) writeStateEvent(response http.ResponseWriter, flusher http.Flusher) bool {
-	encoded, err := json.Marshal(stateView(server.worker.Snapshot()))
+	encoded, err := json.Marshal(server.stateView(server.worker.Snapshot()))
 	if err != nil {
 		return false
 	}
@@ -336,6 +372,24 @@ func (server *Server) handleToolCalls(response http.ResponseWriter, request *htt
 	writeJSON(response, http.StatusOK, map[string]any{"ok": true})
 }
 
+func (server *Server) handleWorkspace(response http.ResponseWriter, request *http.Request) {
+	var body struct {
+		Caller string `json:"caller"`
+		TaskID string `json:"task_id"`
+		Path   string `json:"path"`
+	}
+	if !decodeBody(response, request, &body) {
+		return
+	}
+	key := workerkit.ConversationKey{Caller: llm.CallerID(body.Caller), TaskID: llm.TaskID(body.TaskID)}
+	workspace, err := server.worker.SetHumanWorkspace(request.Context(), key, body.Path)
+	if err != nil {
+		writeCommandError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"workspace": workspace})
+}
+
 type reviewRequest struct {
 	Caller    string   `json:"caller,omitempty"`
 	TaskID    string   `json:"task_id,omitempty"`
@@ -355,6 +409,20 @@ func (server *Server) handleDeliverChanges(response http.ResponseWriter, request
 	writeJSON(response, http.StatusOK, map[string]any{"ok": true})
 }
 
+func (server *Server) handleDismissAlert(response http.ResponseWriter, request *http.Request) {
+	var body struct {
+		Seq uint64 `json:"seq"`
+	}
+	if !decodeBody(response, request, &body) {
+		return
+	}
+	if err := server.worker.DismissAlertContext(request.Context(), body.Seq); err != nil {
+		writeCommandError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (server *Server) handleDiscardChanges(response http.ResponseWriter, request *http.Request) {
 	var body reviewRequest
 	if !decodeBody(response, request, &body) {
@@ -367,10 +435,39 @@ func (server *Server) handleDiscardChanges(response http.ResponseWriter, request
 	writeJSON(response, http.StatusOK, map[string]any{"ok": true})
 }
 
+// handleAbandon terminates a conversation stuck awaiting a caller continuation
+// that will never arrive. It carries no text: abandonment sends no new wire
+// event (see workerkit.Worker.Abandon).
+func (server *Server) handleAbandon(response http.ResponseWriter, request *http.Request) {
+	var body struct {
+		Caller string `json:"caller"`
+		TaskID string `json:"task_id"`
+	}
+	if !decodeBody(response, request, &body) {
+		return
+	}
+	key := workerkit.ConversationKey{Caller: llm.CallerID(body.Caller), TaskID: llm.TaskID(body.TaskID)}
+	if err := server.worker.Abandon(request.Context(), key); err != nil {
+		writeCommandError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"ok": true})
+}
+
 func decodeBody(response http.ResponseWriter, request *http.Request, target any) bool {
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeError(response, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
+		return false
+	}
 	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
+		writeError(response, http.StatusBadRequest, "invalid_body", "request body is invalid")
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		writeError(response, http.StatusBadRequest, "invalid_body", "request body is invalid")
 		return false
 	}
@@ -388,6 +485,7 @@ func writeCommandError(response http.ResponseWriter, err error) {
 		writeError(response, http.StatusNotFound, "not_found", "the referenced item does not exist")
 	case errors.Is(err, workerkit.ErrConversationTerminal),
 		errors.Is(err, workerkit.ErrConversationNotActive),
+		errors.Is(err, workerkit.ErrConversationNotAbandonable),
 		errors.Is(err, workerkit.ErrTooManyContinuations),
 		errors.Is(err, workerkit.ErrNoMirror):
 		writeError(response, http.StatusConflict, "conflict", "the command is not valid for the current state")
@@ -434,9 +532,10 @@ func writeJSON(response http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(response).Encode(value)
 }
 
-// stateView is the wire projection of a workerkit snapshot. It is stable JSON
-// for the embedded UI and third-party dashboards.
-func stateView(state workerkit.State) map[string]any {
+// stateView is the Human-facing wire projection of a workerkit snapshot. It
+// deliberately does not embed the durable Assignment record; only logical
+// scope and the Human host's selected working directory are exposed.
+func (server *Server) stateView(state workerkit.State) map[string]any {
 	inbox := make([]map[string]any, 0, len(state.Inbox))
 	for _, item := range state.Inbox {
 		inbox = append(inbox, map[string]any{
@@ -449,11 +548,46 @@ func stateView(state workerkit.State) map[string]any {
 			"received_at": item.ReceivedAt,
 		})
 	}
-	conversations := make([]workerkit.Conversation, 0, len(state.Conversations))
-	conversations = append(conversations, state.Conversations...)
-	view := map[string]any{"inbox": inbox, "conversations": conversations}
+	type conversationView struct {
+		Key            workerkit.ConversationKey   `json:"key"`
+		Phase          workerkit.Phase             `json:"phase"`
+		Transcript     []workerkit.TranscriptEntry `json:"transcript"`
+		ParkedCalls    []llm.ToolCall              `json:"parked_calls,omitempty"`
+		Delivery       *workerkit.PendingDelivery  `json:"delivery,omitempty"`
+		Draft          string                      `json:"draft,omitempty"`
+		CallerGone     bool                        `json:"caller_gone,omitempty"`
+		UpdatedAt      time.Time                   `json:"updated_at"`
+		WorkspaceScope string                      `json:"workspace_scope,omitempty"`
+		HumanWorkspace *workerkit.HumanWorkspace   `json:"human_workspace,omitempty"`
+		PlanProfile    *PlanProfile                `json:"plan_profile,omitempty"`
+		CommandProfile *CommandProfile             `json:"command_profile,omitempty"`
+	}
+	conversations := make([]conversationView, 0, len(state.Conversations))
+	for _, conversation := range state.Conversations {
+		assignment := conversation.Assignment.Assignment
+		view := conversationView{
+			Key: conversation.Key, Phase: conversation.Phase,
+			Transcript: conversation.Transcript, ParkedCalls: conversation.ParkedCalls,
+			Delivery: conversation.Delivery, Draft: conversation.Draft,
+			CallerGone: conversation.CallerGone, UpdatedAt: conversation.UpdatedAt,
+			WorkspaceScope: assignment.Task.WorkspaceKey, HumanWorkspace: conversation.HumanWorkspace,
+		}
+		if profile, ok := server.plan.ResolvePlanProfile(assignment.Task, assignment.Request); ok && profile.Validate() == nil {
+			copy := profile
+			view.PlanProfile = &copy
+		}
+		if profile, ok := server.command.ResolveCommandProfile(assignment.Task, assignment.Request); ok && profile.Validate() == nil {
+			copy := profile
+			view.CommandProfile = &copy
+		}
+		conversations = append(conversations, view)
+	}
+	view := map[string]any{"schema_version": 3, "inbox": inbox, "conversations": conversations}
 	if state.Review != nil {
 		view["review"] = state.Review
+	}
+	if len(state.Alerts) > 0 {
+		view["alerts"] = state.Alerts
 	}
 	return view
 }

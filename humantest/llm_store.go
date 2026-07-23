@@ -862,7 +862,7 @@ func testLLMStoreTasks(ctx context.Context, t *testing.T, store llm.Store) {
 	chatA := llmConformanceTask("chat-a", 1, llm.TaskAwaitingCaller)
 	chatA.WorkspaceKey, chatA.CapabilityTier = "", llm.TierChat
 	chatA.HarnessID, chatA.HarnessVersion, chatA.HarnessSessionID = "", "", ""
-	chatA.WorkspaceRoot, chatA.ExecAllowed = "", false
+	chatA.ExecAllowed = false
 	chatB := chatA
 	chatB.Key.Task = "task-chat-b"
 	chatB.CreatedAt = chatB.CreatedAt.Add(time.Nanosecond)
@@ -953,7 +953,7 @@ func testLLMStoreTasks(ctx context.Context, t *testing.T, store llm.Store) {
 		t.Fatalf("skipped Task revision error = %v, want ErrStoreConflict", err)
 	}
 	immutable := leased
-	immutable.WorkspaceRoot = "/changed/identity"
+	immutable.HarnessVersion = "changed-identity"
 	immutable.Revision = 3
 	immutable.UpdatedAt = llmConformanceTime(3)
 	err = store.Update(ctx, func(tx llm.StoreTx) error {
@@ -1790,7 +1790,7 @@ func llmConformanceTaskFor(caller llm.CallerID, id string, revision uint64, stat
 		WorkspaceKey: "workspace-" + id, CapabilityTier: llm.TierWorkspace,
 		Codec: llmConformanceCodec(), HarnessID: "humantest-harness",
 		HarnessVersion: "1", HarnessSessionID: "session-" + id,
-		WorkspaceRoot: "/workspace/" + id, ExecAllowed: true, State: state,
+		ExecAllowed: true, State: state,
 		Revision: revision, CreatedAt: llmConformanceTime(1), UpdatedAt: llmConformanceTime(1),
 	}
 }

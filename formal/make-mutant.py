@@ -256,7 +256,7 @@ MUTANTS: dict[str, tuple[str, list[tuple[str, str]]]] = {
             "       baselineVersion, clarificationCount, terminalTasks, terminalRequestCount,\n"
             "       requestTask, requestCaller, requestWorkspace, requestDigest,\n"
             "       requestResults, streamCursor, streamTerminal, closedCursor,\n"
-            "       responseKind, responseTrace\n"
+            "       responseKind, responseTrace, callerDetached\n"
             "     >>\n\n"
             "StartStream(request) ==\n",
             "  /\\ lastSubmission' = NoSubmission\n"
@@ -270,7 +270,7 @@ MUTANTS: dict[str, tuple[str, list[tuple[str, str]]]] = {
             "       baselineVersion, clarificationCount, terminalTasks, terminalRequestCount,\n"
             "       requestTask, requestCaller, requestWorkspace, requestDigest,\n"
             "       streamCursor, streamTerminal, closedCursor,\n"
-            "       responseKind, responseTrace\n"
+            "       responseKind, responseTrace, callerDetached\n"
             "     >>\n\n"
             "StartStream(request) ==\n",
         )],

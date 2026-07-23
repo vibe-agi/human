@@ -1,0 +1,15 @@
+{
+  "name": "human-real-client-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned CLI clients for Human's Testcontainers product gate",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": "22.22.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.217",
+    "@openai/codex": "0.145.0",
+    "opencode-ai": "1.17.18"
+  }
+}

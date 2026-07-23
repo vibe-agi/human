@@ -138,7 +138,7 @@ func newDoctorCommandWithDependencies(dependencies doctorDependencies) *cobra.Co
 		},
 	}
 	command.Flags().StringVar(&workspace, "workspace", ".", "workspace to diagnose; the nearest Git root is selected")
-	command.Flags().StringVar(&healthURL, "health-url", defaultDoctorHealthURL, "Human gateway readiness endpoint")
+	command.Flags().StringVar(&healthURL, "health-url", defaultDoctorHealthURL, "Human service readiness endpoint")
 	command.Flags().BoolVar(&requireOpenCode, "require-opencode", false, "fail unless the exact supported OpenCode Workspace adapter is installed")
 	command.Flags().BoolVar(&outputJSON, "json", false, "print stable machine-readable JSON")
 	return command
@@ -191,14 +191,14 @@ func runDoctor(ctx context.Context, workspaceValue, healthURL string, requireOpe
 		add("local_credentials", doctorWarn, "local credentials were not checked because private workspace data is unavailable")
 	} else {
 		credentialPath := filepath.Join(report.WorkspaceData, "credentials.json")
-		_, found, err := readLocalCredentials(credentialPath)
+		_, found, err := readPublicCredentials(credentialPath)
 		switch {
 		case err != nil:
 			add("local_credentials", doctorFail, err.Error())
 		case !found:
 			add("local_credentials", doctorWarn, "local credentials do not exist yet; start `human local --workspace .` once")
 		default:
-			add("local_credentials", doctorPass, "local credential journal is private and valid")
+			add("local_credentials", doctorPass, "local caller credential is private and valid")
 		}
 	}
 
@@ -223,27 +223,27 @@ func runDoctor(ctx context.Context, workspaceValue, healthURL string, requireOpe
 	}
 
 	if dependencies.health == nil {
-		add("gateway_health", doctorFail, "gateway health diagnostic is unavailable")
+		add("service_health", doctorFail, "service health diagnostic is unavailable")
 	} else {
 		result := dependencies.health(ctx, healthURL)
 		switch {
 		case !result.Running:
-			message := "Human gateway is not running; this is expected before `human local` starts"
+			message := "Human service is not running; this is expected before `human local` starts"
 			if result.Err != nil {
 				message += ": " + result.Err.Error()
 			}
-			add("gateway_health", doctorWarn, message)
+			add("service_health", doctorWarn, message)
 		case result.Err != nil:
-			add("gateway_health", doctorFail, result.Err.Error())
+			add("service_health", doctorFail, result.Err.Error())
 		case result.Observed && !result.HasOnlineWorker:
-			add("gateway_health", doctorWarn, "Human gateway is ready (SQLite ok; recovery complete), but no Human worker is online")
+			add("service_health", doctorWarn, "Human service is ready (SQLite ok; recovery complete), but no Human worker is online")
 		case result.Observed:
-			add("gateway_health", doctorPass, fmt.Sprintf(
-				"Human gateway is ready (SQLite ok; recovery complete); %d Human worker(s) online",
+			add("service_health", doctorPass, fmt.Sprintf(
+				"Human service is ready (SQLite ok; recovery complete); %d Human worker(s) online",
 				result.OnlineWorkers,
 			))
 		default:
-			add("gateway_health", doctorPass, "Human gateway readiness endpoint returned status ok")
+			add("service_health", doctorPass, "Human service readiness endpoint returned status ok")
 		}
 	}
 

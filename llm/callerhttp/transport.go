@@ -38,6 +38,7 @@ const (
 	MaxResponsePageBytes       int64 = 128 << 20
 	defaultBodyLimit                 = int64(8 << 20)
 	defaultAdmissionErrorLimit       = MaxAdmissionErrorBytes
+	defaultHeartbeatInterval         = 15 * time.Second
 
 	HeaderIdempotencyKey = "Idempotency-Key"
 	HeaderTaskID         = "X-Human-Task-Id"
@@ -115,6 +116,10 @@ type Config struct {
 	MaxAdmissionErrorBodyBytes int64
 	ReadTimeout                time.Duration
 	WriteTimeout               time.Duration
+	// HeartbeatInterval emits an SSE comment while a streaming response is
+	// waiting for the Human. Comments are transport keepalives, never durable
+	// response events, and therefore do not alter replay cursors or Codec bytes.
+	HeartbeatInterval time.Duration
 	// PageLimit and PageMaxBytes bound both the query sent to CallerEndpoint and
 	// every page accepted back from it. Zero delegates the query default to the
 	// endpoint while the adapter still enforces its exported hard ceiling.
@@ -136,6 +141,7 @@ type resolvedConfig struct {
 	maxAdmissionErrorBodyBytes int64
 	readTimeout                time.Duration
 	writeTimeout               time.Duration
+	heartbeatInterval          time.Duration
 	pageLimit                  int
 	pageMaxBytes               int64
 }
@@ -194,14 +200,18 @@ func (config Config) resolve() (resolvedConfig, error) {
 	}
 	writeTimeout := config.WriteTimeout
 	readTimeout := config.ReadTimeout
+	heartbeatInterval := config.HeartbeatInterval
 	if readTimeout == 0 {
 		readTimeout = 30 * time.Second
 	}
 	if writeTimeout == 0 {
 		writeTimeout = 10 * time.Second
 	}
-	if readTimeout <= 0 || writeTimeout <= 0 {
-		return resolvedConfig{}, fmt.Errorf("%w: read and write timeouts must be positive", ErrInvalidConfiguration)
+	if heartbeatInterval == 0 {
+		heartbeatInterval = defaultHeartbeatInterval
+	}
+	if readTimeout <= 0 || writeTimeout <= 0 || heartbeatInterval <= 0 {
+		return resolvedConfig{}, fmt.Errorf("%w: read, write, and heartbeat durations must be positive", ErrInvalidConfiguration)
 	}
 	if config.PageLimit < 0 || config.PageLimit > MaxResponsePageLimit ||
 		config.PageMaxBytes < 0 || config.PageMaxBytes > MaxResponsePageBytes {
@@ -221,6 +231,7 @@ func (config Config) resolve() (resolvedConfig, error) {
 		maxAdmissionErrorBodyBytes: maxAdmissionErrorBodyBytes,
 		readTimeout:                readTimeout,
 		writeTimeout:               writeTimeout,
+		heartbeatInterval:          heartbeatInterval,
 		pageLimit:                  config.PageLimit,
 		pageMaxBytes:               config.PageMaxBytes,
 	}, nil

@@ -98,7 +98,12 @@ func TestGatewayExpiryRejectsLateWorkerEventWithoutPoisoningConnection(t *testin
 	workerHub := hub.New(2)
 	gateway, err := NewServer(Config{
 		HeartbeatInterval: time.Hour,
-		MaxPending:        250 * time.Millisecond,
+		// This test exercises the real timer path, but its second request must
+		// still have enough budget to traverse a WebSocket rejection and two
+		// durable worker events when the package suite is running in parallel.
+		// A 250ms product deadline made scheduler load, not protocol behavior,
+		// decide whether that live control request expired too.
+		MaxPending: time.Second,
 	}, database, fixedAuthenticator{}, workerHub, adapter.NewRegistry(), map[string]dialect.Codec{
 		"/v1/chat/completions": openai.New(),
 	})

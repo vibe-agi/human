@@ -1475,13 +1475,16 @@ func (server *Server) applyEventState(
 }
 
 func (server *Server) validateToolCalls(task storeapi.Task, request canonical.Request, calls []completion.ToolCall) error {
+	if request.ToolCallPolicy == canonical.ToolCallsDisabled {
+		return errors.New("tool calls are disabled for this response")
+	}
 	if request.ToolCallPolicy == canonical.ToolCallsSerial && len(calls) > 1 {
 		return fmt.Errorf("serial tool-call policy allows one call, got %d", len(calls))
 	}
 	type toolIdentity struct{ namespace, name string }
-	declared := make(map[toolIdentity]struct{}, len(request.Tools))
+	declared := make(map[toolIdentity]canonical.Tool, len(request.Tools))
 	for _, tool := range request.Tools {
-		declared[toolIdentity{namespace: tool.Namespace, name: tool.Name}] = struct{}{}
+		declared[toolIdentity{namespace: tool.Namespace, name: tool.Name}] = tool
 	}
 	seen := make(map[string]struct{}, len(calls))
 	for _, call := range calls {
@@ -1496,8 +1499,21 @@ func (server *Server) validateToolCalls(task storeapi.Task, request canonical.Re
 		}
 		seen[call.ID] = struct{}{}
 		identity := toolIdentity{namespace: call.Namespace, name: call.Name}
-		if _, ok := declared[identity]; !ok {
+		tool, ok := declared[identity]
+		if !ok {
 			return fmt.Errorf("tool %q was not declared by the caller", call.QualifiedName())
+		}
+		switch tool.InputKind {
+		case canonical.ToolInputJSON:
+			if call.TextInput != nil {
+				return fmt.Errorf("JSON-input tool %q received text input", call.QualifiedName())
+			}
+		case canonical.ToolInputText:
+			if call.TextInput == nil || call.Input != nil {
+				return fmt.Errorf("text-input tool %q requires only text input", call.QualifiedName())
+			}
+		default:
+			return fmt.Errorf("tool %q has unsupported input kind %q", call.QualifiedName(), tool.InputKind)
 		}
 	}
 	if len(calls) == 0 {

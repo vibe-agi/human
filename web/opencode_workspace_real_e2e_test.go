@@ -98,7 +98,7 @@ func TestRealOpenCodeWorkspaceWebDoor(t *testing.T) {
 			resolution.Task = llm.TaskContext{
 				CapabilityTier: llm.TierWorkspace, WorkspaceKey: "workspace-web-door",
 				HarnessID: "opencode", HarnessVersion: "1.17.18",
-				HarnessSessionID: session, WorkspaceRoot: workspace, ExecAllowed: true,
+				HarnessSessionID: session, ExecAllowed: true,
 			}
 		}
 		return resolution, nil
@@ -129,8 +129,9 @@ func TestRealOpenCodeWorkspaceWebDoor(t *testing.T) {
 	mirrorRoot := t.TempDir()
 	mirror, err := fsmirror.Open(t.Context(), fsmirror.Config{
 		Root: mirrorRoot, Debounce: 100 * time.Millisecond,
-		BaselineFile: filepath.Join(t.TempDir(), "baseline.json"),
-		Build:        fsmirror.OpenCodeWriteBuilder(),
+		Scope:         workerkit.WorkspaceScope{Caller: "caller-opencode", WorkspaceKey: "workspace-web-door"},
+		BaselineFile:  filepath.Join(t.TempDir(), "baseline.json"),
+		BuildSnapshot: fsmirror.OpenCodeNativeBuilder(),
 	})
 	if err != nil {
 		t.Fatal(err)

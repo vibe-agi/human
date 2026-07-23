@@ -766,7 +766,7 @@ func customTaskIdentityEqual(left, right llm.StoreTaskRecord) bool {
 	return left.Key == right.Key && left.WorkspaceKey == right.WorkspaceKey &&
 		left.CapabilityTier == right.CapabilityTier && left.Codec.Equal(right.Codec) &&
 		left.HarnessID == right.HarnessID && left.HarnessVersion == right.HarnessVersion &&
-		left.HarnessSessionID == right.HarnessSessionID && left.WorkspaceRoot == right.WorkspaceRoot &&
+		left.HarnessSessionID == right.HarnessSessionID &&
 		left.ExecAllowed == right.ExecAllowed && left.CreatedAt.Equal(right.CreatedAt)
 }
 

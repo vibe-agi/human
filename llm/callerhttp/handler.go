@@ -240,12 +240,35 @@ func readRequestBody(
 	return io.ReadAll(http.MaxBytesReader(response, body, limit))
 }
 
+// callerDetacher lets the handler tell the endpoint that a caller's socket went
+// away before a durable completion. This single signal both gates the scenario-C
+// takeover (a resume preempts only a task whose caller has detached) and raises
+// the scenario-B caller-gone banner. Optional: an endpoint that does not
+// implement it keeps the prior silent behavior.
+type callerDetacher interface {
+	DetachCaller(context.Context, llm.CompletionIdentity)
+}
+
 func (running *runtime) writeResponse(
 	ctx context.Context,
 	response http.ResponseWriter,
 	admission llm.AdmissionResult,
 ) {
 	page := admission.Response
+	// Any incomplete exit means this handler can no longer deliver the durable
+	// response, whether cancellation was observed or a write/flush failed first.
+	// Bind the notice to the exact request identity; a completed response is
+	// excluded so cleanup can never mark newer work on the task as abandoned.
+	defer func() {
+		if page.Complete {
+			return
+		}
+		if detacher, ok := running.endpoint.(callerDetacher); ok {
+			detachCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			detacher.DetachCaller(detachCtx, admission.Identity)
+			cancel()
+		}
+	}()
 	for !page.DecisionCommitted {
 		if len(page.Events) != 0 || page.Complete {
 			writeAdapterError(response, http.StatusInternalServerError, "HumanLLM response boundary is invalid")
@@ -312,7 +335,16 @@ func (running *runtime) writeResponse(
 			return
 		}
 		for !page.Complete {
-			next, err := running.endpoint.WaitResponse(ctx, running.responseQuery(admission, page.Cursor))
+			waitCtx, cancelWait := context.WithTimeout(ctx, running.config.heartbeatInterval)
+			next, err := running.endpoint.WaitResponse(waitCtx, running.responseQuery(admission, page.Cursor))
+			waitTimedOut := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+			cancelWait()
+			if waitTimedOut {
+				if err := writer.writeAndFlush([]llm.WireEvent{{Data: []byte(": human keepalive\n\n")}}); err != nil {
+					return
+				}
+				continue
+			}
 			if err != nil {
 				return
 			}

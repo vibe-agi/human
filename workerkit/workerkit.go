@@ -29,6 +29,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/vibe-agi/human/llm"
+	"github.com/vibe-agi/human/observe"
 )
 
 // MaxParkedContinuations bounds conversations parked on submitted tool calls.
@@ -44,16 +45,18 @@ const MaxParkedContinuations = 32
 const maxTranscriptTextBytes = 16 << 10
 
 var (
-	ErrInvalidConfig         = errors.New("workerkit: invalid configuration")
-	ErrClosed                = errors.New("workerkit: worker is closed")
-	ErrInvalidCommand        = errors.New("workerkit: invalid command")
-	ErrUnknownDelivery       = errors.New("workerkit: unknown inbox delivery")
-	ErrUnknownConversation   = errors.New("workerkit: unknown conversation")
-	ErrConversationTerminal  = errors.New("workerkit: conversation is terminal")
-	ErrConversationNotActive = errors.New("workerkit: conversation is not active")
-	ErrTooManyContinuations  = errors.New("workerkit: too many parked continuations")
-	ErrNoMirror              = errors.New("workerkit: no Mirror is configured")
-	ErrUnknownChange         = errors.New("workerkit: unknown review change")
+	ErrInvalidConfig              = errors.New("workerkit: invalid configuration")
+	ErrClosed                     = errors.New("workerkit: worker is closed")
+	ErrInvalidCommand             = errors.New("workerkit: invalid command")
+	ErrUnknownDelivery            = errors.New("workerkit: unknown inbox delivery")
+	ErrUnknownConversation        = errors.New("workerkit: unknown conversation")
+	ErrConversationTerminal       = errors.New("workerkit: conversation is terminal")
+	ErrConversationNotActive      = errors.New("workerkit: conversation is not active")
+	ErrConversationNotAbandonable = errors.New("workerkit: conversation has no detached caller")
+	ErrTooManyContinuations       = errors.New("workerkit: too many parked continuations")
+	ErrNoMirror                   = errors.New("workerkit: no Mirror is configured")
+	ErrUnknownChange              = errors.New("workerkit: unknown review change")
+	ErrMirrorScopeMismatch        = errors.New("workerkit: mirror scope does not match conversation")
 )
 
 // Config composes one Worker. Wire and State are required borrowed
@@ -75,6 +78,9 @@ type Config struct {
 	// IDs allocates event and delivery identifiers. Nil uses crypto/rand. The
 	// returned value must satisfy the transport's stable-key pattern.
 	IDs func(kind string) (string, error)
+	// Observer receives human-side lifecycle events. Nil is a no-op. Observer
+	// failures are isolated by observe.Emit and never change command outcomes.
+	Observer observe.Observer
 }
 
 // Worker is the headless human-side domain object. All methods are safe for
@@ -86,6 +92,7 @@ type Worker struct {
 	autoResponder func(llm.WorkerAssignmentDelivery) (string, bool)
 	now           func() time.Time
 	ids           func(kind string) (string, error)
+	observer      observe.Observer
 
 	// command serializes every operation with a wire side effect (accept,
 	// reject, the reply/final/tool-call family, deliver/discard, and the loop's
@@ -101,6 +108,8 @@ type Worker struct {
 	pending       map[llm.WorkerDeliveryID]llm.WorkerAssignmentDelivery
 	conversations map[ConversationKey]*Conversation
 	review        *Review
+	alerts        []Notice
+	alertSeq      uint64
 	closed        bool
 
 	notifications chan struct{}
@@ -136,10 +145,17 @@ func Open(ctx context.Context, config Config) (*Worker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("workerkit: restore conversations: %w", err)
 	}
+	var restoredAlerts []Notice
+	if alerts, ok := config.State.(AlertStore); ok {
+		restoredAlerts, err = alerts.ListAlerts(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("workerkit: restore alerts: %w", err)
+		}
+	}
 	loopCtx, loopCancel := context.WithCancel(context.Background())
 	worker := &Worker{
 		wire: config.Wire, state: config.State, mirror: config.Mirror,
-		autoResponder: config.AutoResponder, now: now, ids: ids,
+		autoResponder: config.AutoResponder, now: now, ids: ids, observer: config.Observer,
 		inboxRequests: make(map[llm.WorkerDeliveryID]llm.Request),
 		conversations: make(map[ConversationKey]*Conversation, len(restored)),
 		notifications: make(chan struct{}, 1),
@@ -147,7 +163,25 @@ func Open(ctx context.Context, config Config) (*Worker, error) {
 	}
 	for _, conversation := range restored {
 		cloned := cloneConversation(conversation)
+		if err := worker.prepareConversationWorkspace(ctx, &cloned); err != nil {
+			// A selected repo may not exist after backup restore or a removable
+			// volume may be offline. Keep the conversation operable in Web so
+			// the Human can select a replacement instead of failing the daemon.
+			if cloned.HumanWorkspace != nil {
+				cloned.HumanWorkspace.Available = false
+			}
+		}
 		worker.conversations[cloned.Key] = &cloned
+	}
+	for _, notice := range restoredAlerts {
+		if err := notice.Validate(); err != nil {
+			loopCancel()
+			return nil, fmt.Errorf("workerkit: restored alert is invalid: %w", err)
+		}
+		worker.alerts = append(worker.alerts, notice)
+		if notice.Seq > worker.alertSeq {
+			worker.alertSeq = notice.Seq
+		}
 	}
 	go worker.run()
 	return worker, nil
@@ -159,6 +193,118 @@ func randomID(kind string) (string, error) {
 		return "", fmt.Errorf("workerkit: allocate %s id: %w", kind, err)
 	}
 	return kind + "-" + hex.EncodeToString(buffer), nil
+}
+
+func (worker *Worker) prepareConversationWorkspace(ctx context.Context, conversation *Conversation) error {
+	sessionMirror, ok := worker.mirror.(SessionMirror)
+	if !ok {
+		conversation.HumanWorkspace = nil
+		return nil
+	}
+	task := conversation.Assignment.Assignment.Task
+	if task.CapabilityTier != llm.TierWorkspace {
+		conversation.HumanWorkspace = nil
+		return nil
+	}
+	preferredPath := ""
+	if conversation.HumanWorkspace != nil {
+		preferredPath = conversation.HumanWorkspace.Path
+	}
+	workspace, err := sessionMirror.PrepareSession(ctx, SessionBinding{
+		Scope: WorkspaceScope{
+			Caller:       conversation.Key.Caller,
+			WorkspaceKey: task.WorkspaceKey,
+		},
+		HarnessID:        task.HarnessID,
+		HarnessVersion:   task.HarnessVersion,
+		HarnessSessionID: task.HarnessSessionID,
+	}, preferredPath)
+	if err != nil {
+		return err
+	}
+	conversation.HumanWorkspace = &workspace
+	return nil
+}
+
+// SetHumanWorkspace switches one conversation to an existing Human-side
+// project directory. The selection is persisted before it becomes visible.
+// No Agent path is accepted or inferred here.
+func (worker *Worker) SetHumanWorkspace(
+	ctx context.Context,
+	key ConversationKey,
+	path string,
+) (HumanWorkspace, error) {
+	if err := worker.checkCommand(ctx); err != nil {
+		return HumanWorkspace{}, err
+	}
+	sessionMirror, ok := worker.mirror.(SessionMirror)
+	if !ok {
+		return HumanWorkspace{}, ErrNoMirror
+	}
+	path = strings.TrimSpace(path)
+	if path == "" || len(path) > 4096 || !utf8.ValidString(path) || strings.ContainsAny(path, "\x00\r\n") {
+		return HumanWorkspace{}, fmt.Errorf("%w: Human workspace path is required", ErrInvalidCommand)
+	}
+	worker.command.Lock()
+	defer worker.command.Unlock()
+	worker.mu.Lock()
+	current, exists := worker.conversations[key]
+	if !exists {
+		worker.mu.Unlock()
+		return HumanWorkspace{}, fmt.Errorf("%w: %v", ErrUnknownConversation, key)
+	}
+	conversation := cloneConversation(*current)
+	worker.mu.Unlock()
+	if conversation.Phase == PhaseTerminal {
+		return HumanWorkspace{}, fmt.Errorf("%w: %v", ErrConversationTerminal, key)
+	}
+	if conversation.Delivery != nil {
+		return HumanWorkspace{}, fmt.Errorf("%w: a reviewed delivery is in flight", ErrConversationNotActive)
+	}
+
+	task := conversation.Assignment.Assignment.Task
+	if task.CapabilityTier != llm.TierWorkspace {
+		return HumanWorkspace{}, fmt.Errorf("%w: conversation has no workspace capability", ErrInvalidCommand)
+	}
+	binding := SessionBinding{
+		Scope: WorkspaceScope{
+			Caller:       key.Caller,
+			WorkspaceKey: task.WorkspaceKey,
+		},
+		HarnessID:        task.HarnessID,
+		HarnessVersion:   task.HarnessVersion,
+		HarnessSessionID: task.HarnessSessionID,
+	}
+	workspaceID, err := SessionWorkspaceID(binding)
+	if err != nil {
+		return HumanWorkspace{}, fmt.Errorf("%w: invalid workspace conversation: %v", ErrInvalidCommand, err)
+	}
+	// Persist the operator's intent before changing the watched filesystem.
+	// The canonical path returned by the Mirror is a presentation refinement;
+	// the entered existing path remains sufficient for restart recovery.
+	previous := conversation.HumanWorkspace
+	conversation.HumanWorkspace = &HumanWorkspace{ID: workspaceID, Path: path, Available: false}
+	conversation.UpdatedAt = worker.now().UTC()
+	if err := worker.state.SaveConversation(ctx, cloneConversation(conversation)); err != nil {
+		return HumanWorkspace{}, fmt.Errorf("workerkit: persist Human workspace intent: %w", err)
+	}
+	workspace, err := sessionMirror.PrepareSession(ctx, binding, path)
+	if err != nil {
+		conversation.HumanWorkspace = previous
+		_ = worker.state.SaveConversation(ctx, cloneConversation(conversation))
+		return HumanWorkspace{}, fmt.Errorf("workerkit: switch Human workspace: %w", err)
+	}
+	conversation.HumanWorkspace = &workspace
+	// Best effort: failure leaves the already-durable, equivalent entered path;
+	// the next restore canonicalizes it again.
+	_ = worker.state.SaveConversation(ctx, cloneConversation(conversation))
+	worker.mu.Lock()
+	if _, stillExists := worker.conversations[key]; stillExists {
+		worker.conversations[key] = &conversation
+	}
+	worker.mu.Unlock()
+	worker.notify()
+	return workspace, nil
 }
 
 // Notifications signals that Snapshot may have changed. It is coalescing: one
@@ -189,7 +335,112 @@ func (worker *Worker) Snapshot() State {
 		review.Changes = append([]Change(nil), worker.review.Changes...)
 		state.Review = &review
 	}
+	state.Alerts = append([]Notice(nil), worker.alerts...)
 	return state
+}
+
+// DismissAlert removes one notice by its stable sequence number.
+func (worker *Worker) DismissAlert(seq uint64) {
+	_ = worker.DismissAlertContext(context.Background(), seq)
+}
+
+// DismissAlertContext durably dismisses an alert when the configured
+// StateStore implements AlertStore. The in-memory view changes only after the
+// persistence operation succeeds.
+func (worker *Worker) DismissAlertContext(ctx context.Context, seq uint64) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: context is required", ErrInvalidCommand)
+	}
+	if alerts, ok := worker.state.(AlertStore); ok {
+		if err := alerts.DeleteAlert(ctx, seq); err != nil {
+			return fmt.Errorf("workerkit: persist alert dismissal: %w", err)
+		}
+	}
+	worker.mu.Lock()
+	for index, notice := range worker.alerts {
+		if notice.Seq == seq {
+			worker.alerts = append(worker.alerts[:index], worker.alerts[index+1:]...)
+			break
+		}
+	}
+	worker.mu.Unlock()
+	worker.notify()
+	return nil
+}
+
+func (worker *Worker) addAlert(input Notice) {
+	worker.command.Lock()
+	defer worker.command.Unlock()
+	if input.Code == "" || strings.TrimSpace(input.Message) == "" ||
+		(input.Caller == "") != (input.TaskID == "") {
+		observe.Emit(worker.observer, observe.Event{
+			Kind: observe.KindAlert, Caller: string(input.Caller), Task: string(input.TaskID),
+			Detail: input.Code, Err: fmt.Errorf("%w: invalid transport notice", ErrInvalidCommand),
+		})
+		return
+	}
+	worker.mu.Lock()
+	worker.alertSeq++
+	notice := Notice{
+		Seq: worker.alertSeq, At: worker.now().UTC(), Code: input.Code, Message: input.Message,
+		Caller: input.Caller, TaskID: input.TaskID, RequestID: input.RequestID,
+	}
+	var changed *Conversation
+	if notice.Code == "caller_gone" && notice.Caller != "" && notice.TaskID != "" {
+		key := ConversationKey{Caller: notice.Caller, TaskID: notice.TaskID}
+		if conversation := worker.conversations[key]; conversation != nil && conversation.Phase != PhaseTerminal &&
+			(notice.RequestID == "" || conversation.Assignment.Assignment.Identity.RequestID == notice.RequestID) {
+			copy := cloneConversation(*conversation)
+			copy.CallerGone = true
+			copy.UpdatedAt = notice.At
+			changed = &copy
+		}
+	} else if notice.Code == "request_expired" && notice.Caller != "" && notice.TaskID != "" {
+		// The service decision is already durable. Remove an unaccepted exact
+		// assignment from the inbox, and terminalize only the matching accepted
+		// request — never a newer continuation sharing the same task.
+		for delivery, assignment := range worker.pendingAssignments() {
+			identity := assignment.Assignment.Identity
+			if identity.CallerID == notice.Caller && identity.TaskID == notice.TaskID &&
+				(notice.RequestID == "" || identity.RequestID == notice.RequestID) {
+				worker.removeInboxLocked(delivery)
+			}
+		}
+		key := ConversationKey{Caller: notice.Caller, TaskID: notice.TaskID}
+		if conversation := worker.conversations[key]; conversation != nil && conversation.Phase != PhaseTerminal &&
+			(notice.RequestID == "" || conversation.Assignment.Assignment.Identity.RequestID == notice.RequestID) {
+			copy := cloneConversation(*conversation)
+			copy.Phase = PhaseTerminal
+			copy.CallerGone = false
+			copy.ParkedCalls = nil
+			copy.Delivery = nil
+			copy.Transcript = append(copy.Transcript, TranscriptEntry{
+				At: notice.At, Author: AuthorSystem, Kind: EntryRejected,
+				Text: notice.Message, Code: notice.Code,
+			})
+			copy.UpdatedAt = notice.At
+			changed = &copy
+		}
+	}
+	worker.mu.Unlock()
+	var persistenceErr error
+	if alerts, ok := worker.state.(AlertStore); ok {
+		persistenceErr = alerts.SaveAlert(worker.loopCtx, notice)
+	}
+	if persistenceErr == nil && changed != nil {
+		persistenceErr = worker.state.SaveConversation(worker.loopCtx, cloneConversation(*changed))
+	}
+	worker.mu.Lock()
+	worker.alerts = append(worker.alerts, notice)
+	if changed != nil && persistenceErr == nil {
+		worker.conversations[changed.Key] = changed
+	}
+	worker.mu.Unlock()
+	observe.Emit(worker.observer, observe.Event{
+		Kind: observe.KindAlert, Caller: string(notice.Caller), Task: string(notice.TaskID),
+		Detail: notice.Code, Err: persistenceErr,
+	})
+	worker.notify()
 }
 
 // Shutdown stops consuming the wire and waits for the internal loop. It does
@@ -202,6 +453,9 @@ func (worker *Worker) Shutdown(ctx context.Context) error {
 	worker.closed = true
 	worker.mu.Unlock()
 	worker.loopCancel()
+	if stopper, ok := worker.wire.(interface{ stopNotices() }); ok {
+		stopper.stopNotices()
+	}
 	select {
 	case <-worker.loopDone:
 		return nil
@@ -225,8 +479,18 @@ func (worker *Worker) run() {
 	if worker.mirror != nil {
 		reviews = worker.mirror.Reviews()
 	}
+	var notices <-chan Notice
+	if source, ok := worker.wire.(NoticeSource); ok {
+		notices = source.Notices()
+	}
 	for {
 		select {
+		case notice, open := <-notices:
+			if !open {
+				notices = nil
+				continue
+			}
+			worker.addAlert(notice)
 		case assignment, open := <-assignments:
 			if !open {
 				assignments = nil
@@ -301,7 +565,11 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 		// assignment and be NACKed.
 		resumed := cloneConversation(*conversation)
 		worker.mu.Unlock()
-		settlement := worker.resumeInto(&resumed, delivery)
+		mirrorResult := worker.resumeInto(&resumed, delivery)
+		if err := worker.prepareConversationWorkspace(worker.loopCtx, &resumed); err != nil {
+			worker.notify()
+			return
+		}
 		if err := worker.state.SaveConversation(worker.loopCtx, cloneConversation(resumed)); err != nil {
 			// Fail closed: without a durable resume the assignment must replay
 			// unconfirmed; the visible conversation was never touched.
@@ -309,13 +577,17 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 			return
 		}
 		_ = worker.wire.ConfirmAssignment(worker.loopCtx, delivery.ID)
-		if settlement != nil && worker.mirror != nil {
+		if mirrorResult != nil && worker.mirror != nil {
 			// Settle is idempotent. A crash before this call does not re-settle
 			// (the resume already cleared Delivery), but a filesystem mirror
 			// reseeds the still-undelivered change into the next review from the
 			// on-disk baseline, so the human re-delivers once — never a silent
 			// baseline advance or loss.
-			_ = worker.mirror.Settle(worker.loopCtx, *settlement)
+			if mirrorResult.settlement != nil {
+				_ = worker.mirror.Settle(worker.loopCtx, *mirrorResult.settlement)
+			} else {
+				_ = worker.mirror.Cancel(worker.loopCtx, mirrorResult.retry)
+			}
 		}
 		worker.mu.Lock()
 		if current, stillThere := worker.conversations[key]; stillThere {
@@ -323,6 +595,7 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 			worker.conversations[key] = &resumed
 		}
 		worker.mu.Unlock()
+		worker.observeAssignment(delivery, "resumed")
 		worker.notify()
 		return
 	}
@@ -332,6 +605,7 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 		if text, handled := worker.autoResponder(llm.CloneWorkerAssignmentDelivery(delivery)); handled {
 			worker.mu.Unlock()
 			if worker.autoFinal(delivery, text) {
+				worker.observeAssignment(delivery, "auto")
 				worker.notify()
 				return
 			}
@@ -351,6 +625,7 @@ func (worker *Worker) handleAssignment(delivery llm.WorkerAssignmentDelivery) {
 	worker.inboxRequests[delivery.ID] = delivery.Assignment.Request
 	worker.pendingAssignments()[delivery.ID] = delivery
 	worker.mu.Unlock()
+	worker.observeAssignment(delivery, "inbox")
 	worker.notify()
 }
 
@@ -373,7 +648,11 @@ func (worker *Worker) autoFinal(delivery llm.WorkerAssignmentDelivery, text stri
 	if err != nil {
 		return false
 	}
-	return worker.wire.SendEvent(worker.loopCtx, event) == nil
+	if err := worker.wire.SendEvent(worker.loopCtx, event); err != nil {
+		return false
+	}
+	worker.observeCommand(delivery.Assignment.Identity, llm.EventFinal)
+	return true
 }
 
 // pendingAssignments lazily allocates the delivery cache used by Accept and
@@ -386,10 +665,12 @@ func (worker *Worker) pendingAssignments() map[llm.WorkerDeliveryID]llm.WorkerAs
 }
 
 // resumeInto folds a caller continuation into the conversation copy and
-// returns the mirror settlement earned by a fully successful delivered batch.
-func (worker *Worker) resumeInto(conversation *Conversation, delivery llm.WorkerAssignmentDelivery) *MirrorSettlement {
+// returns the mirror action earned by a finished delivered batch. A fully
+// successful batch advances the baseline; a failed or incomplete batch is
+// released from inflight so it immediately reappears for retry.
+func (worker *Worker) resumeInto(conversation *Conversation, delivery llm.WorkerAssignmentDelivery) *mirrorResumeResult {
 	now := worker.now().UTC()
-	var settlement *MirrorSettlement
+	var mirrorResult *mirrorResumeResult
 	if len(conversation.ParkedCalls) > 0 {
 		results := extractToolResults(delivery.Assignment.Request)
 		for _, call := range conversation.ParkedCalls {
@@ -414,10 +695,14 @@ func (worker *Worker) resumeInto(conversation *Conversation, delivery llm.Worker
 				}
 			}
 			if allSucceeded {
-				settlement = &MirrorSettlement{
-					ChangeIDs: append([]string(nil), pending.ChangeIDs...),
-					Outcome:   MirrorDelivered,
+				mirrorResult = &mirrorResumeResult{
+					settlement: &MirrorSettlement{
+						ChangeIDs: append([]string(nil), pending.ChangeIDs...),
+						Outcome:   MirrorDelivered,
+					},
 				}
+			} else {
+				mirrorResult = &mirrorResumeResult{retry: append([]string(nil), pending.ChangeIDs...)}
 			}
 			// Whether it settles or failed, this batch is finished; failed
 			// changes stay pending inside the mirror and reappear in review.
@@ -431,8 +716,14 @@ func (worker *Worker) resumeInto(conversation *Conversation, delivery llm.Worker
 	}
 	conversation.Assignment = delivery
 	conversation.Phase = PhaseActive
+	conversation.CallerGone = false
 	conversation.UpdatedAt = now
-	return settlement
+	return mirrorResult
+}
+
+type mirrorResumeResult struct {
+	settlement *MirrorSettlement
+	retry      []string
 }
 
 func (worker *Worker) handleRejection(rejection Rejection) {
@@ -445,17 +736,25 @@ func (worker *Worker) handleRejection(rejection Rejection) {
 	}
 	worker.mu.Lock()
 	conversation, exists := worker.conversations[key]
-	if exists {
+	exact := exists &&
+		conversation.Assignment.Assignment.Identity.RequestID == rejection.Delivery.Identity.RequestID &&
+		conversation.Assignment.Assignment.Lease.ID == rejection.Delivery.LeaseID
+	if exact {
 		conversation.Transcript = append(conversation.Transcript, TranscriptEntry{
 			At: worker.now().UTC(), Author: AuthorSystem, Kind: EntryRejected,
 			Text: rejection.Receipt.Message, Code: string(rejection.Receipt.Code),
 		})
-		// The rejected event never reached the caller, so an optimistically
-		// advanced phase (terminal after Final, parked after tool calls, or
-		// awaiting-caller after Clarify) would strand the human on a
-		// permanently-refused conversation. Return it to active so the human
-		// can correct and resend.
-		if conversation.Phase != PhaseActive {
+		// A rejection for an older request/lease must never mutate a newer
+		// continuation sharing the task. For the exact current request, closure,
+		// absence, and lease loss are definitive; other deterministic NACKs leave
+		// the human able to correct the payload and resend with a fresh event ID.
+		switch rejection.Receipt.Code {
+		case llm.WorkerRejectResponseClosed, llm.WorkerRejectNotFound, llm.WorkerRejectStaleLease:
+			conversation.Phase = PhaseTerminal
+			conversation.ParkedCalls = nil
+			conversation.Delivery = nil
+		case llm.WorkerRejectInvalid, llm.WorkerRejectForbidden, llm.WorkerRejectEventConflict,
+			llm.WorkerRejectStateConflict, llm.WorkerRejectToolConflict:
 			conversation.Phase = PhaseActive
 			conversation.ParkedCalls = nil
 			conversation.Delivery = nil
@@ -466,6 +765,10 @@ func (worker *Worker) handleRejection(rejection Rejection) {
 		// Persist before confirming so a crash cannot lose the human-visible
 		// NACK; an unconfirmed rejection replays from the transport.
 		if err := worker.state.SaveConversation(worker.loopCtx, saved); err != nil {
+			observe.Emit(worker.observer, observe.Event{
+				Kind: observe.KindRejectionReceived, Caller: string(key.Caller), Task: string(key.TaskID),
+				Detail: string(rejection.Receipt.Code), Err: err,
+			})
 			worker.notify()
 			return
 		}
@@ -473,6 +776,10 @@ func (worker *Worker) handleRejection(rejection Rejection) {
 		worker.mu.Unlock()
 	}
 	_ = worker.wire.ConfirmRejection(worker.loopCtx, rejection.Delivery.ID)
+	observe.Emit(worker.observer, observe.Event{
+		Kind: observe.KindRejectionReceived, Caller: string(key.Caller), Task: string(key.TaskID),
+		Detail: string(rejection.Receipt.Code),
+	})
 	worker.notify()
 }
 
@@ -505,6 +812,9 @@ func (worker *Worker) Accept(ctx context.Context, delivery llm.WorkerDeliveryID)
 	}
 	worker.mu.Unlock()
 
+	if err := worker.prepareConversationWorkspace(ctx, &conversation); err != nil {
+		return ConversationKey{}, fmt.Errorf("workerkit: prepare Human workspace: %w", err)
+	}
 	if err := worker.state.SaveConversation(ctx, cloneConversation(conversation)); err != nil {
 		return ConversationKey{}, fmt.Errorf("workerkit: persist accepted conversation: %w", err)
 	}
@@ -544,6 +854,7 @@ func (worker *Worker) Reject(ctx context.Context, delivery llm.WorkerDeliveryID,
 	if err := worker.wire.SendEvent(ctx, event); err != nil {
 		return fmt.Errorf("workerkit: send rejection: %w", err)
 	}
+	worker.observeCommand(assignment.Assignment.Identity, llm.EventRejected)
 	if err := worker.wire.ConfirmAssignment(ctx, delivery); err != nil {
 		return fmt.Errorf("workerkit: confirm rejected assignment: %w", err)
 	}
@@ -582,6 +893,85 @@ func (worker *Worker) Final(ctx context.Context, key ConversationKey, text strin
 	worker.command.Lock()
 	defer worker.command.Unlock()
 	return worker.sendConversationEvent(ctx, key, llm.Event{Type: llm.EventFinal, Text: text}, PhaseTerminal)
+}
+
+// Abandon force-terminates a conversation locally, with no wire event, for the
+// case where the caller will not return. After a restart the caller's
+// completion connection is gone (HTTP is volatile), so a recovered active or
+// awaiting_* conversation can no longer be ended the normal way — a Final or
+// reply would NACK ("could not be delivered"). Abandon settles the human-side
+// mirror to terminal and returns any in-flight reviewed changes to review
+// without advancing the baseline. It sends nothing to the caller; if the caller
+// is somehow still waiting it simply times out. A later continuation for the
+// same task enters the inbox as fresh work (handleAssignment treats a terminal
+// conversation as a reusable task id), so nothing is silently lost or resumed.
+func (worker *Worker) Abandon(ctx context.Context, key ConversationKey) error {
+	if err := worker.checkCommand(ctx); err != nil {
+		return err
+	}
+	worker.command.Lock()
+	defer worker.command.Unlock()
+
+	worker.mu.Lock()
+	conversation, exists := worker.conversations[key]
+	if !exists {
+		worker.mu.Unlock()
+		return fmt.Errorf("%w: %v", ErrUnknownConversation, key)
+	}
+	if conversation.Phase == PhaseTerminal {
+		worker.mu.Unlock()
+		return nil // already ended; abandon is idempotent
+	}
+	if conversation.Phase == PhaseActive && !conversation.CallerGone {
+		worker.mu.Unlock()
+		return fmt.Errorf("%w: %v", ErrConversationNotAbandonable, key)
+	}
+	pending := conversation.Delivery
+	worker.mu.Unlock()
+
+	// The caller's results never came back, so any in-flight reviewed batch
+	// returns to review without advancing the baseline; the human re-decides it
+	// on the fresh inbox item a later continuation creates. Cancel is idempotent.
+	if pending != nil && worker.mirror != nil {
+		if err := worker.mirror.Cancel(ctx, pending.ChangeIDs); err != nil {
+			return fmt.Errorf("workerkit: cancel abandoned delivery: %w", err)
+		}
+	}
+
+	worker.mu.Lock()
+	conversation, exists = worker.conversations[key]
+	if !exists {
+		worker.mu.Unlock()
+		return nil
+	}
+	if conversation.Phase == PhaseTerminal {
+		worker.mu.Unlock()
+		return nil // ended while the delivery was being cancelled; still idempotent
+	}
+	// Terminate on a copy and publish it in-memory only after the durable write
+	// succeeds. Mutating the shared conversation before SaveConversation would,
+	// on a save failure, leave it PhaseTerminal while returning an error — and a
+	// retry would then hit the idempotency short-circuit above and report a
+	// success that was never persisted (the abandon is lost on the next restart).
+	terminal := cloneConversation(*conversation)
+	terminal.Phase = PhaseTerminal
+	terminal.ParkedCalls = nil
+	terminal.Delivery = nil
+	terminal.CallerGone = false
+	terminal.UpdatedAt = worker.now().UTC()
+	worker.mu.Unlock()
+
+	if err := worker.state.SaveConversation(ctx, cloneConversation(terminal)); err != nil {
+		return fmt.Errorf("workerkit: persist abandoned conversation: %w", err)
+	}
+
+	worker.mu.Lock()
+	if _, stillThere := worker.conversations[key]; stillThere {
+		worker.conversations[key] = &terminal
+	}
+	worker.mu.Unlock()
+	worker.notify()
+	return nil
 }
 
 // SubmitToolCalls asks the caller agent to execute tools and parks the
@@ -665,13 +1055,38 @@ func (worker *Worker) DeliverChanges(ctx context.Context, key ConversationKey, c
 		return fmt.Errorf("%w: %v is %s", ErrConversationNotActive, key, phase)
 	}
 	tools := append([]llm.Tool(nil), conversation.Assignment.Assignment.Request.Tools...)
-	root := conversation.Assignment.Assignment.Task.WorkspaceRoot
+	task := conversation.Assignment.Assignment.Task
+	humanWorkspace := conversation.HumanWorkspace
+	if _, sessionAware := worker.mirror.(SessionMirror); sessionAware &&
+		(humanWorkspace == nil || !humanWorkspace.Available) {
+		worker.mu.Unlock()
+		return fmt.Errorf("%w: conversation has no Human workspace", ErrMirrorScopeMismatch)
+	}
+	if humanWorkspace != nil {
+		selected := make(map[string]struct{}, len(changeIDs))
+		for _, id := range changeIDs {
+			selected[id] = struct{}{}
+		}
+		for _, change := range worker.review.Changes {
+			if _, isSelected := selected[change.ID]; isSelected && change.WorkspaceID != humanWorkspace.ID {
+				worker.mu.Unlock()
+				return fmt.Errorf("%w: change %s belongs to another Human workspace", ErrMirrorScopeMismatch, change.ID)
+			}
+		}
+	}
 	worker.mu.Unlock()
 
+	workspace := HumanWorkspace{}
+	if humanWorkspace != nil {
+		workspace = *humanWorkspace
+	}
 	calls, err := worker.mirror.Resolve(ctx, MirrorResolve{
-		ChangeIDs:     append([]string(nil), changeIDs...),
-		Tools:         tools,
-		WorkspaceRoot: root,
+		ChangeIDs:      append([]string(nil), changeIDs...),
+		Tools:          tools,
+		Scope:          WorkspaceScope{Caller: key.Caller, WorkspaceKey: task.WorkspaceKey},
+		Workspace:      workspace,
+		HarnessID:      task.HarnessID,
+		HarnessVersion: task.HarnessVersion,
 	})
 	if err != nil {
 		return fmt.Errorf("workerkit: resolve reviewed changes: %w", err)
@@ -784,6 +1199,7 @@ func (worker *Worker) sendConversationEventWith(
 	if err := worker.wire.SendEvent(ctx, wireEvent); err != nil {
 		return fmt.Errorf("workerkit: send %s event: %w", event.Type, err)
 	}
+	worker.observeCommand(assignment.Assignment.Identity, event.Type)
 
 	worker.mu.Lock()
 	conversation, exists = worker.conversations[key]
@@ -814,6 +1230,21 @@ func (worker *Worker) sendConversationEventWith(
 	}
 	worker.notify()
 	return nil
+}
+
+func (worker *Worker) observeAssignment(delivery llm.WorkerAssignmentDelivery, detail string) {
+	identity := delivery.Assignment.Identity
+	observe.Emit(worker.observer, observe.Event{
+		Kind: observe.KindAssignmentArrived, Caller: string(identity.CallerID),
+		Task: string(identity.TaskID), Worker: string(delivery.Assignment.Lease.Owner), Detail: detail,
+	})
+}
+
+func (worker *Worker) observeCommand(identity llm.CompletionIdentity, eventType llm.EventType) {
+	observe.Emit(worker.observer, observe.Event{
+		Kind: observe.KindCommandSent, Caller: string(identity.CallerID),
+		Task: string(identity.TaskID), Detail: string(eventType),
+	})
 }
 
 func (worker *Worker) buildEvent(assignment llm.WorkerAssignmentDelivery, event llm.Event) (llm.WorkerEventDelivery, error) {

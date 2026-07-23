@@ -592,8 +592,9 @@ func (service *Service) planWorkerEvent(
 			digest, digestErr := stableDigest(struct {
 				Namespace string         `json:"namespace,omitempty"`
 				Name      string         `json:"name"`
-				Input     map[string]any `json:"input"`
-			}{call.Namespace, call.Name, call.Input})
+				Input     map[string]any `json:"input,omitempty"`
+				TextInput *string        `json:"text_input,omitempty"`
+			}{call.Namespace, call.Name, call.Input, call.TextInput})
 			if digestErr != nil {
 				return state, nil, WorkerRejectInvalid, nil
 			}
@@ -606,7 +607,13 @@ func (service *Service) planWorkerEvent(
 	case EventRejected:
 		return TaskRejected, nil, terminalEventAllowed(state), nil
 	case EventExpired:
-		return TaskExpired, nil, terminalEventAllowed(state), nil
+		// Expiry is also valid while a durable assignment is still awaiting its
+		// delivery ACK. This lets a host enforce an end-to-end pending deadline
+		// even when no human worker ever accepts the work.
+		if state == TaskLeased || state == TaskAwaitingHuman {
+			return TaskExpired, nil, "", nil
+		}
+		return state, nil, WorkerRejectStateConflict, nil
 	case EventFailed, EventUnavailable:
 		return TaskFailed, nil, terminalEventAllowed(state), nil
 	default:
@@ -627,13 +634,32 @@ func (service *Service) validateAndAuthorizeToolCalls(
 	request Request,
 	calls []ToolCall,
 ) (WorkerRejectionCode, error) {
-	declared := make(map[string]struct{}, len(request.Tools))
+	if request.ToolCallPolicy == ToolCallsDisabled {
+		return WorkerRejectForbidden, nil
+	}
+	if request.ToolCallPolicy == ToolCallsSerial && len(calls) > 1 {
+		return WorkerRejectInvalid, nil
+	}
+	declared := make(map[string]Tool, len(request.Tools))
 	for _, tool := range request.Tools {
-		declared[tool.QualifiedName()] = struct{}{}
+		declared[tool.QualifiedName()] = tool
 	}
 	for _, call := range calls {
-		if _, ok := declared[call.QualifiedName()]; !ok {
+		tool, ok := declared[call.QualifiedName()]
+		if !ok {
 			return WorkerRejectForbidden, nil
+		}
+		switch tool.InputKind {
+		case ToolInputJSON:
+			if call.TextInput != nil {
+				return WorkerRejectInvalid, nil
+			}
+		case ToolInputText:
+			if call.TextInput == nil || call.Input != nil {
+				return WorkerRejectInvalid, nil
+			}
+		default:
+			return WorkerRejectInvalid, nil
 		}
 		if task.CapabilityTier != TierChat {
 			if service.toolAuthorizer == nil {
@@ -680,6 +706,7 @@ func ptrEvent(event Event) *Event { return &event }
 
 func cloneToolCall(call ToolCall) ToolCall {
 	call.Input = cloneTransportMap(call.Input)
+	call.TextInput = cloneTransportString(call.TextInput)
 	return call
 }
 

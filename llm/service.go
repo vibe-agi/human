@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/vibe-agi/human/framework"
+	"github.com/vibe-agi/human/observe"
 	"github.com/vibe-agi/human/protect"
 )
 
@@ -35,7 +36,6 @@ const (
 	maximumStoreRequestPayloadBytes = int64(128 << 20)
 	maximumRecoveryReadLimitBytes   = maximumStoreRequestPayloadBytes
 	workerEnvelopeReserve           = int64(4 << 10)
-	maximumWorkspaceRootBytes       = 4096
 	assignmentValidationSession     = WorkerSessionID("core-validation")
 )
 
@@ -64,6 +64,7 @@ type Service struct {
 	ids                     IDSource
 	seeds                   SeedSource
 	router                  WorkerRouter
+	observer                observe.Observer
 	admission               AdmissionPolicy
 	toolAuthorizer          ToolAuthorizer
 	assignmentBuffer        int
@@ -83,6 +84,11 @@ type Service struct {
 	assignments  map[WorkerDeliveryID]*assignmentState
 	pending      map[WorkerID]map[WorkerDeliveryID]*assignmentState
 	signals      map[StoreRequestKey]*responseSignalState
+	// detached marks tasks whose in-flight caller socket went away before a
+	// durable decision. It is the single caller-liveness signal that gates the
+	// scenario-C takeover (AdmitPreemptDetached) and raises the scenario-B
+	// caller-gone banner. Advisory in-memory state; see service_notice.go.
+	detached map[StoreTaskKey]detachedCaller
 }
 
 var _ framework.Runtime = (*Service)(nil)
@@ -145,7 +151,7 @@ func NewService(ctx context.Context, config Config) (_ *Service, resultErr error
 		protectorResource:    config.Protector,
 		protectionReadPolicy: config.ProtectionReadPolicy,
 		clock:                config.Clock, ids: config.IDs, seeds: config.Seeds,
-		router: config.Router, admission: config.Admission,
+		router: config.Router, observer: config.Observer, admission: config.Admission,
 		toolAuthorizer:   config.ToolAuthorizer,
 		assignmentBuffer: config.AssignmentBuffer, workerPayloadLimitBytes: config.WorkerPayloadLimitBytes,
 		readLimitBytes: config.ReadLimitBytes,
@@ -156,6 +162,7 @@ func NewService(ctx context.Context, config Config) (_ *Service, resultErr error
 		assignments: make(map[WorkerDeliveryID]*assignmentState),
 		pending:     make(map[WorkerID]map[WorkerDeliveryID]*assignmentState),
 		signals:     make(map[StoreRequestKey]*responseSignalState),
+		detached:    make(map[StoreTaskKey]detachedCaller),
 	}
 	cleanup := true
 	defer func() {
@@ -657,6 +664,6 @@ func normalizeTaskContext(input TaskContext) TaskContext {
 func sameTaskContext(record StoreTaskRecord, input TaskContext) bool {
 	return record.WorkspaceKey == input.WorkspaceKey && record.CapabilityTier == input.CapabilityTier &&
 		record.HarnessID == input.HarnessID && record.HarnessVersion == input.HarnessVersion &&
-		record.HarnessSessionID == input.HarnessSessionID && record.WorkspaceRoot == input.WorkspaceRoot &&
+		record.HarnessSessionID == input.HarnessSessionID &&
 		record.ExecAllowed == input.ExecAllowed
 }

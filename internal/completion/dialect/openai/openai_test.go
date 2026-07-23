@@ -103,11 +103,14 @@ func TestDecodeChatMultipleToolResultsRemainIndependent(t *testing.T) {
 	}
 }
 
-func TestDecodeAllowsForwardCompatibleFieldsAndNonStreaming(t *testing.T) {
+func TestDecodeAcceptsExplicitNoopFieldsRejectsUnknownAndSupportsNonStreaming(t *testing.T) {
 	t.Parallel()
 	codec := New()
 	if _, err := codec.Decode([]byte(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hello"}],"temperature":0.1}`)); err != nil {
-		t.Fatalf("forward-compatible field rejected: %v", err)
+		t.Fatalf("documented no-op field rejected: %v", err)
+	}
+	if _, err := codec.Decode([]byte(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hello"}],"future_control":true}`)); err == nil {
+		t.Fatal("unknown top-level control accepted")
 	}
 	request, err := codec.Decode([]byte(`{"model":"m","stream":false,"messages":[{"role":"user","content":"hello"}]}`))
 	if err != nil || request.Stream {
@@ -138,6 +141,22 @@ func TestDecodeChatAcceptsDefaultControlsAndNormalizesEmptyTools(t *testing.T) {
 	if got := string(request.Tools[0].InputSchema); got != `{"type":"object","properties":{}}` {
 		t.Fatalf("default tool schema = %s", got)
 	}
+	serial, err := New().Decode([]byte(`{
+  "model":"m","stream":true,"parallel_tool_calls":false,
+  "messages":[{"role":"user","content":"hello"}],
+  "tools":[{"type":"function","function":{"name":"empty"}}]
+}`))
+	if err != nil || serial.ToolCallPolicy != canonical.ToolCallsSerial {
+		t.Fatalf("serial tool-call policy = %q, %v", serial.ToolCallPolicy, err)
+	}
+	disabled, err := New().Decode([]byte(`{
+	  "model":"m","stream":true,"tool_choice":"none",
+	  "messages":[{"role":"user","content":"hello"}],
+	  "tools":[{"type":"function","function":{"name":"empty"}}]
+	}`))
+	if err != nil || disabled.ToolCallPolicy != canonical.ToolCallsDisabled || len(disabled.Tools) != 0 {
+		t.Fatalf("disabled tool-call policy = %q, tools=%+v, %v", disabled.ToolCallPolicy, disabled.Tools, err)
+	}
 }
 
 func TestDecodeChatRejectsUnsupportedOutputControls(t *testing.T) {
@@ -153,7 +172,6 @@ func TestDecodeChatRejectsUnsupportedOutputControls(t *testing.T) {
 		{name: "JSON schema response", field: `"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}`},
 		{name: "text response with hidden schema", field: `"response_format":{"type":"text","json_schema":{"name":"answer","schema":{"type":"object"}}}`},
 		{name: "text response with unknown control", field: `"response_format":{"type":"text","future_control":true}`},
-		{name: "serial tool calls", field: `"parallel_tool_calls":false`},
 	}
 	for _, test := range tests {
 		test := test

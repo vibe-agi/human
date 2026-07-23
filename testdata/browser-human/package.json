@@ -1,0 +1,11 @@
+{
+  "name": "human-browser-operator-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pinned Playwright human operator for Human's Testcontainers product gate",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "playwright": "1.61.1"
+  }
+}

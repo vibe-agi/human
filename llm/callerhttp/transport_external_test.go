@@ -449,7 +449,6 @@ func TestHeaderResolverKeepsChatEmptyAndRemoteFailClosed(t *testing.T) {
 	remote.Set(callerhttp.HeaderWorkspaceKey, "workspace-a")
 	remote.Set(callerhttp.HeaderHarnessID, "custom")
 	remote.Set(callerhttp.HeaderHarnessVersion, "1.0")
-	remote.Set(callerhttp.HeaderWorkspaceRoot, "/workspace")
 	if _, err := resolver.ResolveRequest(t.Context(), callerhttp.ResolutionRequest{CallerID: "caller-a", Header: remote}); !errors.Is(err, callerhttp.ErrResolution) {
 		t.Fatalf("missing session error = %v", err)
 	}
@@ -463,10 +462,6 @@ func TestHeaderResolverKeepsChatEmptyAndRemoteFailClosed(t *testing.T) {
 	if resolved.Task.CapabilityTier != llm.TierRemoteTools || resolved.Task.WorkspaceKey != "workspace-a" ||
 		resolved.Task.TaskID != "task-a" || !resolved.Task.ExecAllowed {
 		t.Fatalf("remote task = %+v", resolved.Task)
-	}
-	remote.Set(callerhttp.HeaderWorkspaceRoot, strings.Repeat("x", 4097))
-	if _, err := resolver.ResolveRequest(t.Context(), callerhttp.ResolutionRequest{CallerID: "caller-a", Header: remote}); !errors.Is(err, callerhttp.ErrResolution) {
-		t.Fatalf("oversize workspace root error = %v", err)
 	}
 }
 
@@ -983,7 +978,6 @@ func setWorkspaceHeaders(request *http.Request, key string) {
 	request.Header.Set(callerhttp.HeaderHarnessID, "test-harness")
 	request.Header.Set(callerhttp.HeaderHarnessVersion, "1.0")
 	request.Header.Set(callerhttp.HeaderHarnessSession, "session-a")
-	request.Header.Set(callerhttp.HeaderWorkspaceRoot, "/workspace")
 }
 
 func startTransport(

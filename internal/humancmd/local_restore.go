@@ -1,7 +1,6 @@
 package humancmd
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,28 +15,30 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
 const (
-	localRestoreJournalVersion   = 3
+	localRestoreJournalVersion   = 4
 	localRestorePhaseInstalling  = "installing"
 	localRestorePhaseRollingBack = "rolling_back"
 )
 
 var localRestoreTransactionID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
+// localRestoreJournal is an internal, crash-recovery record. Version 4 names
+// identities after the public Service deployment instead of the retired
+// gateway credential-pair implementation.
 type localRestoreJournal struct {
-	Version         int                        `json:"version"`
-	Phase           string                     `json:"phase"`
-	TransactionID   string                     `json:"transaction_id"`
-	WorkspaceScope  string                     `json:"workspace_scope"`
-	GatewayIdentity string                     `json:"gateway_identity"`
-	CallerSubject   string                     `json:"caller_subject"`
-	WorkerSubject   string                     `json:"worker_subject"`
-	Entries         []localRestoreJournalEntry `json:"entries"`
+	Version        int                        `json:"version"`
+	Phase          string                     `json:"phase"`
+	TransactionID  string                     `json:"transaction_id"`
+	WorkspaceScope string                     `json:"workspace_scope"`
+	DeploymentID   string                     `json:"deployment_id"`
+	CallerID       string                     `json:"caller_id"`
+	WorkerID       string                     `json:"worker_id"`
+	Entries        []localRestoreJournalEntry `json:"entries"`
 }
 
 type localRestoreJournalEntry struct {
@@ -63,11 +64,11 @@ func newLocalRestoreCommand(settings *viper.Viper) *cobra.Command {
 		Short: "restore a verified offline backup as one crash-recoverable local state set",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
-			paths, err := resolveLocalBackupPaths(settings)
+			paths, err := resolvePublicLocalBackupPaths(settings)
 			if err != nil {
 				return err
 			}
-			locks, err := acquireStoppedLocal(paths, true)
+			locks, err := acquireStoppedPublicLocal(paths, true)
 			if err != nil {
 				return err
 			}
@@ -76,7 +77,7 @@ func newLocalRestoreCommand(settings *viper.Viper) *cobra.Command {
 				if strings.TrimSpace(input) != "" || force || acceptWorkspaceMismatch {
 					return errors.New("--resume cannot be combined with --input, --force, or --accept-workspace-mismatch")
 				}
-				if err := resumeLocalRestore(command.Context(), paths); err != nil {
+				if err := resumePublicLocalRestore(command.Context(), paths); err != nil {
 					return err
 				}
 				_, err = fmt.Fprintln(command.OutOrStdout(), "Human local restore recovery completed")
@@ -85,27 +86,27 @@ func newLocalRestoreCommand(settings *viper.Viper) *cobra.Command {
 			if strings.TrimSpace(input) == "" {
 				return errors.New("backup input is required; use --input FILE (or --resume after an interrupted restore)")
 			}
-			if err := rejectPendingLocalRestore(paths.GatewayDB); err != nil {
+			if err := rejectPendingLocalRestore(paths.ServiceDB); err != nil {
 				return err
 			}
 			archivePath, err := resolvePrivatePath(input, "backup input")
 			if err != nil {
 				return err
 			}
-			manifest, err := restoreLocalBackup(command.Context(), paths, archivePath, force, acceptWorkspaceMismatch)
+			manifest, err := restorePublicLocalBackup(command.Context(), paths, archivePath, force, acceptWorkspaceMismatch)
 			if err != nil {
 				return err
 			}
 			if manifest.WorkspaceScope != paths.WorkspaceKey {
 				if _, err := fmt.Fprintln(command.OutOrStdout(),
-					"WARNING: transport identity was rebound, but archived in-flight task workspace/root identities were preserved; review them before continuing old file operations.",
+					"WARNING: archived in-flight task workspace/root identities were preserved; review them before continuing old file operations.",
 				); err != nil {
 					return err
 				}
 			}
 			_, err = fmt.Fprintf(command.OutOrStdout(),
 				"Human local backup restored\narchive: %s\ncreated: %s\nfiles: %d\n",
-				archivePath, manifest.CreatedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"), countManifestFiles(manifest))
+				archivePath, manifest.CreatedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"), countPublicManifestFiles(manifest))
 			return err
 		},
 	}
@@ -115,212 +116,6 @@ func newLocalRestoreCommand(settings *viper.Viper) *cobra.Command {
 	command.Flags().BoolVar(&acceptWorkspaceMismatch, "accept-workspace-mismatch", false,
 		"acknowledge a verified same-workspace relocation; archived in-flight workspace/root identities are not rewritten")
 	return command
-}
-
-func restoreLocalBackup(ctx context.Context, paths localBackupPaths, archivePath string, force, acceptWorkspaceMismatch bool) (localBackupManifest, error) {
-	if err := validateLocalBackupPathSet(paths); err != nil {
-		return localBackupManifest{}, err
-	}
-	if err := rejectArchiveStateCollision(paths, archivePath); err != nil {
-		return localBackupManifest{}, err
-	}
-	extracted, err := os.MkdirTemp("", "human-local-restore-verify-*")
-	if err != nil {
-		return localBackupManifest{}, fmt.Errorf("create restore verification directory: %w", err)
-	}
-	defer os.RemoveAll(extracted)
-	summary, err := extractAndVerifyLocalBackup(ctx, archivePath, extracted)
-	if err != nil {
-		return localBackupManifest{}, err
-	}
-	manifest := summary.Manifest
-	if manifest.WorkspaceScope != paths.WorkspaceKey && !acceptWorkspaceMismatch {
-		return localBackupManifest{}, fmt.Errorf(
-			"backup belongs to workspace scope %s, current scope is %s; use --accept-workspace-mismatch only after verifying the destination",
-			manifest.WorkspaceScope, paths.WorkspaceKey,
-		)
-	}
-	if manifest.CallerSubject != paths.CallerSubject {
-		return localBackupManifest{}, fmt.Errorf(
-			"backup caller subject %q does not match configured local caller subject %q",
-			manifest.CallerSubject, paths.CallerSubject,
-		)
-	}
-	if manifest.WorkerSubject != paths.WorkerSubject {
-		return localBackupManifest{}, fmt.Errorf(
-			"backup worker subject %q does not match configured local worker subject %q",
-			manifest.WorkerSubject, paths.WorkerSubject,
-		)
-	}
-	if manifest.StateEnabled && paths.StateDB == "" {
-		return localBackupManifest{}, errors.New("backup contains worker state; configure a non-empty --state-db destination")
-	}
-
-	journal, err := prepareLocalRestore(ctx, paths, manifest, extracted, force)
-	if err != nil {
-		return localBackupManifest{}, err
-	}
-	journalPath := localRestoreJournalPath(paths.GatewayDB)
-	published, err := writeLocalRestoreJournal(journalPath, journal)
-	if err != nil {
-		if !published {
-			removeLocalRestoreStages(journal)
-		}
-		return localBackupManifest{}, err
-	}
-	if err := commitLocalRestore(ctx, journalPath, journal); err != nil {
-		return localBackupManifest{}, fmt.Errorf("commit local restore (run `human local restore --workspace . --resume` after correcting the reported condition): %w", err)
-	}
-	if _, found, err := readLocalCredentials(paths.Credentials); err != nil || !found {
-		if err == nil {
-			err = errors.New("restored credentials are missing")
-		}
-		return localBackupManifest{}, err
-	}
-	return manifest, nil
-}
-
-func prepareLocalRestore(ctx context.Context, paths localBackupPaths, manifest localBackupManifest, extracted string, force bool) (localRestoreJournal, error) {
-	targetGatewayIdentity, err := localGatewayIdentity(paths.GatewayDB)
-	if err != nil {
-		return localRestoreJournal{}, fmt.Errorf("resolve restore gateway identity: %w", err)
-	}
-	if err := rebindLocalWorkerBinding(
-		ctx,
-		filepath.Join(extracted, "worker", "worker-outbox.db"),
-		filepath.Join(extracted, "worker", "worker-state.db"),
-		manifest.StateEnabled,
-		manifest.GatewayIdentity, targetGatewayIdentity, manifest.WorkerSubject,
-	); err != nil {
-		return localRestoreJournal{}, fmt.Errorf("prepare restored worker identity: %w", err)
-	}
-	txID := uuid.NewString()
-	journal := localRestoreJournal{
-		Version: localRestoreJournalVersion, Phase: localRestorePhaseInstalling, TransactionID: txID,
-		WorkspaceScope: paths.WorkspaceKey, GatewayIdentity: targetGatewayIdentity,
-		CallerSubject: paths.CallerSubject, WorkerSubject: paths.WorkerSubject,
-	}
-	components := []struct {
-		id, kind, logical, target    string
-		present, sqlite, credentials bool
-	}{
-		{"gateway", "file", "gateway/gateway.db", paths.GatewayDB, true, true, false},
-		{"credentials", "file", "credentials/credentials.json", paths.Credentials, true, false, true},
-		{"outbox", "file", "worker/worker-outbox.db", paths.OutboxDB, true, true, false},
-		{
-			"mirror-workspace", "directory", "mirror/workspace",
-			filepath.Join(paths.MirrorRoot, paths.CallerSubject, paths.WorkspaceKey), true, false, false,
-		},
-		{
-			"mirror-state", "directory", "mirror/state",
-			filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, paths.WorkspaceKey), true, false, false,
-		},
-	}
-	if paths.StateDB != "" {
-		components = append(components, struct {
-			id, kind, logical, target    string
-			present, sqlite, credentials bool
-		}{"state", "file", "worker/worker-state.db", paths.StateDB, manifest.StateEnabled, manifest.StateEnabled, false})
-	}
-	databaseTargets := []struct{ id, target string }{{"gateway", paths.GatewayDB}, {"outbox", paths.OutboxDB}}
-	if paths.StateDB != "" {
-		databaseTargets = append(databaseTargets, struct{ id, target string }{"state", paths.StateDB})
-	}
-	for _, database := range databaseTargets {
-		for _, suffix := range []string{"journal", "wal", "shm"} {
-			components = append(components, struct {
-				id, kind, logical, target    string
-				present, sqlite, credentials bool
-			}{database.id + "-" + suffix, "file", "", database.target + "-" + suffix, false, false, false})
-		}
-	}
-
-	for _, component := range components {
-		var targetDirectoryErr error
-		switch component.id {
-		case "mirror-workspace", "mirror-state":
-			targetDirectoryErr = ensureLocalMirrorCallerRoot(filepath.Dir(component.target))
-		default:
-			targetDirectoryErr = os.MkdirAll(filepath.Dir(component.target), 0o700)
-		}
-		if targetDirectoryErr != nil {
-			removeLocalRestoreStages(journal)
-			return localRestoreJournal{}, fmt.Errorf("create restore target directory: %w", targetDirectoryErr)
-		}
-		if component.credentials && runtime.GOOS != "windows" {
-			info, err := os.Stat(filepath.Dir(component.target))
-			if err != nil || info.Mode().Perm()&0o077 != 0 {
-				removeLocalRestoreStages(journal)
-				return localRestoreJournal{}, fmt.Errorf("credential restore directory %s must have mode 0700", filepath.Dir(component.target))
-			}
-		}
-		hadPrevious, nonempty, err := inspectRestoreTarget(component.target, component.kind)
-		if err != nil {
-			removeLocalRestoreStages(journal)
-			return localRestoreJournal{}, err
-		}
-		if nonempty && !force {
-			removeLocalRestoreStages(journal)
-			return localRestoreJournal{}, fmt.Errorf("restore target %s is non-empty; inspect it and use --force to replace the complete local state set", component.target)
-		}
-		base := filepath.Base(component.target)
-		entry := localRestoreJournalEntry{
-			ID: component.id, Kind: component.kind, Target: component.target,
-			Previous: filepath.Join(filepath.Dir(component.target), ".human-restore-"+txID+"-old-"+base),
-			Present:  component.present, HadPrevious: hadPrevious,
-			SQLite: component.sqlite, Credentials: component.credentials,
-		}
-		if component.present {
-			entry.Staged = filepath.Join(filepath.Dir(component.target), ".human-restore-"+txID+"-new-"+base)
-		}
-		journal.Entries = append(journal.Entries, entry)
-		current := &journal.Entries[len(journal.Entries)-1]
-		if component.present {
-			source := filepath.Join(extracted, filepath.FromSlash(component.logical))
-			switch component.kind {
-			case "file":
-				mode := fs.FileMode(0o600)
-				if err := copyStableRegular(source, current.Staged, mode); err != nil {
-					removeLocalRestoreStages(journal)
-					return localRestoreJournal{}, fmt.Errorf("stage restored %s: %w", component.id, err)
-				}
-				current.Digest, err = digestFile(current.Staged)
-			case "directory":
-				err = copyRestoreDirectory(source, current.Staged)
-				if err == nil {
-					current.Digest, err = digestRestoreTree(current.Staged)
-				}
-			}
-			if err != nil {
-				removeLocalRestoreStages(journal)
-				return localRestoreJournal{}, fmt.Errorf("stage restored %s: %w", component.id, err)
-			}
-			if current.SQLite {
-				if err := quickCheckSQLitePath(ctx, current.Staged, "staged restored "+component.id); err != nil {
-					removeLocalRestoreStages(journal)
-					return localRestoreJournal{}, err
-				}
-			}
-			if current.Credentials {
-				if _, found, err := readLocalCredentials(current.Staged); err != nil || !found {
-					removeLocalRestoreStages(journal)
-					if err == nil {
-						err = errors.New("credential journal is missing")
-					}
-					return localRestoreJournal{}, fmt.Errorf("validate staged restored credentials: %w", err)
-				}
-			}
-			if err := syncLocalRestoreStage(*current); err != nil {
-				removeLocalRestoreStages(journal)
-				return localRestoreJournal{}, fmt.Errorf("sync staged restored %s: %w", component.id, err)
-			}
-		}
-	}
-	if err := validateLocalRestoreJournal(paths, journal); err != nil {
-		removeLocalRestoreStages(journal)
-		return localRestoreJournal{}, err
-	}
-	return journal, nil
 }
 
 func inspectRestoreTarget(target, kind string) (exists, nonempty bool, err error) {
@@ -471,11 +266,7 @@ func writeLocalRestoreJournal(filename string, journal localRestoreJournal) (boo
 	return writeLocalRestoreJournalWithSync(filename, journal, syncDirectory)
 }
 
-func writeLocalRestoreJournalWithSync(
-	filename string,
-	journal localRestoreJournal,
-	syncDirectoryFn func(string) error,
-) (bool, error) {
+func writeLocalRestoreJournalWithSync(filename string, journal localRestoreJournal, syncDirectoryFn func(string) error) (bool, error) {
 	directory := filepath.Dir(filename)
 	temporaryPath, err := createLocalRestoreJournalTemporary(directory, journal)
 	if err != nil {
@@ -501,11 +292,7 @@ func replaceLocalRestoreJournal(filename string, journal localRestoreJournal) er
 	return replaceLocalRestoreJournalWithSync(filename, journal, syncDirectory)
 }
 
-func replaceLocalRestoreJournalWithSync(
-	filename string,
-	journal localRestoreJournal,
-	syncDirectoryFn func(string) error,
-) error {
+func replaceLocalRestoreJournalWithSync(filename string, journal localRestoreJournal, syncDirectoryFn func(string) error) error {
 	directory := filepath.Dir(filename)
 	temporaryPath, err := createLocalRestoreJournalTemporary(directory, journal)
 	if err != nil {
@@ -552,37 +339,6 @@ func readLocalRestoreJournal(filename string) (localRestoreJournal, error) {
 	return journal, nil
 }
 
-func commitLocalRestore(ctx context.Context, journalPath string, journal localRestoreJournal) error {
-	if journal.Phase != localRestorePhaseInstalling {
-		return fmt.Errorf("cannot commit local restore journal in phase %q", journal.Phase)
-	}
-	for _, entry := range journal.Entries {
-		if err := installLocalRestoreEntry(entry); err != nil {
-			return err
-		}
-	}
-	if err := validateInstalledLocalRestore(ctx, journal); err != nil {
-		journal.Phase = localRestorePhaseRollingBack
-		if phaseErr := replaceLocalRestoreJournal(journalPath, journal); phaseErr != nil {
-			return errors.Join(err, fmt.Errorf("record local restore rollback phase: %w", phaseErr))
-		}
-		rollbackErr := rollbackLocalRestore(journalPath, journal)
-		return errors.Join(err, rollbackErr)
-	}
-	for _, entry := range journal.Entries {
-		if err := os.RemoveAll(entry.Previous); err != nil {
-			return fmt.Errorf("remove prior restore component %s: %w", entry.ID, err)
-		}
-		if err := syncDirectory(filepath.Dir(entry.Target)); err != nil {
-			return err
-		}
-	}
-	if err := os.Remove(journalPath); err != nil {
-		return fmt.Errorf("remove committed local restore journal: %w", err)
-	}
-	return syncDirectory(filepath.Dir(journalPath))
-}
-
 func installLocalRestoreEntry(entry localRestoreJournalEntry) error {
 	if !entry.Present {
 		if _, err := os.Lstat(entry.Previous); err == nil {
@@ -622,7 +378,6 @@ func installLocalRestoreEntry(entry localRestoreJournalEntry) error {
 	if targetErr != nil && !errors.Is(targetErr, os.ErrNotExist) {
 		return targetErr
 	}
-
 	if stageExists {
 		if targetExists && !previousExists {
 			if entry.HadPrevious {
@@ -666,42 +421,6 @@ func matchesRestoreDigest(entry localRestoreJournalEntry, filename string) bool 
 		digest, err = digestRestoreTree(filename)
 	}
 	return err == nil && digest == entry.Digest
-}
-
-func validateInstalledLocalRestore(ctx context.Context, journal localRestoreJournal) error {
-	var gatewayPath, credentialPath string
-	for _, entry := range journal.Entries {
-		if !entry.Present {
-			if _, err := os.Lstat(entry.Target); !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("restore component %s should be absent", entry.ID)
-			}
-			continue
-		}
-		if !matchesRestoreDigest(entry, entry.Target) {
-			return fmt.Errorf("installed restore component %s failed its content digest", entry.ID)
-		}
-		if entry.SQLite {
-			if err := quickCheckSQLitePath(ctx, entry.Target, "installed restored "+entry.ID); err != nil {
-				return err
-			}
-		}
-		if entry.Credentials {
-			credentialPath = entry.Target
-			if _, found, err := readLocalCredentials(entry.Target); err != nil || !found {
-				if err == nil {
-					err = errors.New("credential journal is missing")
-				}
-				return fmt.Errorf("validate installed restored credentials: %w", err)
-			}
-		}
-		if entry.ID == "gateway" {
-			gatewayPath = entry.Target
-		}
-	}
-	if err := validateLocalCredentialBinding(ctx, gatewayPath, credentialPath, journal.CallerSubject, journal.WorkerSubject); err != nil {
-		return fmt.Errorf("validate installed gateway/credential binding: %w", err)
-	}
-	return nil
 }
 
 func rollbackLocalRestore(journalPath string, journal localRestoreJournal) error {
@@ -754,141 +473,6 @@ func rollbackLocalRestoreEntry(entry localRestoreJournalEntry) error {
 		}
 	}
 	return syncDirectory(filepath.Dir(entry.Target))
-}
-
-func resumeLocalRestore(ctx context.Context, paths localBackupPaths) error {
-	journalPath := localRestoreJournalPath(paths.GatewayDB)
-	journal, err := readLocalRestoreJournal(journalPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return errors.New("there is no interrupted local restore to resume")
-	}
-	if err != nil {
-		return err
-	}
-	if err := validateLocalRestoreJournal(paths, journal); err != nil {
-		return err
-	}
-	switch journal.Phase {
-	case localRestorePhaseInstalling:
-		return commitLocalRestore(ctx, journalPath, journal)
-	case localRestorePhaseRollingBack:
-		return rollbackLocalRestore(journalPath, journal)
-	default:
-		return fmt.Errorf("local restore journal has invalid phase %q", journal.Phase)
-	}
-}
-
-func validateLocalRestoreJournal(paths localBackupPaths, journal localRestoreJournal) error {
-	if journal.Version != localRestoreJournalVersion || !localRestoreTransactionID.MatchString(journal.TransactionID) {
-		return errors.New("local restore journal has an unsupported version or transaction ID")
-	}
-	if journal.Phase != localRestorePhaseInstalling && journal.Phase != localRestorePhaseRollingBack {
-		return fmt.Errorf("local restore journal has invalid phase %q", journal.Phase)
-	}
-	expectedGatewayIdentity, err := localGatewayIdentity(paths.GatewayDB)
-	if err != nil {
-		return fmt.Errorf("resolve local restore journal gateway identity: %w", err)
-	}
-	if journal.WorkspaceScope != paths.WorkspaceKey || journal.GatewayIdentity != expectedGatewayIdentity ||
-		journal.CallerSubject != paths.CallerSubject || journal.WorkerSubject != paths.WorkerSubject {
-		return errors.New("local restore journal does not belong to the selected workspace and caller")
-	}
-	for _, callerRoot := range []string{
-		filepath.Join(paths.MirrorRoot, paths.CallerSubject),
-		filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject),
-	} {
-		if err := validateLocalMirrorCallerRoot(callerRoot, false); err != nil {
-			return err
-		}
-	}
-	allowed := map[string]string{
-		"gateway": paths.GatewayDB, "credentials": paths.Credentials, "outbox": paths.OutboxDB,
-		"mirror-workspace": filepath.Join(paths.MirrorRoot, paths.CallerSubject, paths.WorkspaceKey),
-		"mirror-state":     filepath.Join(paths.MirrorRoot, ".human-state", paths.CallerSubject, paths.WorkspaceKey),
-	}
-	if paths.StateDB != "" {
-		allowed["state"] = paths.StateDB
-	}
-	for id, database := range map[string]string{"gateway": paths.GatewayDB, "outbox": paths.OutboxDB, "state": paths.StateDB} {
-		if database == "" {
-			continue
-		}
-		for _, suffix := range []string{"journal", "wal", "shm"} {
-			allowed[id+"-"+suffix] = database + "-" + suffix
-		}
-	}
-	seen := make(map[string]struct{}, len(journal.Entries))
-	for _, entry := range journal.Entries {
-		target, ok := allowed[entry.ID]
-		if !ok || target != entry.Target {
-			return fmt.Errorf("local restore journal has an unexpected target for %s", entry.ID)
-		}
-		if _, duplicate := seen[entry.ID]; duplicate {
-			return fmt.Errorf("local restore journal repeats component %s", entry.ID)
-		}
-		seen[entry.ID] = struct{}{}
-		base := filepath.Base(target)
-		expectedPrevious := filepath.Join(filepath.Dir(target), ".human-restore-"+journal.TransactionID+"-old-"+base)
-		if entry.Previous != expectedPrevious || (entry.Present && entry.Staged != filepath.Join(filepath.Dir(target), ".human-restore-"+journal.TransactionID+"-new-"+base)) || (!entry.Present && entry.Staged != "") {
-			return fmt.Errorf("local restore journal staging paths for %s are invalid", entry.ID)
-		}
-		if entry.Kind != "file" && entry.Kind != "directory" {
-			return fmt.Errorf("local restore journal kind for %s is invalid", entry.ID)
-		}
-		if entry.Present && len(entry.Digest) != sha256.Size*2 {
-			return fmt.Errorf("local restore journal digest for %s is invalid", entry.ID)
-		}
-		if entry.Present {
-			if _, err := hex.DecodeString(entry.Digest); err != nil {
-				return fmt.Errorf("local restore journal digest for %s is invalid", entry.ID)
-			}
-		} else if entry.Digest != "" {
-			return fmt.Errorf("absent restore component %s must not carry a digest", entry.ID)
-		}
-		if err := validateRestoreEntrySemantics(entry); err != nil {
-			return err
-		}
-		for _, candidate := range []string{entry.Target, entry.Staged, entry.Previous} {
-			if candidate != "" {
-				if err := validateRestorePathShape(entry, candidate); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	for id := range allowed {
-		if _, ok := seen[id]; !ok {
-			return fmt.Errorf("local restore journal is missing component %s", id)
-		}
-	}
-	return nil
-}
-
-func validateRestoreEntrySemantics(entry localRestoreJournalEntry) error {
-	valid := false
-	switch entry.ID {
-	case "gateway", "outbox":
-		valid = entry.Kind == "file" && entry.Present && entry.SQLite && !entry.Credentials
-	case "credentials":
-		valid = entry.Kind == "file" && entry.Present && !entry.SQLite && entry.Credentials
-	case "mirror-workspace", "mirror-state":
-		valid = entry.Kind == "directory" && entry.Present && !entry.SQLite && !entry.Credentials
-	case "state":
-		valid = entry.Kind == "file" && entry.SQLite == entry.Present && !entry.Credentials
-	default:
-		for _, prefix := range []string{"gateway-", "outbox-", "state-"} {
-			if strings.HasPrefix(entry.ID, prefix) {
-				suffix := strings.TrimPrefix(entry.ID, prefix)
-				valid = (suffix == "journal" || suffix == "wal" || suffix == "shm") &&
-					entry.Kind == "file" && !entry.Present && !entry.SQLite && !entry.Credentials
-				break
-			}
-		}
-	}
-	if !valid {
-		return fmt.Errorf("local restore journal component %s has invalid kind/presence/security semantics", entry.ID)
-	}
-	return nil
 }
 
 func syncLocalRestoreStage(entry localRestoreJournalEntry) error {
@@ -951,12 +535,12 @@ func removeLocalRestoreStages(journal localRestoreJournal) {
 	}
 }
 
-func localRestoreJournalPath(gatewayDatabase string) string {
-	return gatewayDatabase + ".restore-journal.json"
+func localRestoreJournalPath(serviceDatabase string) string {
+	return serviceDatabase + ".restore-journal.json"
 }
 
-func rejectPendingLocalRestore(gatewayDatabase string) error {
-	journalPath := localRestoreJournalPath(gatewayDatabase)
+func rejectPendingLocalRestore(serviceDatabase string) error {
+	journalPath := localRestoreJournalPath(serviceDatabase)
 	if _, err := os.Lstat(journalPath); err == nil {
 		return fmt.Errorf("an interrupted local restore is pending at %s; keep Human local stopped and run `human local restore --workspace . --resume`", journalPath)
 	} else if !errors.Is(err, os.ErrNotExist) {

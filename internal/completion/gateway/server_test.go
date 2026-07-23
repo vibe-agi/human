@@ -1411,6 +1411,12 @@ func TestToolCallValidationUsesNamespacePairAndSerialPolicy(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "serial") {
 		t.Fatalf("serial multi-call result = %v", err)
 	}
+	request.ToolCallPolicy = canonical.ToolCallsDisabled
+	if err := server.validateToolCalls(task, request, []completion.ToolCall{{
+		ID: "read-disabled", Name: "read",
+	}}); err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("disabled tool-call result = %v", err)
+	}
 }
 
 func TestInvalidWorkerEventIsRejectedWithoutPoisoningLiveSession(t *testing.T) {

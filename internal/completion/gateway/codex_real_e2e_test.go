@@ -17,7 +17,7 @@ import (
 	"github.com/vibe-agi/human/internal/completion/canonical"
 )
 
-const realCodexVersion = "codex-cli 0.144.5"
+const realCodexVersion = "codex-cli 0.145.0"
 
 // TestRealCodexResponsesToolLoop is an opt-in release gate for the exact
 // installed Codex CLI. It uses only command-line overrides and an empty
@@ -191,7 +191,8 @@ func TestRealCodexResponsesToolLoop(t *testing.T) {
 			}
 		default:
 		}
-		t.Fatalf("real Codex failed: %v (output bytes=%d, event types=%v)", runErr, len(output), codexEventTypes(output))
+		t.Fatalf("real Codex failed: %v (output bytes=%d, event types=%v)\n%s",
+			runErr, len(output), codexEventTypes(output), output)
 	}
 
 	var result workerResult

@@ -30,13 +30,41 @@ func (Codec) Dialect() canonical.Dialect {
 }
 
 type chatRequest struct {
-	Model             string          `json:"model"`
-	Stream            bool            `json:"stream"`
-	Messages          []chatMessage   `json:"messages"`
-	Tools             []chatTool      `json:"tools"`
-	ToolChoice        json.RawMessage `json:"tool_choice"`
-	ResponseFormat    json.RawMessage `json:"response_format"`
-	ParallelToolCalls *bool           `json:"parallel_tool_calls"`
+	Model             string            `json:"model"`
+	Stream            bool              `json:"stream"`
+	Messages          []chatMessage     `json:"messages"`
+	Tools             []chatTool        `json:"tools"`
+	ToolChoice        json.RawMessage   `json:"tool_choice"`
+	ResponseFormat    json.RawMessage   `json:"response_format"`
+	ParallelToolCalls *bool             `json:"parallel_tool_calls"`
+	FrequencyPenalty  *float64          `json:"frequency_penalty"`
+	Logprobs          *bool             `json:"logprobs"`
+	MaxCompletion     *int64            `json:"max_completion_tokens"`
+	MaxTokens         *int64            `json:"max_tokens"`
+	N                 *int64            `json:"n"`
+	PresencePenalty   *float64          `json:"presence_penalty"`
+	Seed              *int64            `json:"seed"`
+	Store             *bool             `json:"store"`
+	Temperature       *float64          `json:"temperature"`
+	TopLogprobs       *int64            `json:"top_logprobs"`
+	TopP              *float64          `json:"top_p"`
+	PromptCacheKey    string            `json:"prompt_cache_key"`
+	SafetyIdentifier  string            `json:"safety_identifier"`
+	User              string            `json:"user"`
+	Audio             json.RawMessage   `json:"audio"`
+	LogitBias         map[string]int64  `json:"logit_bias"`
+	Metadata          map[string]string `json:"metadata"`
+	Modalities        []string          `json:"modalities"`
+	PromptRetention   string            `json:"prompt_cache_retention"`
+	ReasoningEffort   string            `json:"reasoning_effort"`
+	ServiceTier       string            `json:"service_tier"`
+	Stop              json.RawMessage   `json:"stop"`
+	StreamOptions     json.RawMessage   `json:"stream_options"`
+	Verbosity         string            `json:"verbosity"`
+	FunctionCall      json.RawMessage   `json:"function_call"`
+	Functions         []chatFunction    `json:"functions"`
+	Prediction        json.RawMessage   `json:"prediction"`
+	WebSearchOptions  json.RawMessage   `json:"web_search_options"`
 }
 
 type chatMessage struct {
@@ -68,22 +96,31 @@ type chatToolCall struct {
 
 func (Codec) Decode(payload []byte) (canonical.Request, error) {
 	var wire chatRequest
-	if err := dialect.DecodeJSON(payload, &wire); err != nil {
+	if err := dialect.DecodeJSONStrict(payload, &wire); err != nil {
 		return canonical.Request{}, fmt.Errorf("decode OpenAI chat request: %w", err)
 	}
-	if err := validateToolChoice(wire.ToolChoice); err != nil {
+	if err := validateChatControls(wire); err != nil {
+		return canonical.Request{}, err
+	}
+	toolChoicePolicy, err := parseToolChoice(wire.ToolChoice)
+	if err != nil {
 		return canonical.Request{}, err
 	}
 	if err := validateResponseFormat(wire.ResponseFormat); err != nil {
 		return canonical.Request{}, err
 	}
-	if wire.ParallelToolCalls != nil && !*wire.ParallelToolCalls {
-		return canonical.Request{}, errors.New("parallel_tool_calls=false is not supported")
-	}
 	request := canonical.Request{
-		Dialect: canonical.DialectOpenAIChat,
-		Model:   wire.Model,
-		Stream:  wire.Stream,
+		Dialect:        canonical.DialectOpenAIChat,
+		Model:          wire.Model,
+		Stream:         wire.Stream,
+		Metadata:       wire.Metadata,
+		ToolCallPolicy: toolChoicePolicy,
+	}
+	if wire.ParallelToolCalls != nil && toolChoicePolicy != canonical.ToolCallsDisabled {
+		request.ToolCallPolicy = canonical.ToolCallsParallel
+		if !*wire.ParallelToolCalls {
+			request.ToolCallPolicy = canonical.ToolCallsSerial
+		}
 	}
 	for index, message := range wire.Messages {
 		role, err := parseRole(message.Role)
@@ -148,21 +185,157 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 			InputSchema: objectSchemaOrDefault(tool.Function.Parameters),
 		})
 	}
+	for index, function := range wire.Functions {
+		if strings.TrimSpace(function.Name) == "" {
+			return canonical.Request{}, fmt.Errorf("legacy function %d: name is required", index)
+		}
+		request.Tools = append(request.Tools, canonical.Tool{
+			Name: function.Name, Description: function.Description,
+			InputSchema: objectSchemaOrDefault(function.Parameters),
+		})
+	}
 	if err := request.Validate(); err != nil {
 		return canonical.Request{}, err
+	}
+	if request.ToolCallPolicy == canonical.ToolCallsDisabled {
+		request.Tools = nil
 	}
 	return request, nil
 }
 
-func validateToolChoice(raw json.RawMessage) error {
+func validateChatControls(wire chatRequest) error {
+	if wire.FrequencyPenalty != nil && (*wire.FrequencyPenalty < -2 || *wire.FrequencyPenalty > 2) {
+		return errors.New("frequency_penalty must be between -2 and 2")
+	}
+	if wire.PresencePenalty != nil && (*wire.PresencePenalty < -2 || *wire.PresencePenalty > 2) {
+		return errors.New("presence_penalty must be between -2 and 2")
+	}
+	if wire.Temperature != nil && (*wire.Temperature < 0 || *wire.Temperature > 2) {
+		return errors.New("temperature must be between 0 and 2")
+	}
+	if wire.TopP != nil && (*wire.TopP < 0 || *wire.TopP > 1) {
+		return errors.New("top_p must be between 0 and 1")
+	}
+	for _, limit := range []struct {
+		name  string
+		value *int64
+	}{
+		{name: "max_completion_tokens", value: wire.MaxCompletion},
+		{name: "max_tokens", value: wire.MaxTokens},
+	} {
+		if limit.value != nil && *limit.value < 0 {
+			return fmt.Errorf("%s must be non-negative", limit.name)
+		}
+	}
+	if wire.N != nil && *wire.N != 1 {
+		return errors.New("n must be 1; the human model returns one choice")
+	}
+	if wire.Logprobs != nil && *wire.Logprobs {
+		return errors.New("logprobs are not supported")
+	}
+	if wire.TopLogprobs != nil && *wire.TopLogprobs != 0 {
+		return errors.New("top_logprobs are not supported")
+	}
+	if wire.Store != nil && *wire.Store {
+		return errors.New("store=true is not supported")
+	}
+	if !isNullJSON(wire.Audio) || !isNullJSON(wire.Prediction) || !isNullJSON(wire.WebSearchOptions) {
+		return errors.New("audio, predicted output, and provider-hosted web search are not supported")
+	}
+	if len(wire.LogitBias) != 0 {
+		return errors.New("logit_bias is not supported")
+	}
+	if len(wire.Modalities) != 0 && (len(wire.Modalities) != 1 || wire.Modalities[0] != "text") {
+		return errors.New("only the text output modality is supported")
+	}
+	if err := validateStop(wire.Stop); err != nil {
+		return err
+	}
+	if err := validateStreamOptions(wire.StreamOptions); err != nil {
+		return err
+	}
+	if err := validateLegacyFunctionCall(wire.FunctionCall); err != nil {
+		return err
+	}
+	if wire.PromptRetention != "" && wire.PromptRetention != "in_memory" && wire.PromptRetention != "24h" {
+		return fmt.Errorf("unsupported prompt_cache_retention %q", wire.PromptRetention)
+	}
+	if wire.ReasoningEffort != "" {
+		switch wire.ReasoningEffort {
+		case "none", "minimal", "low", "medium", "high", "xhigh", "max":
+		default:
+			return fmt.Errorf("unsupported reasoning_effort %q", wire.ReasoningEffort)
+		}
+	}
+	if wire.ServiceTier != "" {
+		switch wire.ServiceTier {
+		case "auto", "default", "flex", "scale", "priority":
+		default:
+			return fmt.Errorf("unsupported service_tier %q", wire.ServiceTier)
+		}
+	}
+	if wire.Verbosity != "" && wire.Verbosity != "low" && wire.Verbosity != "medium" && wire.Verbosity != "high" {
+		return fmt.Errorf("unsupported verbosity %q", wire.Verbosity)
+	}
+	return nil
+}
+
+func validateStop(raw json.RawMessage) error {
 	if isNullJSON(raw) {
 		return nil
 	}
-	var choice string
-	if err := json.Unmarshal(raw, &choice); err != nil || choice != "auto" {
-		return errors.New("tool_choice is unsupported; omit it or use \"auto\"")
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return errors.New("stop must be a string or an array of strings")
 	}
 	return nil
+}
+
+func validateStreamOptions(raw json.RawMessage) error {
+	if isNullJSON(raw) {
+		return nil
+	}
+	var options struct {
+		IncludeObfuscation *bool `json:"include_obfuscation"`
+		IncludeUsage       *bool `json:"include_usage"`
+	}
+	if err := dialect.DecodeJSONStrict(raw, &options); err != nil {
+		return fmt.Errorf("stream_options: %w", err)
+	}
+	// Both options affect provider telemetry only. Human emits unobfuscated SSE
+	// and zero/omitted token usage, so accepting them is an explicit no-op.
+	return nil
+}
+
+func validateLegacyFunctionCall(raw json.RawMessage) error {
+	if isNullJSON(raw) {
+		return nil
+	}
+	var mode string
+	if err := json.Unmarshal(raw, &mode); err == nil && mode == "auto" {
+		return nil
+	}
+	return errors.New("legacy function_call is unsupported; omit it or use \"auto\"")
+}
+
+func parseToolChoice(raw json.RawMessage) (canonical.ToolCallPolicy, error) {
+	if isNullJSON(raw) {
+		return "", nil
+	}
+	var choice string
+	if err := json.Unmarshal(raw, &choice); err == nil {
+		switch choice {
+		case "auto":
+			return "", nil
+		case "none":
+			return canonical.ToolCallsDisabled, nil
+		}
+	}
+	return "", errors.New("tool_choice is unsupported; omit it or use \"auto\"/\"none\"")
 }
 
 func validateResponseFormat(raw json.RawMessage) error {
@@ -357,6 +530,9 @@ func (stream *stream) Encode(event completion.Event, _ ...dialect.EventSeed) ([]
 	case completion.EventToolCalls:
 		calls := make([]map[string]any, 0, len(event.ToolCalls))
 		for index, call := range event.ToolCalls {
+			if call.TextInput != nil {
+				return nil, false, fmt.Errorf("OpenAI Chat tool call %q cannot use text input", call.ID)
+			}
 			arguments, err := marshalToolArguments(call.Input)
 			if err != nil {
 				return nil, false, fmt.Errorf("marshal tool call %q arguments: %w", call.ID, err)
@@ -404,13 +580,19 @@ func marshalToolArguments(input map[string]any) ([]byte, error) {
 }
 
 func (stream *stream) chunk(delta map[string]any, finishReason *string) ([]byte, error) {
+	var usage any
+	if finishReason != nil {
+		// A human model has no provider tokenizer. Terminal chunks still expose a
+		// well-formed zero usage object so SDK callers which request stream usage
+		// receive a deterministic answer without a dialect-specific session seed.
+		usage = completionUsage()
+	}
 	payload, err := json.Marshal(map[string]any{
-		"id":      stream.responseID,
-		"object":  "chat.completion.chunk",
-		"created": stream.created,
-		"model":   stream.model,
+		"id": stream.responseID, "object": "chat.completion.chunk",
+		"created": stream.created, "model": stream.model,
+		"service_tier": nil, "system_fingerprint": nil, "usage": usage,
 		"choices": []map[string]any{{
-			"index": 0, "delta": delta, "finish_reason": finishReason,
+			"index": 0, "delta": delta, "finish_reason": finishReason, "logprobs": nil,
 		}},
 	})
 	if err != nil {

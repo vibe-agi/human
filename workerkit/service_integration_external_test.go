@@ -176,7 +176,7 @@ func TestWorkerAgainstRealServiceToolContinuation(t *testing.T) {
 	task := llm.TaskContext{
 		CapabilityTier: llm.TierWorkspace, WorkspaceKey: "workspace-a",
 		HarnessID: "harness-a", HarnessVersion: "v1", HarnessSessionID: "session-1",
-		WorkspaceRoot: "/workspace", ExecAllowed: true,
+		ExecAllowed: true,
 	}
 	request := textOnlyRequest("fix the bug")
 	request.Tools = []llm.Tool{{Name: "bash", InputSchema: []byte(`{"type":"object"}`)}}

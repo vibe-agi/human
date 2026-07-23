@@ -15,15 +15,21 @@ import (
 func (codec Codec) NewAggregate(responseID, model string, seeds ...dialect.StreamSeed) dialect.Aggregate {
 	created := codec.now().Unix()
 	parallelToolCalls := true
+	toolChoice := "auto"
 	if len(seeds) != 0 && seeds[0].CreatedAtUnix > 0 {
 		created = seeds[0].CreatedAtUnix
 	}
 	if len(seeds) != 0 && seeds[0].ToolCallPolicy == canonical.ToolCallsSerial {
 		parallelToolCalls = false
 	}
+	if len(seeds) != 0 && seeds[0].ToolCallPolicy == canonical.ToolCallsDisabled {
+		parallelToolCalls = false
+		toolChoice = "none"
+	}
 	return &aggregate{
 		responseID: responseID, model: model, created: created, now: codec.now,
 		parallelToolCalls: parallelToolCalls,
+		toolChoice:        toolChoice,
 	}
 }
 
@@ -36,6 +42,7 @@ type aggregate struct {
 	done              bool
 	text              strings.Builder
 	parallelToolCalls bool
+	toolChoice        string
 }
 
 func (aggregate *aggregate) Start() ([][]byte, error) {
@@ -79,6 +86,17 @@ func (aggregate *aggregate) Encode(event completion.Event, seeds ...dialect.Even
 			output = append(output, aggregate.messageOutput())
 		}
 		for _, call := range event.ToolCalls {
+			if call.TextInput != nil {
+				item := map[string]any{
+					"id": customItemID(call.ID), "type": "custom_tool_call", "status": "completed",
+					"call_id": call.ID, "name": call.Name, "input": *call.TextInput,
+				}
+				if call.Namespace != "" {
+					item["namespace"] = call.Namespace
+				}
+				output = append(output, item)
+				continue
+			}
 			arguments, err := marshalToolArguments(call.Input)
 			if err != nil {
 				return nil, false, fmt.Errorf("marshal tool call %q arguments: %w", call.ID, err)
@@ -123,6 +141,10 @@ func (aggregate *aggregate) Encode(event completion.Event, seeds ...dialect.Even
 }
 
 func (aggregate *aggregate) response(status string, output []any, completedAt int64) map[string]any {
+	var usage any
+	if status == "completed" {
+		usage = responsesUsage()
+	}
 	return map[string]any{
 		"id": aggregate.responseID, "object": "response", "created_at": aggregate.created,
 		"status": status, "completed_at": completedAt, "error": nil,
@@ -132,8 +154,8 @@ func (aggregate *aggregate) response(status string, output []any, completedAt in
 		"reasoning":            map[string]any{"effort": nil, "summary": nil},
 		"store":                false, "temperature": nil,
 		"text":        map[string]any{"format": map[string]string{"type": "text"}},
-		"tool_choice": "auto", "tools": []any{}, "top_p": nil,
-		"truncation": "disabled", "usage": nil, "metadata": map[string]string{},
+		"tool_choice": aggregate.toolChoice, "tools": []any{}, "top_p": nil,
+		"truncation": "disabled", "usage": usage, "metadata": map[string]string{},
 	}
 }
 

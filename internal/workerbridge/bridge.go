@@ -46,6 +46,7 @@ type Bridge struct {
 
 	assignments chan llm.WorkerAssignmentDelivery
 	rejections  chan workerkit.Rejection
+	notices     chan workerkit.Notice
 	done        chan struct{}
 	closing     chan struct{}
 
@@ -72,6 +73,7 @@ func Dial(ctx context.Context, config Config) (*Bridge, error) {
 		client:      client,
 		assignments: make(chan llm.WorkerAssignmentDelivery, 64),
 		rejections:  make(chan workerkit.Rejection, 64),
+		notices:     make(chan workerkit.Notice, 16),
 		done:        make(chan struct{}),
 		closing:     make(chan struct{}),
 		byKey:       make(map[string]completion.Assignment),
@@ -98,7 +100,10 @@ func (bridge *Bridge) Close() error {
 
 func (bridge *Bridge) Assignments() <-chan llm.WorkerAssignmentDelivery { return bridge.assignments }
 func (bridge *Bridge) Rejections() <-chan workerkit.Rejection           { return bridge.rejections }
+func (bridge *Bridge) Notices() <-chan workerkit.Notice                 { return bridge.notices }
 func (bridge *Bridge) Done() <-chan struct{}                            { return bridge.done }
+
+var _ workerkit.NoticeSource = (*Bridge)(nil)
 
 func (bridge *Bridge) Err() error {
 	bridge.mu.Lock()
@@ -139,10 +144,17 @@ func (bridge *Bridge) pump() {
 			}
 		case message.OutboxQuarantine != nil:
 			// A durable outbox row was quarantined: an event the human believed
-			// sent will never leave. Record it so Err() surfaces the fault rather
-			// than dropping it silently. A first-class human-visible alert needs a
-			// workerkit Notifier port (tracked in docs/11).
+			// sent will never leave. Surface it as a human-visible alert (and
+			// keep it in Err() for logs).
 			bridge.recordErr(fmt.Errorf("workerbridge: worker outbox quarantined a durable event; the corresponding reply will not be delivered"))
+			select {
+			case bridge.notices <- workerkit.Notice{
+				Code:    "outbox_quarantine",
+				Message: "A reply could not be delivered (worker outbox quarantined a corrupt event). Re-send it.",
+			}:
+			case <-bridge.closing:
+				return
+			}
 		case message.Err != nil:
 			bridge.recordErr(message.Err)
 		}
@@ -175,6 +187,7 @@ func (bridge *Bridge) SendEvent(ctx context.Context, delivery llm.WorkerEventDel
 	for _, call := range delivery.Event.ToolCalls {
 		event.ToolCalls = append(event.ToolCalls, completion.ToolCall{
 			ID: call.ID, Namespace: call.Namespace, Name: call.Name, Input: call.Input,
+			TextInput: call.TextInput,
 		})
 	}
 	if err := bridge.client.SendEvent(ctx, assignment, event); err != nil {
@@ -250,7 +263,6 @@ func bridgeAssignment(legacy completion.Assignment) (llm.WorkerAssignmentDeliver
 				HarnessID:        legacy.HarnessID,
 				HarnessVersion:   legacy.HarnessVersion,
 				HarnessSessionID: legacy.HarnessSessionID,
-				WorkspaceRoot:    legacy.Root,
 				ExecAllowed:      legacy.ExecAllowed,
 			},
 			Request: request,
@@ -270,6 +282,7 @@ func (bridge *Bridge) bridgeRejection(message workerclient.Message) (workerkit.R
 		for _, call := range message.RejectedEvent.ToolCalls {
 			event.ToolCalls = append(event.ToolCalls, llm.ToolCall{
 				ID: call.ID, Namespace: call.Namespace, Name: call.Name, Input: call.Input,
+				TextInput: call.TextInput,
 			})
 		}
 	} else {

@@ -206,7 +206,7 @@ func (session EncoderSession) Validate() error {
 		return fmt.Errorf("%w: session seed is too large", ErrInvalidCodecContract)
 	}
 	switch session.Seed.ToolCallPolicy {
-	case "", ToolCallsSerial, ToolCallsParallel:
+	case "", ToolCallsDisabled, ToolCallsSerial, ToolCallsParallel:
 	default:
 		return fmt.Errorf("%w: unsupported tool-call policy %q", ErrInvalidCodecContract, session.Seed.ToolCallPolicy)
 	}

@@ -19,6 +19,7 @@ type fakeWire struct {
 	mu           sync.Mutex
 	assignments  chan llm.WorkerAssignmentDelivery
 	rejections   chan workerkit.Rejection
+	notices      chan workerkit.Notice
 	done         chan struct{}
 	sent         []llm.WorkerEventDelivery
 	confirmedA   []llm.WorkerDeliveryID
@@ -31,12 +32,14 @@ func newFakeWire() *fakeWire {
 	return &fakeWire{
 		assignments: make(chan llm.WorkerAssignmentDelivery, 64),
 		rejections:  make(chan workerkit.Rejection, 64),
+		notices:     make(chan workerkit.Notice, 64),
 		done:        make(chan struct{}),
 	}
 }
 
 func (wire *fakeWire) Assignments() <-chan llm.WorkerAssignmentDelivery { return wire.assignments }
 func (wire *fakeWire) Rejections() <-chan workerkit.Rejection           { return wire.rejections }
+func (wire *fakeWire) Notices() <-chan workerkit.Notice                 { return wire.notices }
 func (wire *fakeWire) Done() <-chan struct{}                            { return wire.done }
 func (wire *fakeWire) Err() error                                       { return nil }
 
@@ -103,7 +106,7 @@ func testAssignment(task, delivery string, tier llm.CapabilityTier, request llm.
 		taskContext = llm.TaskContext{
 			TaskID: llm.TaskID(task), CapabilityTier: tier,
 			WorkspaceKey: "workspace-a", HarnessID: "harness-a", HarnessVersion: "v1",
-			HarnessSessionID: "session-a", WorkspaceRoot: "/workspace",
+			HarnessSessionID: "session-a",
 		}
 	}
 	return llm.WorkerAssignmentDelivery{
@@ -488,5 +491,93 @@ func TestWorkerRejectionRecordedBeforeConfirm(t *testing.T) {
 	store.mu.Unlock()
 	if saves == 0 {
 		t.Fatal("rejection was confirmed without persisting the conversation")
+	}
+}
+
+func TestWorkerExpiryNoticeTargetsExactInboxAndConversation(t *testing.T) {
+	wire := newFakeWire()
+	store, _ := workerkit.NewMemoryStateStore()
+	worker := openTestWorker(t, wire, store)
+
+	old := testAssignment("task-1", "delivery-old", llm.TierChat, textOnlyRequest("old"))
+	newer := testAssignment("task-1", "delivery-new", llm.TierChat, textOnlyRequest("new"))
+	wire.assignments <- old
+	wire.assignments <- newer
+	waitFor(t, worker, func(state workerkit.State) bool { return len(state.Inbox) == 2 })
+	wire.notices <- workerkit.Notice{
+		Code: "request_expired", Message: "expired", Caller: "caller-a", TaskID: "task-1",
+		RequestID: old.Assignment.Identity.RequestID,
+	}
+	state := waitFor(t, worker, func(state workerkit.State) bool { return len(state.Inbox) == 1 })
+	if state.Inbox[0].Delivery != newer.ID {
+		t.Fatalf("expiry removed the wrong inbox item: %+v", state.Inbox)
+	}
+
+	key, err := worker.Accept(t.Context(), newer.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A stale exact-request notice must not terminalize the newer assignment.
+	wire.notices <- workerkit.Notice{
+		Code: "request_expired", Message: "old expired", Caller: key.Caller, TaskID: key.TaskID,
+		RequestID: old.Assignment.Identity.RequestID,
+	}
+	state = waitFor(t, worker, func(state workerkit.State) bool { return len(state.Alerts) >= 2 })
+	if phase := state.Conversations[0].Phase; phase != workerkit.PhaseActive {
+		t.Fatalf("stale expiry changed newer phase to %q", phase)
+	}
+	// The exact current notice closes the local view because the core decision
+	// was already durable before this advisory signal.
+	wire.notices <- workerkit.Notice{
+		Code: "request_expired", Message: "current expired", Caller: key.Caller, TaskID: key.TaskID,
+		RequestID: newer.Assignment.Identity.RequestID,
+	}
+	state = waitFor(t, worker, func(state workerkit.State) bool {
+		return len(state.Conversations) == 1 && state.Conversations[0].Phase == workerkit.PhaseTerminal
+	})
+	transcript := state.Conversations[0].Transcript
+	if transcript[len(transcript)-1].Code != "request_expired" {
+		t.Fatalf("expiry transcript = %+v", transcript)
+	}
+}
+
+func TestWorkerStaleRejectionDoesNotMutateNewLease(t *testing.T) {
+	wire := newFakeWire()
+	store, _ := workerkit.NewMemoryStateStore()
+	worker := openTestWorker(t, wire, store)
+
+	first := testAssignment("task-1", "delivery-first", llm.TierWorkspace, textOnlyRequest("first"))
+	wire.assignments <- first
+	waitFor(t, worker, func(state workerkit.State) bool { return len(state.Inbox) == 1 })
+	key, err := worker.Accept(t.Context(), first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Clarify(t.Context(), key, "need input"); err != nil {
+		t.Fatal(err)
+	}
+	oldEvent := wire.sentEvents()[0]
+	continuation := testAssignment("task-1", "delivery-second", llm.TierWorkspace, textOnlyRequest("second"))
+	wire.assignments <- continuation
+	waitFor(t, worker, func(state workerkit.State) bool {
+		return state.Conversations[0].Assignment.ID == continuation.ID &&
+			state.Conversations[0].Phase == workerkit.PhaseActive
+	})
+	wire.rejections <- workerkit.Rejection{
+		Delivery: oldEvent,
+		Receipt: llm.WorkerEventReceipt{
+			Delivery: oldEvent.ID, EventID: oldEvent.Event.ID, Decision: llm.WorkerEventNACK,
+			Code: llm.WorkerRejectStaleLease, Message: "old lease",
+		},
+	}
+	state := waitFor(t, worker, func(state workerkit.State) bool {
+		wire.mu.Lock()
+		confirmed := len(wire.confirmedR) != 0 && wire.confirmedR[len(wire.confirmedR)-1] == oldEvent.ID
+		wire.mu.Unlock()
+		return confirmed
+	})
+	conversation := state.Conversations[0]
+	if conversation.Assignment.ID != continuation.ID || conversation.Phase != workerkit.PhaseActive {
+		t.Fatalf("stale rejection mutated newer assignment: %+v", conversation)
 	}
 }

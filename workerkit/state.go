@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/vibe-agi/human/llm"
 )
@@ -87,9 +89,17 @@ type Conversation struct {
 	ParkedCalls []llm.ToolCall               `json:"parked_calls,omitempty"`
 	// Delivery is the in-flight reviewed batch, settled when every call of the
 	// batch returns a successful result.
-	Delivery  *PendingDelivery `json:"delivery,omitempty"`
-	Draft     string           `json:"draft,omitempty"`
-	UpdatedAt time.Time        `json:"updated_at"`
+	Delivery *PendingDelivery `json:"delivery,omitempty"`
+	Draft    string           `json:"draft,omitempty"`
+	// HumanWorkspace is this conversation's Human-host working directory. It
+	// never describes or exposes the Agent user's filesystem.
+	HumanWorkspace *HumanWorkspace `json:"human_workspace,omitempty"`
+	// CallerGone is an advisory, persisted operator-safety flag. It permits a
+	// locally active conversation to be abandoned only after the transport has
+	// identified that exact task's caller as detached. Awaiting-caller/results
+	// conversations remain abandonable without it.
+	CallerGone bool      `json:"caller_gone,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // StateStore persists accepted conversations across worker restarts. It is
@@ -112,6 +122,16 @@ type StateStore interface {
 	ListConversations(context.Context) ([]Conversation, error)
 }
 
+// AlertStore is the optional durable extension for human-visible notices.
+// Keeping it separate preserves the small StateStore contract for custom
+// embedders, while the reference memory and SQLite implementations provide it
+// so production alerts survive process restart and dismissal is durable.
+type AlertStore interface {
+	SaveAlert(context.Context, Notice) error
+	DeleteAlert(context.Context, uint64) error
+	ListAlerts(context.Context) ([]Notice, error)
+}
+
 // InboxItem is one assignment awaiting an accept/reject decision. It is not
 // persisted by workerkit; the transport replays unconfirmed assignments.
 type InboxItem struct {
@@ -126,6 +146,43 @@ type InboxItem struct {
 	ReceivedAt time.Time
 }
 
+// Notice is a human-visible alert (e.g. a quarantined outbox row whose reply
+// will never be delivered). Seq is stable for dismissal.
+type Notice struct {
+	Seq       uint64       `json:"seq"`
+	At        time.Time    `json:"at"`
+	Code      string       `json:"code"`
+	Message   string       `json:"message"`
+	Caller    llm.CallerID `json:"caller,omitempty"`
+	TaskID    llm.TaskID   `json:"task_id,omitempty"`
+	RequestID string       `json:"request_id,omitempty"`
+}
+
+// Validate checks the portable human-alert contract implemented by optional
+// AlertStores. A notice may be global or identify one exact caller task; a
+// half-populated identity is rejected so safety actions can never target an
+// ambiguous conversation.
+func (notice Notice) Validate() error {
+	if notice.Seq == 0 || notice.At.IsZero() {
+		return fmt.Errorf("%w: alert sequence and timestamp are required", ErrInvalidCommand)
+	}
+	code := strings.TrimSpace(notice.Code)
+	if code == "" || code != notice.Code || len(code) > 128 || !utf8.ValidString(code) {
+		return fmt.Errorf("%w: alert code is invalid", ErrInvalidCommand)
+	}
+	message := strings.TrimSpace(notice.Message)
+	if message == "" || len(notice.Message) > maxTranscriptTextBytes || !utf8.ValidString(notice.Message) {
+		return fmt.Errorf("%w: alert message is invalid", ErrInvalidCommand)
+	}
+	if (notice.Caller == "") != (notice.TaskID == "") {
+		return fmt.Errorf("%w: alert caller and task must be supplied together", ErrInvalidCommand)
+	}
+	if notice.RequestID != "" && (notice.Caller == "" || strings.TrimSpace(notice.RequestID) != notice.RequestID) {
+		return fmt.Errorf("%w: alert request id requires an exact caller task", ErrInvalidCommand)
+	}
+	return nil
+}
+
 // State is a coherent snapshot for UIs. All values are deep copies; mutating
 // them never affects the worker.
 type State struct {
@@ -134,6 +191,8 @@ type State struct {
 	// Review is the latest complete Live Workspace review, or nil without a
 	// configured Mirror (or before its first publication).
 	Review *Review
+	// Alerts are undismissed human-visible notices, oldest first.
+	Alerts []Notice
 }
 
 func cloneConversation(conversation Conversation) Conversation {

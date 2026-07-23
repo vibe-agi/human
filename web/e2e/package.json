@@ -3,6 +3,9 @@
   "private": true,
   "type": "module",
   "description": "Browser driver for the Human web real door; launched by the gated Go test, not standalone.",
+  "scripts": {
+    "visual-smoke": "node visual-smoke.mjs"
+  },
   "dependencies": {
     "playwright": "^1.55.0"
   }

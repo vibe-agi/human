@@ -8,6 +8,7 @@ import (
 
 	"github.com/vibe-agi/human/internal/completion"
 	"github.com/vibe-agi/human/internal/completion/canonical"
+	"github.com/vibe-agi/human/internal/completion/dialect"
 )
 
 func TestDecodeResponsesRequest(t *testing.T) {
@@ -131,7 +132,7 @@ func TestDecodeResponsesRejectsUnsupportedShapes(t *testing.T) {
 		},
 		{
 			name:    "unknown top level control",
-			payload: `{"model":"m","stream":true,"input":"hello","temperature":0.1}`,
+			payload: `{"model":"m","stream":true,"input":"hello","future_control":true}`,
 		},
 		{
 			name:    "previous response",
@@ -162,6 +163,29 @@ func TestDecodeResponsesAllowsDefaultOutputControls(t *testing.T) {
 }`))
 	if err != nil {
 		t.Fatalf("Decode() rejected supported defaults: %v", err)
+	}
+}
+
+func TestDecodeResponsesDisablesTools(t *testing.T) {
+	t.Parallel()
+	request, err := New().Decode([]byte(`{
+	  "model":"m","stream":true,"input":"hello","tool_choice":"none",
+	  "tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]
+	}`))
+	if err != nil || request.ToolCallPolicy != canonical.ToolCallsDisabled || len(request.Tools) != 0 {
+		t.Fatalf("disabled Responses tools = %q, tools=%+v, %v", request.ToolCallPolicy, request.Tools, err)
+	}
+	stream := New().NewStream("resp-disabled", "m", dialect.StreamSeed{
+		CreatedAtUnix: 1, ToolCallPolicy: canonical.ToolCallsDisabled,
+	})
+	frames, err := stream.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := assertEvent(t, frames[0], "response.created", 0)
+	response := created["response"].(map[string]any)
+	if response["tool_choice"] != "none" || response["parallel_tool_calls"] != false {
+		t.Fatalf("disabled Responses projection = %+v", response)
 	}
 }
 

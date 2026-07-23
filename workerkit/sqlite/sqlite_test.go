@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/humantest"
@@ -70,6 +71,56 @@ func TestStateStoreReleaseAndReopenKeepsConversations(t *testing.T) {
 	if len(listed) != 1 || listed[0].Key != saved.Key ||
 		listed[0].Phase != workerkit.PhaseAwaitingResults || listed[0].Draft != "survives restart" {
 		t.Fatalf("reopened conversations = %+v", listed)
+	}
+}
+
+func TestStateStoreReleaseAndReopenKeepsAlerts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := statesqlite.Open(t.Context(), statesqlite.Config{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := first.Value()
+	if err != nil {
+		t.Fatal(err)
+	}
+	alerts, ok := store.(workerkit.AlertStore)
+	if !ok {
+		t.Fatal("SQLite StateStore does not implement AlertStore")
+	}
+	want := workerkit.Notice{
+		Seq: 7, At: time.Now().UTC(), Code: "caller_gone", Message: "caller disconnected",
+		Caller: "caller-a", TaskID: "task-1",
+	}
+	if err := alerts.SaveAlert(t.Context(), want); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := statesqlite.Open(t.Context(), statesqlite.Config{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Release(context.Background()) })
+	reopened, err := second.Value()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reopened.(workerkit.AlertStore).ListAlerts(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("reopened alerts = %+v, want %+v", got, want)
+	}
+	if err := reopened.(workerkit.AlertStore).DeleteAlert(t.Context(), want.Seq); err != nil {
+		t.Fatal(err)
+	}
+	got, err = reopened.(workerkit.AlertStore).ListAlerts(t.Context())
+	if err != nil || len(got) != 0 {
+		t.Fatalf("alerts after durable dismissal = %+v, err=%v", got, err)
 	}
 }
 

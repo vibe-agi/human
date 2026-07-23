@@ -135,7 +135,6 @@ func taskIdentityEqual(left, right llm.StoreTaskRecord) bool {
 		left.HarnessID == right.HarnessID &&
 		left.HarnessVersion == right.HarnessVersion &&
 		left.HarnessSessionID == right.HarnessSessionID &&
-		left.WorkspaceRoot == right.WorkspaceRoot &&
 		left.ExecAllowed == right.ExecAllowed &&
 		left.CreatedAt.Equal(right.CreatedAt)
 }

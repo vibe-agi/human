@@ -49,6 +49,7 @@ type Block struct {
 	ToolNamespace string         `json:"tool_namespace,omitempty"`
 	ToolName      string         `json:"tool_name,omitempty"`
 	Input         map[string]any `json:"input,omitempty"`
+	TextInput     *string        `json:"text_input,omitempty"`
 	Output        any            `json:"output,omitempty"`
 	IsError       bool           `json:"is_error,omitempty"`
 }
@@ -58,11 +59,20 @@ type Message struct {
 	Blocks []Block `json:"blocks"`
 }
 
+type ToolInputKind string
+
+const (
+	ToolInputJSON ToolInputKind = ""
+	ToolInputText ToolInputKind = "text"
+)
+
 type Tool struct {
 	Namespace   string          `json:"namespace,omitempty"`
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema"`
+	InputKind   ToolInputKind   `json:"input_kind,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+	InputFormat json.RawMessage `json:"input_format,omitempty"`
 }
 
 // ToolCallPolicy is the caller's explicit scheduling contract for one model
@@ -70,6 +80,7 @@ type Tool struct {
 type ToolCallPolicy string
 
 const (
+	ToolCallsDisabled ToolCallPolicy = "disabled"
 	ToolCallsSerial   ToolCallPolicy = "serial"
 	ToolCallsParallel ToolCallPolicy = "parallel"
 )
@@ -116,7 +127,7 @@ func (request Request) Validate() error {
 		return errors.New("at least one message is required")
 	}
 	switch request.ToolCallPolicy {
-	case "", ToolCallsSerial, ToolCallsParallel:
+	case "", ToolCallsDisabled, ToolCallsSerial, ToolCallsParallel:
 	default:
 		return fmt.Errorf("unsupported tool-call policy %q", request.ToolCallPolicy)
 	}
@@ -131,8 +142,23 @@ func (request Request) Validate() error {
 			return fmt.Errorf("duplicate tool %q", QualifiedToolName(tool.Namespace, tool.Name))
 		}
 		toolNames[identity] = struct{}{}
-		if !json.Valid(tool.InputSchema) {
-			return fmt.Errorf("tool %q has invalid input schema", QualifiedToolName(tool.Namespace, tool.Name))
+		switch tool.InputKind {
+		case ToolInputJSON:
+			if !json.Valid(tool.InputSchema) {
+				return fmt.Errorf("tool %q has invalid input schema", QualifiedToolName(tool.Namespace, tool.Name))
+			}
+			if len(tool.InputFormat) != 0 {
+				return fmt.Errorf("JSON-input tool %q has a text input format", QualifiedToolName(tool.Namespace, tool.Name))
+			}
+		case ToolInputText:
+			if len(tool.InputSchema) != 0 {
+				return fmt.Errorf("text-input tool %q has an input schema", QualifiedToolName(tool.Namespace, tool.Name))
+			}
+			if len(tool.InputFormat) != 0 && !json.Valid(tool.InputFormat) {
+				return fmt.Errorf("text-input tool %q has invalid input format", QualifiedToolName(tool.Namespace, tool.Name))
+			}
+		default:
+			return fmt.Errorf("tool %q has unsupported input kind %q", QualifiedToolName(tool.Namespace, tool.Name), tool.InputKind)
 		}
 	}
 	for index, capability := range request.HostedCapabilities {
@@ -186,6 +212,9 @@ func (block Block) Validate() error {
 		}
 		if err := ValidateToolIdentity(block.ToolNamespace, block.ToolName); err != nil {
 			return fmt.Errorf("invalid tool use identity: %w", err)
+		}
+		if block.Input != nil && block.TextInput != nil {
+			return errors.New("tool use cannot have both JSON and text input")
 		}
 	case BlockToolResult:
 		if block.ToolCallID == "" {

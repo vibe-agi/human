@@ -2,7 +2,7 @@
 
 [02](02-gateway.md) 讲"为什么"，本篇是"照着实现什么"——M0/M1 的精确字段、状态、时序。本文定义身份、adapter、循环、拒单与 read/search 的实现边界，02 相关节引用此处为准。
 
-> **当前落点**：循环状态机、Live Workspace 与 Remote tools 核心已在 `internal/completion/`、caller shim、SQLite store、gateway、worker 协议和 TUI 中实现；仓库内覆盖重复 POST/tool-call、三方言聚合/重放、fsnotify/auto-send、持久多 continuation 与崩溃恢复。OpenCode 1.17.18 的 exact Workspace 已用真实 CLI 跑通 `空 Human mirror → :pull 精确字节 → native edit/result → bash + todowrite → final → 同 session terminal 后下一 user turn 新 task`。故障矩阵覆盖 caller 同 key 5 次断流、worker 冷启动/反复抖动/半开、在线 worker 遭 gateway/SQLite 重启及三方重叠掉线；Workspace 正式测试又覆盖离线原生 edit、gateway/SQLite 与 worker outbox 重启、并发重放、result continuation 和 save-ahead diff。Codex 0.144.4 已完成响应前重试黑盒，0.144.5 已真实完成 Responses Basic 的串行函数调用/result/final；Claude 只有本机契约测试。Codex Workspace/Tasks/Live Workspace 与 Claude 真实 harness 仍不能宣称支持。
+> **当前落点**：循环状态机、Live Workspace 与 Remote tools 核心已在公共 `llm`/`workerkit` 栈及远程 gateway 产品中实现；仓库内覆盖重复 POST/tool-call、三方言聚合/重放、fsnotify/auto-send、持久多 continuation 与崩溃恢复。OpenCode 1.17.18 的 exact Workspace 已用真实 CLI 跑通 `空 Human mirror → :pull 精确字节 → native edit/result → bash + todowrite → final → 同 session terminal 后下一 user turn 新 task`。故障矩阵覆盖 caller 同 key 5 次断流、worker 冷启动/反复抖动/半开、在线 worker 遭 gateway/SQLite 重启及三方重叠掉线；Workspace 正式测试又覆盖离线原生 edit、gateway/SQLite 与 worker outbox 重启、并发重放、result continuation 和 save-ahead diff。Claude Code 2.1.217 已完成 Messages `Bash` 成功/失败、`Write`/`Edit` Live Workspace，以及 `TaskCreate → TaskUpdate → TaskList` Web 闭环。Codex 0.145.0 已完成 Responses 命令/result/final、Plan、partial SSE 恢复，以及精确 custom freeform `apply_patch` 的 Workspace create/modify；profile 由请求中的实际 tool/grammar 判定，不凭版本号伪造能力。
 
 ## 1. 身份：三个正交概念，不可混用
 
@@ -14,19 +14,31 @@
 | `task_id` | 一次串行委托及其 clarification/tool 循环、lease（粘接单人）、幂等 | 稳定（一次委托一个） | shim 由受信配置显式提供；OpenCode 1.17.18 exact profile 先派生 candidate，再优先续用同 harness session 的唯一非终态 task |
 | `ui_conversation_group` | 仅 TUI 显示分组 | 可错、可变 | 历史指纹启发式（G-05） |
 
-在鉴权得到的 `caller_id` 命名空间内，**正确性只依赖前两个**；完整边界写作 `caller_id/workspace_key/task_id`。指纹只影响 TUI 卡片聚合，错了不影响状态/镜像/baseline。镜像目录按 `caller_id/workspace_key` 建（不是 `<conv>`）。
+在鉴权得到的 `caller_id` 命名空间内，**正确性只依赖前两个**；完整边界写作
+`caller_id/workspace_key/task_id`。Human 文件目录不是 Agent 路径坐标：默认目录由
+`caller/workspace/harness/version/session` 派生稳定 `session-<hash>`，也可由 Human
+在 Web 中绑定到自己的已有 repo。
 
 ## 2. 接入三档要求的字段
 
 | 档 | 必需字段 | 边界保证 |
 |---|---|---|
 | **Basic** | base_url + token | 文本 + 本次请求明确声明的原生 tools；真实 Agent 执行；每次 completion 独立，无需 adapter/shim |
-| **Workspace** | exact `harness_id/version` + `workspace_key` + 根 `R` + 版本化 session/task 身份；每项操作仍须由请求实际声明对应原生工具 | Live mirror 保存/核对、原生 tool call、result reconcile 与跨 completion continuation；不要求 snapshot/完整镜像 |
+| **Workspace** | exact `harness_id/version` + `workspace_key` + 版本化 session/task 身份；每项操作仍须由请求实际声明对应原生工具 | Human 每会话工作目录、项目相对原生 tool call、result reconcile 与跨 completion continuation；不要求两边挂载同一路径 |
 | **Remote tools** | stable caller/workspace/task/key + `human-shim@1` 或等价边界 | 持久执行 ledger、强 CAS、realpath/symlink 与执行围栏；该 profile 同样可承载 Live mirror |
 
 增强字段来自**版本化契约**，不是通用推断。缺稳定字段或未知 profile 时安全降级 Basic：保留本次声明的原生 tools，但清空 caller 提供的稳定 task/workspace，不承诺跨回合粘连、ledger/CAS 或精确幂等。adapter 不是全局工具 allowlist：它映射登记工具的语义并对 exact 增强档的 native tools 做授权分类。请求声明的其它工具仍可走通用入口，但不能自动获得镜像/path/result codec；mapped/已审 standard 默认可用，privileged 或未分类 custom/MCP 工具须显式 active-capability opt-in。精确 OpenCode 的无工具标题/摘要请求是版本化的辅助调用例外，会清空 task/workspace、隔离为 Chat，同时保留 exact request-level retry key。`human-shim@1` 从受信启动配置注入 caller/workspace/task/key，并把 caller 声明与 token principal 比对；错配返 `403`，缺声明返 `428`。
 
-`opencode@1.17.18` 的静态 provider headers 必须给出 tier、`workspace_key`、harness ID/version 与**绝对** caller root；OpenCode 自己发送单一非空 `X-Session-Id`。gateway 以 `session_id + model + system + canonical messages through latest user` 先派生 candidate `opencode-task:v1:<sha256>`，再查 `(caller_id, workspace_key, harness_id/version, harness_session_id)`：存在唯一非终态 task 时复用它并覆盖 candidate。数据库唯一部分索引保证该 affinity 最多一个非终态 task。故 clarification → followup → tool call → result continuation 始终同 task；只有现有 task terminal 后，下一顶层 user 才采用新 candidate。若存在 `X-Session-Affinity`，必须与 session ID 完全一致。UA、版本或身份不匹配就 fail-closed/降级，不套用到其它 OpenCode 版本。
+`opencode@1.17.18` 自己发送单一非空 `X-Session-Id`，本地 exact harness resolver
+把认证 caller、Human 配置的逻辑 `workspace_key` 与该 session 组成 affinity。通用
+`HeaderResolver` 部署则要求 caller 显式给出 tier、`workspace_key`、harness ID/version
+与 session，但不接受 Agent 绝对路径。gateway 以
+`session_id + model + system + canonical messages through latest user` 先派生 candidate
+`opencode-task:v1:<sha256>`，再查
+`(caller_id, workspace_key, harness_id/version, harness_session_id)`：存在唯一非终态 task
+时复用它。Human 交付的文件参数始终是项目相对路径，由 OpenCode 在它自己的 cwd 解析。
+若存在 `X-Session-Affinity`，必须与 session ID 完全一致；UA、版本或身份不匹配就
+fail-closed/降级，不套用到其它 OpenCode 版本。
 
 ## 3. adapter 握手
 
@@ -41,7 +53,7 @@ tools:
   delete/rename: {name, args}
   exec:    {name, cwd 语义, 超时, 审批, 输出/错误格式}
 concurrency: 是否支持并行 tool_calls
-path_style: workspace_virtual | absolute
+path_style: project_relative
 result_codec: 版本化结果成功/失败与对账规则
 session_identity: task 来源与一致性约束
 error_shape: 工具失败的回传结构（供对账区分成功/失败/部分）
@@ -98,8 +110,8 @@ admitted ─→ leased ─→ awaiting_human ─→ responded
 
 Basic 的所有工具都来自客户侧 Agent 本次请求的明确声明，Human 侧绝不执行。exact Workspace/Remote tools 还要求 privileged/unclassified 工具取得 active-capability opt-in（现由 `X-Human-Allow-Exec: true` 表达），随后仍由客户 Agent 做自身权限裁决。TUI 在此能力集合上提供三层输入：
 
-1. **Tasks 全量列表编辑器**：仅完整匹配 `todowrite.todos[{content,status,priority}]`、`TodoWrite.todos[{content,status,activeForm}]` 或 `update_plan.plan[{step,status}]` 时启用；从历史 tool call/result 按 `tool_call_id` 恢复，编辑后调用原工具同步。它只表示 caller Agent 的计划，与 Inbox 分离。OpenCode 1.17.18 已有真实 fixture/闭环；Claude/Codex 只有本机契约适配和仓库测试，尚未真实 harness e2e。
-2. **Command 编辑器**：仅 caller 声明兼容 `bash`，或 Remote adapter 对当前任务授权 exec 时启用；输入命令后只生成 tool call，由客户 Agent 执行，绝不在 Human 本地执行。精确 OpenCode Workspace 的 `:pull relative/path` 会生成 `opencode debug file read --pure` 调用，要求 exec opt-in 和 Agent 权限，严格解码 base64 后只 hydrate 该文件；空文件合法，前导 `-` 路径以 `./` 消歧，超出统一 `8 MiB` wire budget 时 fail-closed。
+1. **Tasks/Plan 编辑器**：Web 的 `PlanProfileResolver` 是可替换 SPI；基础实现只在 exact harness 版本和去掉 description/title 后完全一致的行为 schema 上启用。OpenCode `todowrite.todos[{content,status,priority}]` 与 Codex `update_plan.plan[{step,status}]` 使用全量列表；Claude 2.1.217 使用 `TaskCreate`/`TaskUpdate`/`TaskList` 的逐任务生命周期，并从匹配 `tool_call_id` 的 result 恢复 task ID。三端均已由真实 CLI + Playwright 从正式面板完成 pending→in_progress→completed continuation；schema 漂移时专用面板 fail closed，只保留高级 declared-tool 入口。它只表示 caller Agent 的计划，与 Inbox 分离。
+2. **Command 编辑器**：Web 的 `CommandProfileResolver` 是可替换 SPI；基础实现仅在 exact harness/version 和完整 behavioral schema 匹配时映射 Claude Code 2.1.217 `Bash`、OpenCode 1.17.18 `bash`、Codex 0.145.0 `exec_command`。三端成功与非零失败恢复都已由真实 CLI + Playwright 从正式面板跑通；schema 漂移时专用面板 fail closed。输入命令后只生成 tool call，由客户 Agent 在自己的当前 workspace 执行，绝不在 Human 本地执行，也不拿可能更宽的路由根覆写 cwd。精确 OpenCode Workspace 的 `:pull relative/path` 是另一条受控命令能力：它生成 `opencode debug file read --pure` 调用，要求 exec opt-in 和 Agent 权限，严格解码 base64 后只 hydrate 该文件；空文件合法，前导 `-` 路径以 `./` 消歧，超出统一 `8 MiB` wire budget 时 fail-closed。
 3. **高级 fallback**：其它声明工具按 `t` 输入 `<tool-name> <JSON object>`，一行一个；schema 不匹配时禁用专用编辑器，不猜语义，也不授予声明之外的能力。
 
 因此 Basic 的 read/search 直接使用客户侧 Agent 本次声明的原生工具；Agent 执行并在下一 completion 回传 result。Live Workspace 还会让 mirror watcher 在保存后 fresh review，再按 exact profile 生成原生 edit/write：默认人工 preview/confirm；显式 auto-send 仅自动发送 change-level `allow` 的改动，安全 warning/block 或冲突停住。OpenCode 的“无 CAS”adapter warning 会展示但不阻断显式 auto-send，最终权限仍在客户 Agent。
@@ -140,7 +152,7 @@ OpenCode 1.17.18 的真实 CLI gate 已从空 Human mirror 生成 `:pull native.
 
 上表的恢复有三个边界：
 
-1. caller 精确续传需要同一 key 与同一 canonical 摘要。默认显式提供；严格匹配的 Codex Responses turn 与 OpenCode 1.17.18 Workspace turn 可分别派生。OpenCode Basic/Chat 与其它未识别无 key 请求仍是新请求。Codex 0.144.4 黑盒只证明响应前 retry 身份；0.144.5 真实 gate 已证明 Responses Basic 的串行函数调用/result/final，两者都不能代替 partial SSE 恢复或 Codex Workspace profile。
+1. caller 精确续传需要同一 key 与同一 canonical 摘要。默认显式提供；严格匹配的 Codex Responses turn 与 OpenCode 1.17.18 Workspace turn 可分别派生。OpenCode Basic/Chat 与其它未识别无 key 请求仍是新请求。Codex 0.144.4 黑盒只证明响应前 retry 身份；0.145.0 真实公共栈 gate 已分别证明 Responses RemoteTools 串行函数调用/result/final、完整 progress 帧后断 SSE 的同 durable turn 恢复，以及 exact `apply_patch` Workspace 正常路径。后者仍不能代替 Workspace 故障恢复。
 2. 恢复只对 `max_pending` 剩余窗口内的请求成立。超过后原请求已 `expired`；迟到 worker 事件可被持久拒绝并恢复为草稿，但不会使旧请求复活。
 3. worker outbox 保护已发送事件；默认 worker state DB 另持久化 Reply/Command/Tasks/Advanced tool-call 草稿、rejected drafts 与最多 32 个 continuation。mirror preview 等未列入 state DB 的瞬时 UI 状态仍不承诺恢复。
 
@@ -150,6 +162,6 @@ OpenCode 1.17.18 的真实 CLI gate 已从空 Human mirror 生成 `:pull native.
 
 **Codex 重试黑盒已验证（狭范围）**：Codex CLI 0.144.4 在捕获端返 500 与读完 POST 后断 TCP 时均显示 `Reconnecting 1/5…5/5`，两组捕获端各收到 30 个 POST；UA 为 `codex_exec/<version>`，没有显式 key。metadata 中 `turn_id` 在同一用户 turn 的 A/B/B/B 工具循环不变，下一用户 turn 更换。这支持当前 profile 的派生 key 决策，不证明 Codex 已能通过 gateway 完成部分 SSE 恢复或工具闭环。
 
-**Codex Responses Basic 工具闭环已验证（狭范围）**：Codex CLI 0.144.5 在隔离空 `CODEX_HOME` 中实收串行策略、普通 `exec_command`、namespace functions 与 hosted `web_search`；Human 发出命令后 CLI 实际执行，并用相同 `call_id` 回传 result，再消费 Human final 后正常退出。它证明当前 Basic 文本/函数 wire，不证明 partial SSE retry、Tasks、Workspace 或 Live Workspace。
+**Codex Responses 工具闭环已验证（狭范围）**：Codex CLI 0.145.0 在隔离空 `CODEX_HOME` 中实收串行策略、普通 `exec_command`、namespace functions 与 hosted `web_search`；公共 local 门中 Human 通过正式 Command 面板发出命令，CLI 在调用方工作区实际执行，并用相同 `call_id` 回传 result，再消费 Human final 后正常退出。正式 Tasks 面板已完成 `update_plan` 三态 continuation，另有 fault proxy 在完整 progress 帧后切断 SSE 并验证同 body/session/idempotency 的恢复。模型目录明确 `apply_patch_tool_type=freeform` 时，CLI 还会声明 Responses `custom` grammar tool；exact resolver 据真实 envelope 升级 Workspace，Human 独立目录中的 create/modify 被编码为项目相对 patch，CLI 原生执行后核对最终字节。未知模型 fallback、缺失/漂移 grammar 或 `defer_loading` 都不会获得该能力。
 
-**M0 仍待外部验证**：OpenCode 真实 CLI 在 partial SSE、gateway/worker 反复掉线与恢复顺序中的行为，以及完整 TUI 保存/auto-send 体验；Codex Responses 的 partial SSE/故障恢复与 Workspace/Tasks/Live Workspace；Claude/Anthropic 的真实工具闭环；真实凭据/证书轮换和多 worker。项目内部 fault tests 证明 request/event/outbox 不变量，不证明无 shim 的 OpenCode 原生文件执行 exactly-once。后续清单见 [06](06-product-todos.md)。
+**仍待外部验证**：OpenCode 真实 CLI 在 gateway/worker 进程反复掉线时的恢复顺序，以及默认 UI 之外的 auto-send 体验；Codex `apply_patch` Workspace 的断流/重启恢复；Claude 接近 context window 的真实自动压缩门。公共远程栈已有 HTTPS/WSS 双 tenant/双 worker、claims 路由与短期凭据重连刷新测试，但真实 IdP、代理证书轮换、多实例存储和长期用户试点仍是部署级工作。项目内部 fault tests 证明 request/event/outbox 不变量，不证明无 shim 的原生文件工具 exactly-once。后续清单见 [06](06-product-todos.md)。

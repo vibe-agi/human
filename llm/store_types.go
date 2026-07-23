@@ -143,7 +143,6 @@ type StoreTaskRecord struct {
 	HarnessID        string
 	HarnessVersion   string
 	HarnessSessionID string
-	WorkspaceRoot    string
 	ExecAllowed      bool
 	State            TaskState
 	LeaseOwner       WorkerID

@@ -9,13 +9,10 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-
-	"github.com/vibe-agi/human/internal/completion/adapter"
-	"github.com/vibe-agi/human/internal/userdata"
 )
 
 func TestInitOpenCodePrintsCompleteSecretFreeProvider(t *testing.T) {
-	payload, err := generateOpenCodeConfig(".", defaultOpenCodeBaseURL)
+	payload, err := generateOpenCodeConfig(defaultOpenCodeBaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,34 +30,10 @@ func TestInitOpenCodePrintsCompleteSecretFreeProvider(t *testing.T) {
 	if provider.Options.BaseURL != defaultOpenCodeBaseURL || provider.Options.APIKey != "{env:HUMAN_CALLER_TOKEN}" || provider.Options.Timeout {
 		t.Fatalf("provider options = %+v", provider.Options)
 	}
-	workspace, err := userdata.ResolveGitWorkspace(".")
-	if err != nil {
-		t.Fatal(err)
+	if len(provider.Options.Headers) != 0 {
+		t.Fatalf("generated local provider should not carry Agent workspace headers: %+v", provider.Options.Headers)
 	}
-	workspaceKey, err := userdata.WorkspaceKey(workspace)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantHeaders := map[string]string{
-		"X-Human-Capability-Tier": "workspace",
-		"X-Human-Workspace-Key":   workspaceKey,
-		"X-Human-Harness-Id":      adapter.OpenCodeID,
-		"X-Human-Harness-Version": adapter.OpenCodeVersion,
-		"X-Human-Workspace-Root":  workspace,
-		"X-Human-Allow-Exec":      "true",
-	}
-	if len(provider.Options.Headers) != len(wantHeaders) {
-		t.Fatalf("headers = %+v", provider.Options.Headers)
-	}
-	for name, want := range wantHeaders {
-		if got := provider.Options.Headers[name]; got != want {
-			t.Fatalf("header %s = %q, want %q", name, got, want)
-		}
-	}
-	if strings.Contains(workspaceKey, filepath.Base(workspace)) {
-		t.Fatalf("workspace key reveals workspace name: %q", workspaceKey)
-	}
-	if !bytes.Equal(payload, mustGenerateOpenCodeConfig(t, ".", defaultOpenCodeBaseURL)) {
+	if !bytes.Equal(payload, mustGenerateOpenCodeConfig(t, defaultOpenCodeBaseURL)) {
 		t.Fatal("generated provider JSON is not deterministic")
 	}
 }
@@ -79,7 +52,7 @@ func TestInitOpenCodeWritesAtomicallyAndRequiresForce(t *testing.T) {
 		err := command.ExecuteContext(context.Background())
 		return output.String(), err
 	}
-	output, err := run("--workspace", ".", "--output", outputPath)
+	output, err := run("--output", outputPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +63,7 @@ func TestInitOpenCodeWritesAtomicallyAndRequiresForce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(first, mustGenerateOpenCodeConfig(t, ".", defaultOpenCodeBaseURL)) {
+	if !bytes.Equal(first, mustGenerateOpenCodeConfig(t, defaultOpenCodeBaseURL)) {
 		t.Fatalf("written config differs from stdout config:\n%s", first)
 	}
 	if runtime.GOOS != "windows" {
@@ -102,11 +75,11 @@ func TestInitOpenCodeWritesAtomicallyAndRequiresForce(t *testing.T) {
 			t.Fatalf("output mode = %o, want 600", info.Mode().Perm())
 		}
 	}
-	if _, err := run("--workspace", ".", "--output", outputPath); err == nil || !strings.Contains(err.Error(), "--force") {
+	if _, err := run("--output", outputPath); err == nil || !strings.Contains(err.Error(), "--force") {
 		t.Fatalf("no-clobber error = %v", err)
 	}
 	const replacementURL = "http://127.0.0.1:29080/v1"
-	if _, err := run("--workspace", ".", "--base-url", replacementURL, "--output", outputPath, "--force"); err != nil {
+	if _, err := run("--base-url", replacementURL, "--output", outputPath, "--force"); err != nil {
 		t.Fatal(err)
 	}
 	replacement, err := os.ReadFile(outputPath)
@@ -132,11 +105,11 @@ func TestInitOpenCodeDefaultsToStdout(t *testing.T) {
 	var output bytes.Buffer
 	command.SetOut(&output)
 	command.SetErr(&output)
-	command.SetArgs([]string{"--workspace", "."})
+	command.SetArgs(nil)
 	if err := command.ExecuteContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(output.Bytes(), mustGenerateOpenCodeConfig(t, ".", defaultOpenCodeBaseURL)) {
+	if !bytes.Equal(output.Bytes(), mustGenerateOpenCodeConfig(t, defaultOpenCodeBaseURL)) {
 		t.Fatalf("stdout provider config = %s", output.Bytes())
 	}
 }
@@ -147,7 +120,7 @@ func TestInitOpenCodeRequiresTLSForRemoteBearerEndpoint(t *testing.T) {
 		"http://human.example/v1",
 		"http://192.0.2.10:8080/v1",
 	} {
-		if _, err := generateOpenCodeConfig(".", value); err == nil || !strings.Contains(err.Error(), "must use https") {
+		if _, err := generateOpenCodeConfig(value); err == nil || !strings.Contains(err.Error(), "must use https") {
 			t.Fatalf("remote plaintext base URL %q error = %v", value, err)
 		}
 	}
@@ -157,15 +130,15 @@ func TestInitOpenCodeRequiresTLSForRemoteBearerEndpoint(t *testing.T) {
 		"http://[::1]:19080/v1",
 		"https://human.example/v1",
 	} {
-		if _, err := generateOpenCodeConfig(".", value); err != nil {
+		if _, err := generateOpenCodeConfig(value); err != nil {
 			t.Fatalf("safe base URL %q: %v", value, err)
 		}
 	}
 }
 
-func mustGenerateOpenCodeConfig(t *testing.T, workspace, baseURL string) []byte {
+func mustGenerateOpenCodeConfig(t *testing.T, baseURL string) []byte {
 	t.Helper()
-	payload, err := generateOpenCodeConfig(workspace, baseURL)
+	payload, err := generateOpenCodeConfig(baseURL)
 	if err != nil {
 		t.Fatal(err)
 	}

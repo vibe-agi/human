@@ -136,7 +136,10 @@ func TestWorkerSubcommandHasStandaloneFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"gateway", "token-file", "mirror-root", "workspace-auto-send", "outbox", "state-db"} {
+	for _, name := range []string{
+		"gateway", "token-file", "workspace", "caller-scope", "workspace-scope",
+		"outbox", "state-db",
+	} {
 		if worker.Flags().Lookup(name) == nil {
 			t.Fatalf("worker flag %q is missing", name)
 		}
@@ -155,10 +158,10 @@ func TestWorkerSubcommandBindsUsableDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, want := range map[string]string{
-		"gateway":     "ws://127.0.0.1:8080/internal/v1/worker/ws",
-		"mirror-root": "~/mirror",
-		"outbox":      automaticPrivatePath,
-		"state-db":    automaticPrivatePath,
+		"gateway":   "ws://127.0.0.1:8080/internal/v1/worker/ws",
+		"workspace": "~/human-workspace",
+		"outbox":    automaticPrivatePath,
+		"state-db":  automaticPrivatePath,
 	} {
 		flag := worker.Flags().Lookup(name)
 		if flag == nil || flag.DefValue != want {
@@ -183,10 +186,13 @@ func TestLocalSubcommandRunsEmbeddedStackDirectly(t *testing.T) {
 	if local.RunE == nil {
 		t.Fatal("local has no direct RunE")
 	}
-	for _, name := range []string{"listen", "db", "credentials", "workspace", "mirror-root", "workspace-auto-send", "stream-write-timeout"} {
+	for _, name := range []string{"listen", "db", "credentials", "workspace", "stream-write-timeout"} {
 		if local.Flag(name) == nil {
 			t.Fatalf("local flag %q is missing", name)
 		}
+	}
+	if local.Flag("mirror-root") != nil {
+		t.Fatal("local still exposes the obsolete mirror-root flag")
 	}
 }
 
@@ -206,26 +212,26 @@ func TestGatewaySubcommandRunsServerDirectly(t *testing.T) {
 	}
 }
 
-func TestWorkerMirrorRootDefaultsToDocumentedLocation(t *testing.T) {
+func TestWorkerWorkspaceDefaultsToDocumentedLocation(t *testing.T) {
 	t.Parallel()
 	command, _, err := New().Find([]string{"worker"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	flag := command.Flags().Lookup("mirror-root")
-	if flag == nil || flag.DefValue != "~/mirror" {
-		t.Fatalf("mirror-root flag = %+v", flag)
+	flag := command.Flags().Lookup("workspace")
+	if flag == nil || flag.DefValue != "~/human-workspace" {
+		t.Fatalf("workspace flag = %+v", flag)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := resolveMirrorRoot(flag.DefValue)
+	resolved, err := resolveHumanWorkspace(flag.DefValue)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved != filepath.Join(home, "mirror") {
-		t.Fatalf("resolved mirror root = %q, want %q", resolved, filepath.Join(home, "mirror"))
+	if resolved != filepath.Join(home, "human-workspace") {
+		t.Fatalf("resolved Human workspace = %q, want %q", resolved, filepath.Join(home, "human-workspace"))
 	}
 }
 
@@ -292,11 +298,11 @@ func TestLocalAutomaticPrivatePathsUseRealGitWorkspaceScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := resolveWorkspaceDataPath(automaticPrivatePath, "local database", "local", workspace, "gateway.db")
+	got, err := resolveWorkspaceDataPath(automaticPrivatePath, "local service database", "local", workspace, "store.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := userdata.WorkspacePath("local", workspace, "gateway.db")
+	want, err := userdata.WorkspacePath("local", workspace, "store.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,9 +380,9 @@ func TestResolveOptionalPrivatePathValidatesEnabledPath(t *testing.T) {
 	}
 }
 
-func TestResolveMirrorRootRejectsAmbiguousUserExpansion(t *testing.T) {
+func TestResolveHumanWorkspaceRejectsAmbiguousUserExpansion(t *testing.T) {
 	t.Parallel()
-	if _, err := resolveMirrorRoot("~someone/mirror"); err == nil {
-		t.Fatal("expected ~user mirror root to be rejected")
+	if _, err := resolveHumanWorkspace("~someone/workspace"); err == nil {
+		t.Fatal("expected ~user Human workspace to be rejected")
 	}
 }

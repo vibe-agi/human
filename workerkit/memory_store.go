@@ -16,11 +16,15 @@ type MemoryStateStore struct {
 	mu            sync.Mutex
 	closed        bool
 	conversations map[ConversationKey]Conversation
+	alerts        map[uint64]Notice
 }
 
 // NewMemoryStateStore returns an empty store and its release callback.
 func NewMemoryStateStore() (*MemoryStateStore, framework.ReleaseFunc) {
-	store := &MemoryStateStore{conversations: make(map[ConversationKey]Conversation)}
+	store := &MemoryStateStore{
+		conversations: make(map[ConversationKey]Conversation),
+		alerts:        make(map[uint64]Notice),
+	}
 	return store, func(context.Context) error {
 		store.mu.Lock()
 		defer store.mu.Unlock()
@@ -30,6 +34,7 @@ func NewMemoryStateStore() (*MemoryStateStore, framework.ReleaseFunc) {
 }
 
 var _ StateStore = (*MemoryStateStore)(nil)
+var _ AlertStore = (*MemoryStateStore)(nil)
 
 func (store *MemoryStateStore) SaveConversation(ctx context.Context, conversation Conversation) error {
 	if err := checkStateContext(ctx); err != nil {
@@ -81,6 +86,52 @@ func (store *MemoryStateStore) ListConversations(ctx context.Context) ([]Convers
 		return a.TaskID < b.TaskID
 	})
 	return conversations, nil
+}
+
+func (store *MemoryStateStore) SaveAlert(ctx context.Context, notice Notice) error {
+	if err := checkStateContext(ctx); err != nil {
+		return err
+	}
+	if err := notice.Validate(); err != nil {
+		return err
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrClosed
+	}
+	store.alerts[notice.Seq] = notice
+	return nil
+}
+
+func (store *MemoryStateStore) DeleteAlert(ctx context.Context, seq uint64) error {
+	if err := checkStateContext(ctx); err != nil {
+		return err
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrClosed
+	}
+	delete(store.alerts, seq)
+	return nil
+}
+
+func (store *MemoryStateStore) ListAlerts(ctx context.Context) ([]Notice, error) {
+	if err := checkStateContext(ctx); err != nil {
+		return nil, err
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return nil, ErrClosed
+	}
+	alerts := make([]Notice, 0, len(store.alerts))
+	for _, notice := range store.alerts {
+		alerts = append(alerts, notice)
+	}
+	sort.Slice(alerts, func(i, j int) bool { return alerts[i].Seq < alerts[j].Seq })
+	return alerts, nil
 }
 
 func checkStateContext(ctx context.Context) error {

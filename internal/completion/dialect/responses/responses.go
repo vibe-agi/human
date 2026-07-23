@@ -32,30 +32,46 @@ func (Codec) Dialect() canonical.Dialect {
 }
 
 type responsesRequest struct {
-	Model              string            `json:"model"`
-	Stream             bool              `json:"stream"`
-	Instructions       json.RawMessage   `json:"instructions"`
-	Input              json.RawMessage   `json:"input"`
-	Tools              []json.RawMessage `json:"tools"`
-	Metadata           map[string]string `json:"metadata"`
-	ToolChoice         json.RawMessage   `json:"tool_choice"`
-	Text               json.RawMessage   `json:"text"`
-	PreviousResponseID json.RawMessage   `json:"previous_response_id"`
-	ParallelToolCalls  *bool             `json:"parallel_tool_calls"`
-	Reasoning          json.RawMessage   `json:"reasoning"`
-	Store              *bool             `json:"store"`
-	Include            json.RawMessage   `json:"include"`
-	MaxOutputTokens    json.RawMessage   `json:"max_output_tokens"`
-	ClientMetadata     json.RawMessage   `json:"client_metadata"`
-	PromptCacheKey     json.RawMessage   `json:"prompt_cache_key"`
+	Model                string            `json:"model"`
+	Stream               bool              `json:"stream"`
+	Instructions         json.RawMessage   `json:"instructions"`
+	Input                json.RawMessage   `json:"input"`
+	Tools                []json.RawMessage `json:"tools"`
+	Metadata             map[string]string `json:"metadata"`
+	ToolChoice           json.RawMessage   `json:"tool_choice"`
+	Text                 json.RawMessage   `json:"text"`
+	PreviousResponseID   json.RawMessage   `json:"previous_response_id"`
+	ParallelToolCalls    *bool             `json:"parallel_tool_calls"`
+	Reasoning            json.RawMessage   `json:"reasoning"`
+	Store                *bool             `json:"store"`
+	Include              json.RawMessage   `json:"include"`
+	MaxOutputTokens      *int64            `json:"max_output_tokens"`
+	ClientMetadata       json.RawMessage   `json:"client_metadata"`
+	PromptCacheKey       json.RawMessage   `json:"prompt_cache_key"`
+	Background           *bool             `json:"background"`
+	MaxToolCalls         *int64            `json:"max_tool_calls"`
+	Temperature          *float64          `json:"temperature"`
+	TopLogprobs          *int64            `json:"top_logprobs"`
+	TopP                 *float64          `json:"top_p"`
+	SafetyIdentifier     string            `json:"safety_identifier"`
+	User                 string            `json:"user"`
+	ContextManagement    []json.RawMessage `json:"context_management"`
+	Conversation         json.RawMessage   `json:"conversation"`
+	Prompt               json.RawMessage   `json:"prompt"`
+	PromptCacheRetention string            `json:"prompt_cache_retention"`
+	ServiceTier          string            `json:"service_tier"`
+	StreamOptions        json.RawMessage   `json:"stream_options"`
+	Truncation           string            `json:"truncation"`
 }
 
 type responseTool struct {
-	Type        string          `json:"type"`
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Parameters  json.RawMessage `json:"parameters"`
-	Tools       []responseTool  `json:"tools"`
+	Type         string          `json:"type"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description"`
+	Parameters   json.RawMessage `json:"parameters"`
+	Format       json.RawMessage `json:"format"`
+	DeferLoading *bool           `json:"defer_loading"`
+	Tools        []responseTool  `json:"tools"`
 }
 
 type inputItem struct {
@@ -67,6 +83,7 @@ type inputItem struct {
 	Namespace string          `json:"namespace"`
 	Name      string          `json:"name"`
 	Arguments string          `json:"arguments"`
+	Input     string          `json:"input"`
 	Output    json.RawMessage `json:"output"`
 }
 
@@ -86,7 +103,8 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 	if err := ensureJSONEOF(decoder); err != nil {
 		return canonical.Request{}, fmt.Errorf("decode OpenAI Responses request: %w", err)
 	}
-	if err := validateToolChoice(wire.ToolChoice); err != nil {
+	toolChoicePolicy, err := parseToolChoice(wire.ToolChoice)
+	if err != nil {
 		return canonical.Request{}, err
 	}
 	if err := validateTextFormat(wire.Text); err != nil {
@@ -103,13 +121,14 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 		return canonical.Request{}, fmt.Errorf("instructions: %w", err)
 	}
 	request := canonical.Request{
-		Dialect:  canonical.DialectResponses,
-		Model:    wire.Model,
-		Stream:   wire.Stream,
-		System:   instructions,
-		Metadata: wire.Metadata,
+		Dialect:        canonical.DialectResponses,
+		Model:          wire.Model,
+		Stream:         wire.Stream,
+		System:         instructions,
+		Metadata:       wire.Metadata,
+		ToolCallPolicy: toolChoicePolicy,
 	}
-	if wire.ParallelToolCalls != nil {
+	if wire.ParallelToolCalls != nil && toolChoicePolicy != canonical.ToolCallsDisabled {
 		request.ToolCallPolicy = canonical.ToolCallsParallel
 		if !*wire.ParallelToolCalls {
 			request.ToolCallPolicy = canonical.ToolCallsSerial
@@ -126,6 +145,9 @@ func (Codec) Decode(payload []byte) (canonical.Request, error) {
 	if err := request.Validate(); err != nil {
 		return canonical.Request{}, err
 	}
+	if request.ToolCallPolicy == canonical.ToolCallsDisabled {
+		request.Tools = nil
+	}
 	return request, nil
 }
 
@@ -141,11 +163,14 @@ func ensureJSONEOF(decoder *json.Decoder) error {
 }
 
 // validateTopLevelControls makes every accepted modern Codex field deliberate.
-// Empty include, store=false, client metadata and the prompt cache key are
-// transport/provider hints: they are type-checked and intentionally omitted
-// from the canonical assignment. Behavior-changing controls that Human does
-// not implement are rejected rather than silently changing request identity.
+// Sampling, token-budget, cache, service-tier and reasoning options are
+// provider hints with no analogue for a human model. They are type/range
+// checked and deliberately omitted from canonical assignment. Stateful
+// provider features and output-shape guarantees remain fail-closed.
 func validateTopLevelControls(wire responsesRequest) error {
+	if wire.Background != nil && *wire.Background {
+		return errors.New("background=true is not supported")
+	}
 	if wire.Store != nil && *wire.Store {
 		return errors.New("store=true is not supported; omit store or use false")
 	}
@@ -154,12 +179,26 @@ func validateTopLevelControls(wire responsesRequest) error {
 		if err := json.Unmarshal(wire.Include, &include); err != nil {
 			return fmt.Errorf("include: %w", err)
 		}
-		if len(include) != 0 {
-			return errors.New("non-empty include is not supported")
+		for index, item := range include {
+			if item != "reasoning.encrypted_content" || index != 0 {
+				return fmt.Errorf("unsupported include value: %q", include)
+			}
 		}
 	}
-	if !isNullJSON(wire.MaxOutputTokens) {
-		return errors.New("max_output_tokens is not supported")
+	if wire.MaxOutputTokens != nil && *wire.MaxOutputTokens < 0 {
+		return errors.New("max_output_tokens must be non-negative")
+	}
+	if wire.MaxToolCalls != nil && *wire.MaxToolCalls < 0 {
+		return errors.New("max_tool_calls must be non-negative")
+	}
+	if wire.Temperature != nil && (*wire.Temperature < 0 || *wire.Temperature > 2) {
+		return errors.New("temperature must be between 0 and 2")
+	}
+	if wire.TopP != nil && (*wire.TopP < 0 || *wire.TopP > 1) {
+		return errors.New("top_p must be between 0 and 1")
+	}
+	if wire.TopLogprobs != nil && *wire.TopLogprobs != 0 {
+		return errors.New("top_logprobs are not supported")
 	}
 	if !isNullJSON(wire.ClientMetadata) {
 		var metadata map[string]any
@@ -174,7 +213,72 @@ func validateTopLevelControls(wire responsesRequest) error {
 		}
 	}
 	if !isNullJSON(wire.Reasoning) {
-		return errors.New("top-level reasoning controls are not supported; use null or omit reasoning")
+		var controls struct {
+			Effort          string `json:"effort"`
+			GenerateSummary string `json:"generate_summary"`
+			Summary         string `json:"summary"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(wire.Reasoning))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&controls); err != nil {
+			return fmt.Errorf("reasoning: %w", err)
+		}
+		if err := ensureJSONEOF(decoder); err != nil {
+			return fmt.Errorf("reasoning: %w", err)
+		}
+		if controls.Effort != "" {
+			switch controls.Effort {
+			case "none", "minimal", "low", "medium", "high", "xhigh", "max":
+			default:
+				return fmt.Errorf("unsupported reasoning.effort %q", controls.Effort)
+			}
+		}
+		for _, summary := range []struct {
+			name  string
+			value string
+		}{
+			{name: "generate_summary", value: controls.GenerateSummary},
+			{name: "summary", value: controls.Summary},
+		} {
+			if summary.value != "" && summary.value != "auto" && summary.value != "concise" && summary.value != "detailed" {
+				return fmt.Errorf("unsupported reasoning.%s %q", summary.name, summary.value)
+			}
+		}
+	}
+	if len(wire.ContextManagement) != 0 {
+		return errors.New("context_management is not supported")
+	}
+	if !isNullJSON(wire.Conversation) {
+		return errors.New("conversation continuation is not supported")
+	}
+	if !isNullJSON(wire.Prompt) {
+		return errors.New("server-side prompt templates are not supported")
+	}
+	if wire.PromptCacheRetention != "" && wire.PromptCacheRetention != "in_memory" && wire.PromptCacheRetention != "24h" {
+		return fmt.Errorf("unsupported prompt_cache_retention %q", wire.PromptCacheRetention)
+	}
+	if wire.ServiceTier != "" {
+		switch wire.ServiceTier {
+		case "auto", "default", "flex", "scale", "priority":
+		default:
+			return fmt.Errorf("unsupported service_tier %q", wire.ServiceTier)
+		}
+	}
+	if wire.Truncation != "" && wire.Truncation != "auto" && wire.Truncation != "disabled" {
+		return fmt.Errorf("unsupported truncation %q", wire.Truncation)
+	}
+	if !isNullJSON(wire.StreamOptions) {
+		var options struct {
+			IncludeObfuscation *bool `json:"include_obfuscation"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(wire.StreamOptions))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&options); err != nil {
+			return fmt.Errorf("stream_options: %w", err)
+		}
+		if err := ensureJSONEOF(decoder); err != nil {
+			return fmt.Errorf("stream_options: %w", err)
+		}
 	}
 	return nil
 }
@@ -198,6 +302,8 @@ func appendResponseTool(request *canonical.Request, raw json.RawMessage) error {
 	switch tool.Type {
 	case "function":
 		return appendFunctionTool(request, "", tool)
+	case "custom":
+		return appendCustomTool(request, "", tool)
 	case "namespace":
 		if strings.TrimSpace(tool.Name) == "" {
 			return errors.New("namespace requires name")
@@ -206,10 +312,16 @@ func appendResponseTool(request *canonical.Request, raw json.RawMessage) error {
 			return fmt.Errorf("namespace %q contains no functions", tool.Name)
 		}
 		for index, nested := range tool.Tools {
-			if nested.Type != "function" {
+			if nested.Type != "function" && nested.Type != "custom" {
 				return fmt.Errorf("namespace %q tool %d: unsupported type %q", tool.Name, index, nested.Type)
 			}
-			if err := appendFunctionTool(request, tool.Name, nested); err != nil {
+			var err error
+			if nested.Type == "function" {
+				err = appendFunctionTool(request, tool.Name, nested)
+			} else {
+				err = appendCustomTool(request, tool.Name, nested)
+			}
+			if err != nil {
 				return fmt.Errorf("namespace %q tool %d: %w", tool.Name, index, err)
 			}
 		}
@@ -223,6 +335,62 @@ func appendResponseTool(request *canonical.Request, raw json.RawMessage) error {
 	default:
 		return fmt.Errorf("unsupported type %q", tool.Type)
 	}
+}
+
+func appendCustomTool(request *canonical.Request, namespace string, tool responseTool) error {
+	if strings.TrimSpace(tool.Name) == "" {
+		return errors.New("custom tool requires name")
+	}
+	if tool.DeferLoading != nil && *tool.DeferLoading {
+		return fmt.Errorf("custom tool %q: defer_loading=true is not supported", tool.Name)
+	}
+	format, err := validateCustomToolFormat(tool.Format)
+	if err != nil {
+		return fmt.Errorf("custom tool %q format: %w", tool.Name, err)
+	}
+	request.Tools = append(request.Tools, canonical.Tool{
+		Namespace:   namespace,
+		Name:        tool.Name,
+		Description: tool.Description,
+		InputKind:   canonical.ToolInputText,
+		InputFormat: format,
+	})
+	return nil
+}
+
+func validateCustomToolFormat(raw json.RawMessage) (json.RawMessage, error) {
+	if isNullJSON(raw) {
+		return nil, nil
+	}
+	var format struct {
+		Type       string `json:"type"`
+		Definition string `json:"definition"`
+		Syntax     string `json:"syntax"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&format); err != nil {
+		return nil, err
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return nil, err
+	}
+	switch format.Type {
+	case "text":
+		if format.Definition != "" || format.Syntax != "" {
+			return nil, errors.New("text format cannot contain grammar fields")
+		}
+	case "grammar":
+		if format.Definition == "" {
+			return nil, errors.New("grammar definition is required")
+		}
+		if format.Syntax != "lark" && format.Syntax != "regex" {
+			return nil, errors.New(`grammar syntax must be "lark" or "regex"`)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported format type %q", format.Type)
+	}
+	return bytes.Clone(raw), nil
 }
 
 func appendFunctionTool(request *canonical.Request, namespace string, tool responseTool) error {
@@ -245,15 +413,20 @@ func objectSchemaOrDefault(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
-func validateToolChoice(raw json.RawMessage) error {
+func parseToolChoice(raw json.RawMessage) (canonical.ToolCallPolicy, error) {
 	if isNullJSON(raw) {
-		return nil
+		return "", nil
 	}
 	var choice string
-	if err := json.Unmarshal(raw, &choice); err != nil || choice != "auto" {
-		return errors.New("tool_choice is unsupported; omit it or use \"auto\"")
+	if err := json.Unmarshal(raw, &choice); err == nil {
+		switch choice {
+		case "auto":
+			return "", nil
+		case "none":
+			return canonical.ToolCallsDisabled, nil
+		}
 	}
-	return nil
+	return "", errors.New("tool_choice is unsupported; omit it or use \"auto\"/\"none\"")
 }
 
 func validateTextFormat(raw json.RawMessage) error {
@@ -389,18 +562,37 @@ func appendItem(request *canonical.Request, item inputItem, raw json.RawMessage)
 			}},
 		})
 		return nil
+	case "custom_tool_call":
+		if strings.TrimSpace(item.CallID) == "" {
+			return errors.New("custom_tool_call requires call_id")
+		}
+		if strings.TrimSpace(item.Name) == "" {
+			return errors.New("custom_tool_call requires name")
+		}
+		input := item.Input
+		request.Messages = append(request.Messages, canonical.Message{
+			Role: canonical.RoleAssistant,
+			Blocks: []canonical.Block{{
+				Type:          canonical.BlockToolUse,
+				ToolCallID:    item.CallID,
+				ToolNamespace: item.Namespace,
+				ToolName:      item.Name,
+				TextInput:     &input,
+			}},
+		})
+		return nil
 	case "reasoning":
 		return appendOpaqueFingerprint(request, item.Type, raw)
-	case "function_call_output":
+	case "function_call_output", "custom_tool_call_output":
 		if strings.TrimSpace(item.CallID) == "" {
-			return errors.New("function_call_output requires call_id")
+			return fmt.Errorf("%s requires call_id", item.Type)
 		}
 		if len(item.Output) == 0 {
-			return errors.New("function_call_output requires output")
+			return fmt.Errorf("%s requires output", item.Type)
 		}
 		var output any
 		if err := dialect.DecodeJSON(item.Output, &output); err != nil {
-			return fmt.Errorf("function_call_output output: %w", err)
+			return fmt.Errorf("%s output: %w", item.Type, err)
 		}
 		request.Messages = append(request.Messages, canonical.Message{
 			Role: canonical.RoleTool,
@@ -485,11 +677,16 @@ func appendSystem(request *canonical.Request, text string) {
 func (codec Codec) NewStream(responseID, model string, seeds ...dialect.StreamSeed) dialect.Stream {
 	created := codec.now().Unix()
 	parallelToolCalls := true
+	toolChoice := "auto"
 	if len(seeds) != 0 && seeds[0].CreatedAtUnix > 0 {
 		created = seeds[0].CreatedAtUnix
 	}
 	if len(seeds) != 0 && seeds[0].ToolCallPolicy == canonical.ToolCallsSerial {
 		parallelToolCalls = false
+	}
+	if len(seeds) != 0 && seeds[0].ToolCallPolicy == canonical.ToolCallsDisabled {
+		parallelToolCalls = false
+		toolChoice = "none"
 	}
 	return &stream{
 		responseID:        responseID,
@@ -497,6 +694,7 @@ func (codec Codec) NewStream(responseID, model string, seeds ...dialect.StreamSe
 		created:           created,
 		now:               codec.now,
 		parallelToolCalls: parallelToolCalls,
+		toolChoice:        toolChoice,
 	}
 }
 
@@ -543,6 +741,7 @@ type stream struct {
 	text              strings.Builder
 	textOpen          bool
 	parallelToolCalls bool
+	toolChoice        string
 }
 
 func (stream *stream) Start() ([][]byte, error) {
@@ -624,6 +823,48 @@ func (stream *stream) Encode(event completion.Event, seeds ...dialect.EventSeed)
 			output = append(output, stream.messageOutput())
 		}
 		for _, call := range event.ToolCalls {
+			if call.TextInput != nil {
+				itemID := customItemID(call.ID)
+				index := len(output)
+				added, err := stream.event("response.output_item.added", map[string]any{
+					"type":         "response.output_item.added",
+					"output_index": index,
+					"item":         stream.customOutput(call, "", "in_progress"),
+				})
+				if err != nil {
+					return nil, false, err
+				}
+				delta, err := stream.event("response.custom_tool_call_input.delta", map[string]any{
+					"type":         "response.custom_tool_call_input.delta",
+					"item_id":      itemID,
+					"output_index": index,
+					"delta":        *call.TextInput,
+				})
+				if err != nil {
+					return nil, false, err
+				}
+				inputDone, err := stream.event("response.custom_tool_call_input.done", map[string]any{
+					"type":         "response.custom_tool_call_input.done",
+					"item_id":      itemID,
+					"output_index": index,
+					"input":        *call.TextInput,
+				})
+				if err != nil {
+					return nil, false, err
+				}
+				item := stream.customOutput(call, *call.TextInput, "completed")
+				itemDone, err := stream.event("response.output_item.done", map[string]any{
+					"type":         "response.output_item.done",
+					"output_index": index,
+					"item":         item,
+				})
+				if err != nil {
+					return nil, false, err
+				}
+				frames = append(frames, added, delta, inputDone, itemDone)
+				output = append(output, item)
+				continue
+			}
 			arguments, err := marshalToolArguments(call.Input)
 			if err != nil {
 				return nil, false, fmt.Errorf("marshal tool call %q arguments: %w", call.ID, err)
@@ -825,6 +1066,10 @@ func (stream *stream) response(status string, output []any, completedAt any) map
 	if output == nil {
 		output = []any{}
 	}
+	var usage any
+	if status == "completed" {
+		usage = responsesUsage()
+	}
 	return map[string]any{
 		"id":                   stream.responseID,
 		"object":               "response",
@@ -847,12 +1092,20 @@ func (stream *stream) response(status string, output []any, completedAt any) map
 		"text": map[string]any{
 			"format": map[string]string{"type": "text"},
 		},
-		"tool_choice": "auto",
+		"tool_choice": stream.toolChoice,
 		"tools":       []any{},
 		"top_p":       nil,
 		"truncation":  "disabled",
-		"usage":       nil,
+		"usage":       usage,
 		"metadata":    map[string]string{},
+	}
+}
+
+func responsesUsage() map[string]any {
+	return map[string]any{
+		"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+		"input_tokens_details":  map[string]int{"cached_tokens": 0},
+		"output_tokens_details": map[string]int{"reasoning_tokens": 0},
 	}
 }
 
@@ -901,6 +1154,21 @@ func (stream *stream) functionOutput(call completion.ToolCall, arguments, status
 	return item
 }
 
+func (stream *stream) customOutput(call completion.ToolCall, input, status string) map[string]any {
+	item := map[string]any{
+		"id":      customItemID(call.ID),
+		"type":    "custom_tool_call",
+		"status":  status,
+		"call_id": call.ID,
+		"name":    call.Name,
+		"input":   input,
+	}
+	if call.Namespace != "" {
+		item["namespace"] = call.Namespace
+	}
+	return item
+}
+
 func outputTextPart(text string) map[string]any {
 	return map[string]any{
 		"type":        "output_text",
@@ -937,6 +1205,10 @@ func messageItemID(responseID string) string {
 
 func functionItemID(callID string) string {
 	return "fc_" + callID
+}
+
+func customItemID(callID string) string {
+	return "ctc_" + callID
 }
 
 func nullableString(value string) any {

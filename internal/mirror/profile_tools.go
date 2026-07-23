@@ -166,8 +166,12 @@ func deliveryToolCallDigest(call completion.ToolCall) (string, error) {
 		ID        string         `json:"id"`
 		Namespace string         `json:"namespace"`
 		Name      string         `json:"name"`
-		Input     map[string]any `json:"input"`
-	}{ID: call.ID, Namespace: call.Namespace, Name: call.Name, Input: call.Input})
+		Input     map[string]any `json:"input,omitempty"`
+		TextInput *string        `json:"text_input,omitempty"`
+	}{
+		ID: call.ID, Namespace: call.Namespace, Name: call.Name,
+		Input: call.Input, TextInput: call.TextInput,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -177,7 +181,8 @@ func deliveryToolCallDigest(call completion.ToolCall) (string, error) {
 
 func deliveryToolUseDigest(use canonical.Block) (string, error) {
 	return deliveryToolCallDigest(completion.ToolCall{
-		ID: use.ToolCallID, Namespace: use.ToolNamespace, Name: use.ToolName, Input: use.Input,
+		ID: use.ToolCallID, Namespace: use.ToolNamespace, Name: use.ToolName,
+		Input: use.Input, TextInput: use.TextInput,
 	})
 }
 

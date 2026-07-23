@@ -61,6 +61,9 @@ func (aggregate *aggregate) Encode(event completion.Event, _ ...dialect.EventSee
 			content = append(content, map[string]any{"type": "text", "text": aggregate.text.String()})
 		}
 		for _, call := range event.ToolCalls {
+			if call.TextInput != nil {
+				return nil, false, fmt.Errorf("Anthropic tool call %q cannot use text input", call.ID)
+			}
 			input := call.Input
 			if input == nil {
 				input = map[string]any{}
@@ -107,7 +110,7 @@ func (aggregate *aggregate) message(content []any, stopReason string) ([]byte, e
 	return json.Marshal(map[string]any{
 		"id": aggregate.responseID, "type": "message", "role": "assistant",
 		"content": content, "model": aggregate.model,
-		"stop_reason": stopReason, "stop_sequence": nil,
-		"usage": map[string]int{"input_tokens": 0, "output_tokens": 0},
+		"stop_reason": stopReason, "stop_sequence": nil, "stop_details": nil,
+		"container": nil, "usage": anthropicUsage(),
 	})
 }

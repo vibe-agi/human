@@ -189,6 +189,28 @@ type WorkerConnection interface {
 	CommitEvent(context.Context, WorkerEventDelivery) (WorkerEventReceipt, error)
 }
 
+// WorkerNotice is a transport-level alert the worker's human must see — for
+// example, the caller holding an in-flight request disconnected. It is advisory
+// (a UI hint), never a correctness signal: dropping one changes no durable
+// state and is always safe.
+type WorkerNotice struct {
+	Code      string
+	Message   string
+	Caller    CallerID
+	TaskID    TaskID
+	RequestID string
+}
+
+// WorkerNoticer is an optional WorkerConnection capability. A connection may
+// surface transport-level notices (a caller disconnect, say) that a transport
+// adapter forwards to the human side. It is discovered by type assertion, so a
+// WorkerConnection that does not implement it simply carries no notices and
+// nothing breaks. The abstraction is the product; whether and how a given
+// connection detects such events is that implementation's own concern.
+type WorkerNoticer interface {
+	Notices() <-chan WorkerNotice
+}
+
 // WorkerDeliveryID identifies one transport delivery. It is distinct from an
 // idempotency key and worker event ID, and remains stable across retransmission.
 type WorkerDeliveryID string
@@ -270,8 +292,8 @@ type Assignment struct {
 	Identity CompletionIdentity `json:"identity"`
 	Lease    WorkerLease        `json:"lease"`
 	Boundary AssignmentBoundary `json:"boundary"`
-	// Task is authenticated workspace/capability context. It travels inside the
-	// assignment so WorkspaceRoot is covered by the worker payload gate.
+	// Task is authenticated logical workspace/capability context. It carries no
+	// caller filesystem coordinates.
 	Task    TaskContext `json:"task"`
 	Request Request     `json:"request"`
 }
@@ -550,6 +572,9 @@ func validateTransportEvent(event Event) error {
 			if err := ValidateToolIdentity(call.Namespace, call.Name); err != nil {
 				return fmt.Errorf("%w: invalid tool call %q: %v", ErrWorkerDelivery, call.ID, err)
 			}
+			if call.Input != nil && call.TextInput != nil {
+				return fmt.Errorf("%w: tool call %q has both JSON and text input", ErrWorkerDelivery, call.ID)
+			}
 			if _, err := json.Marshal(call.Input); err != nil {
 				return fmt.Errorf("%w: tool call %q input is not JSON: %v", ErrWorkerDelivery, call.ID, err)
 			}
@@ -627,6 +652,7 @@ func cloneTransportRequest(request Request) Request {
 		blocks := append([]Block(nil), request.Messages[messageIndex].Blocks...)
 		for blockIndex := range blocks {
 			blocks[blockIndex].Input = cloneTransportMap(blocks[blockIndex].Input)
+			blocks[blockIndex].TextInput = cloneTransportString(blocks[blockIndex].TextInput)
 			blocks[blockIndex].Output = cloneTransportJSONValue(blocks[blockIndex].Output)
 		}
 		request.Messages[messageIndex].Blocks = blocks
@@ -634,6 +660,7 @@ func cloneTransportRequest(request Request) Request {
 	request.Tools = append([]Tool(nil), request.Tools...)
 	for index := range request.Tools {
 		request.Tools[index].InputSchema = append(json.RawMessage(nil), request.Tools[index].InputSchema...)
+		request.Tools[index].InputFormat = append(json.RawMessage(nil), request.Tools[index].InputFormat...)
 	}
 	request.HostedCapabilities = append([]HostedCapability(nil), request.HostedCapabilities...)
 	for index := range request.HostedCapabilities {
@@ -656,8 +683,17 @@ func cloneTransportToolCalls(calls []ToolCall) []ToolCall {
 	cloned := append([]ToolCall(nil), calls...)
 	for index := range cloned {
 		cloned[index].Input = cloneTransportMap(cloned[index].Input)
+		cloned[index].TextInput = cloneTransportString(cloned[index].TextInput)
 	}
 	return cloned
+}
+
+func cloneTransportString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func cloneTransportMap(value map[string]any) map[string]any {

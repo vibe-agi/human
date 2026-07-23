@@ -1,543 +1,1048 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Human Worker</title>
+<title>Human · 接单台</title>
+<script>
+  // Restore the explicit operator preference before CSS is parsed, preventing
+  // both refresh resets and a light/dark first-paint flash.
+  try {
+    const savedTheme = localStorage.getItem("human-web-theme");
+    if (savedTheme === "light" || savedTheme === "dark") {
+      document.documentElement.setAttribute("data-theme", savedTheme);
+    }
+  } catch (_) {}
+</script>
 <style>
-  :root {
-    --bg: #f6f7f9; --panel: #ffffff; --line: #e2e5ea; --text: #1c2430;
-    --muted: #6b7686; --accent: #2456d6; --danger: #c0392b; --ok: #1e8e4e;
+  /* Human workbench. Neutral editor chrome keeps attention on the transcript;
+     a single restrained accent marks selection and the operator's turn. */
+  :root{
+    --ink:#F7F7F7; --panel:#FFFFFF; --raised:#F3F3F3; --hover:#ECECEC;
+    --selection:#E8F3FC; --input:#FFFFFF; --line:#D8D8D8; --line-soft:#E8E8E8;
+    --text:#1F1F1F; --muted:#616161; --faint:#8A8A8A;
+    --human:#006AB1; --human-bg:#0078D4; --human-on:#FFFFFF; --human-soft:rgba(0,120,212,.08);
+    --machine:#536D9C; --machine-soft:rgba(83,109,156,.09);
+    --danger:#C42B1C; --danger-soft:rgba(196,43,28,.08);
+    --ok:#16825D; --ok-soft:rgba(22,130,93,.09);
+    --shadow:0 1px 2px rgba(0,0,0,.04);
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI","PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #14181f; --panel: #1d232d; --line: #2c3442; --text: #e6eaf1;
-      --muted: #93a0b4; --accent: #6c96ff; --danger: #ff7b6b; --ok: #57c98a;
+  @media (prefers-color-scheme:dark){
+    :root{
+      color-scheme:dark;
+      --ink:#1E1E1E; --panel:#252526; --raised:#2A2D2E; --hover:#2F3334;
+      --selection:#04395E; --input:#3C3C3C; --line:#3C3C3C; --line-soft:#333333;
+      --text:#CCCCCC; --muted:#A0A0A0; --faint:#747474;
+      --human:#75BEFF; --human-bg:#0E639C; --human-on:#FFFFFF; --human-soft:rgba(117,190,255,.09);
+      --machine:#9AAFCB; --machine-soft:rgba(154,175,203,.10);
+      --danger:#F48771; --danger-soft:rgba(244,135,113,.10);
+      --ok:#4EC9B0; --ok-soft:rgba(78,201,176,.10);
+      --shadow:none;
     }
   }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 14px/1.6 -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
-    display: grid; grid-template-columns: 320px 1fr; height: 100vh;
+  :root[data-theme="light"]{
+    --ink:#F7F7F7; --panel:#FFFFFF; --raised:#F3F3F3; --hover:#ECECEC;
+    --selection:#E8F3FC; --input:#FFFFFF; --line:#D8D8D8; --line-soft:#E8E8E8;
+    --text:#1F1F1F; --muted:#616161; --faint:#8A8A8A;
+    --human:#006AB1; --human-bg:#0078D4; --human-on:#FFFFFF; --human-soft:rgba(0,120,212,.08);
+    --machine:#536D9C; --machine-soft:rgba(83,109,156,.09);
+    --danger:#C42B1C; --danger-soft:rgba(196,43,28,.08);
+    --ok:#16825D; --ok-soft:rgba(22,130,93,.09);
+    --shadow:0 1px 2px rgba(0,0,0,.04);
   }
-  aside { border-right: 1px solid var(--line); overflow-y: auto; padding: 12px; }
-  main { display: flex; flex-direction: column; overflow: hidden; }
-  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 14px 4px 6px; }
-  .card {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-    padding: 10px 12px; margin-bottom: 8px; cursor: pointer;
+  :root[data-theme="dark"]{
+    --ink:#1E1E1E; --panel:#252526; --raised:#2A2D2E; --hover:#2F3334;
+    --selection:#04395E; --input:#3C3C3C; --line:#3C3C3C; --line-soft:#333333;
+    --text:#CCCCCC; --muted:#A0A0A0; --faint:#747474;
+    --human:#75BEFF; --human-bg:#0E639C; --human-on:#FFFFFF; --human-soft:rgba(117,190,255,.09);
+    --machine:#9AAFCB; --machine-soft:rgba(154,175,203,.10);
+    --danger:#F48771; --danger-soft:rgba(244,135,113,.10);
+    --ok:#4EC9B0; --ok-soft:rgba(78,201,176,.10);
+    --shadow:none;
   }
-  .card.selected { border-color: var(--accent); }
-  .card .meta { color: var(--muted); font-size: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
-  .card .preview { margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
-  .card .actions { margin-top: 8px; display: flex; gap: 8px; }
-  button {
-    border: 1px solid var(--line); background: var(--panel); color: var(--text);
-    border-radius: 8px; padding: 6px 14px; cursor: pointer; font-size: 13px;
+  :root[data-theme="light"]{color-scheme:light;}
+  :root[data-theme="dark"]{color-scheme:dark;}
+  *{box-sizing:border-box;}
+  body{margin:0; height:100vh; overflow:hidden; background:var(--ink); color:var(--text);
+    font-family:var(--sans); font-size:13px; line-height:1.5; -webkit-font-smoothing:antialiased;
+    display:flex; flex-direction:column;}
+  button{font-family:inherit; cursor:pointer; appearance:none; -webkit-appearance:none;}
+  [hidden]{display:none !important;}
+  :focus-visible{outline:1px solid var(--human); outline-offset:1px;}
+  ::selection{background:var(--human-soft);}
+  .eyebrow{font-family:var(--mono); font-size:10.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); font-weight:600;}
+
+  /* header */
+  .rail{flex:0 0 auto; height:46px; display:flex; align-items:center; gap:16px; padding:0 12px;
+    background:var(--panel); border-bottom:1px solid var(--line);}
+  .badge{display:flex; align-items:center; gap:9px; min-width:0;}
+  .badge .dot{width:7px; height:7px; border-radius:50%; background:var(--human-bg); flex:0 0 auto;}
+  .badge .model{font-family:var(--mono); font-weight:600; letter-spacing:.02em;}
+  .badge .role{font-size:11px; color:var(--muted); border-left:1px solid var(--line); padding-left:9px;}
+  .rail .spacer{flex:1 1 auto;}
+  .metrics{display:flex; align-items:center; gap:16px; font-family:var(--mono); font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums;}
+  .metrics b{color:var(--text); font-weight:600;}
+  .metrics .sep{width:1px; height:20px; background:var(--line);}
+  .toggles{display:flex; align-items:center; gap:6px;}
+  .toggles button{border:1px solid var(--line); background:transparent; color:var(--muted); border-radius:5px; min-height:28px; padding:4px 9px; font-size:12px; font-family:var(--mono);}
+  .toggles button:hover{color:var(--text); background:var(--hover);}
+  #status{font-family:var(--mono); font-size:12px; line-height:1.5; color:var(--muted);}
+  #status.offline{color:var(--danger);}
+
+  /* deck */
+  .deck{flex:1 1 auto; display:grid; grid-template-columns:280px minmax(0,1fr) 392px; min-height:0;}
+  .col{min-height:0; overflow-y:auto; overflow-x:hidden;}
+  .dispatch{border-right:1px solid var(--line); background:var(--panel);}
+  .exchange{display:flex; flex-direction:column; background:var(--ink); overflow:hidden;}
+  .console{border-left:1px solid var(--line); background:var(--panel);}
+  .colhead{position:sticky; top:0; z-index:2; min-height:40px; background:var(--panel); padding:11px 16px 9px;
+    border-bottom:1px solid var(--line-soft); display:flex; align-items:center; gap:8px;}
+  .colhead .count{margin-left:auto; font-family:var(--mono); font-size:11px; color:var(--faint);}
+  .mtab{display:none;}
+
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px 11px; margin:8px 10px; box-shadow:var(--shadow);}
+  .inbox-card .top{display:flex; align-items:center; gap:8px; margin-bottom:6px;}
+  .chip{font-family:var(--mono); font-size:10.5px; letter-spacing:.05em; text-transform:uppercase; padding:2px 7px; border-radius:999px;
+    border:1px solid var(--machine); color:var(--machine); background:var(--machine-soft); white-space:nowrap;}
+  .chip.workspace{border-color:var(--human); color:var(--human); background:var(--human-soft);}
+  .src{font-family:var(--mono); font-size:12px; color:var(--muted);}
+  .aux{margin-left:auto; font-size:10.5px; color:var(--faint);}
+  .inbox-card .preview{color:var(--text); font-size:13px; margin-bottom:9px; word-break:break-word;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;}
+  .row{display:flex; align-items:center; gap:7px; min-width:0;}
+  .row>.mini{min-width:0;}
+  .btn{border:1px solid var(--line); background-color:var(--panel); background-image:none; color:var(--text); border-radius:4px; min-height:32px; padding:5px 11px; font-size:12.5px; line-height:1.25; white-space:nowrap; transition:background-color .08s,border-color .08s;}
+  .btn:hover{background:var(--hover); border-color:var(--faint);}
+  .btn.primary{background:var(--human-bg); border-color:var(--human-bg); color:var(--human-on); font-weight:600;}
+  .btn.primary:hover{background:var(--human); border-color:var(--human);}
+  .btn.ok{color:var(--ok); border-color:var(--ok);}
+  .btn.end{border-style:solid;}
+  .btn.ghost-danger{color:var(--danger); border-color:transparent;}
+  .btn.ghost-danger:hover{border-color:var(--danger); background:var(--danger-soft);}
+  .btn:disabled{opacity:.4; cursor:not-allowed;}
+
+  .conv{display:flex; gap:9px; align-items:flex-start; min-width:0; margin:2px 6px; padding:8px 9px; border-radius:4px; cursor:pointer; border:1px solid transparent;}
+  .conv:hover{background:var(--hover);}
+  .conv.sel{background:var(--selection); border-color:transparent; box-shadow:inset 2px 0 0 var(--human);}
+  .conv .lamp{width:7px; height:7px; border-radius:50%; margin-top:5px; flex:0 0 auto; background:var(--faint);}
+  .conv.turn .lamp{background:var(--human-bg);}
+  .conv.wait .lamp{background:var(--machine);}
+  @keyframes beat{0%,100%{opacity:1;}50%{opacity:.45;}}
+  .conv .mid{flex:1 1 auto; min-width:0; overflow:hidden;}
+  .conv .id,.conv .sub{display:block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .conv .id{font-family:var(--mono); font-size:12px;}
+  .conv .sub{font-size:11.5px; color:var(--muted);}
+  .conv .st{flex:0 0 auto; margin-left:4px; font-family:var(--mono); font-size:10px; text-transform:uppercase; letter-spacing:.03em; color:var(--faint); white-space:nowrap;}
+  .conv.turn .st{color:var(--human);} .conv.wait .st{color:var(--machine);}
+  .serving-note{margin:6px 16px 8px; font-size:11px; color:var(--faint); line-height:1.4;}
+  #archived-wrap{margin-top:6px; border-top:1px solid var(--line-soft);}
+  .arch-summary{list-style:none; cursor:pointer; padding:10px 14px; font-family:var(--mono); font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--faint); display:flex; align-items:center; gap:8px;}
+  .arch-summary::-webkit-details-marker{display:none;}
+  .arch-summary::before{content:"▸"; display:inline-block; transition:transform .15s;}
+  #archived-wrap[open] .arch-summary::before{transform:rotate(90deg);}
+  #archived .conv{opacity:.7;}
+  .empty-note{padding:16px; font-size:12px; color:var(--faint);}
+
+  .exhead{flex:0 0 auto; min-width:0; min-height:42px; padding:10px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; background:var(--panel);}
+  .exhead .who{font-family:var(--mono); font-size:13px;}
+  .exhead .task{min-width:0; font-family:var(--mono); font-size:11.5px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .exhead .disclose{margin-left:auto; font-size:11px; color:var(--muted); display:flex; align-items:center; gap:6px; white-space:nowrap;}
+  .exhead .disclose .d{width:6px; height:6px; border-radius:50%; background:var(--human-bg);}
+  #empty{flex:1 1 auto; display:grid; place-items:center; color:var(--muted); padding:20px; text-align:center;}
+  .stream{flex:1 1 auto; overflow-y:auto; padding:20px; scroll-behavior:smooth;}
+  .turnwrap{max-width:820px; margin:0 auto;}
+  .entry{margin-bottom:14px;}
+  .entry .who{font-family:var(--mono); font-size:11px; letter-spacing:.03em; color:var(--muted); margin-bottom:5px; display:flex; gap:8px; align-items:center;}
+  .entry .who .k{color:var(--faint);}
+  .bubble{border:1px solid var(--line); border-radius:6px; padding:10px 12px; background:var(--panel); box-shadow:var(--shadow); white-space:pre-wrap; word-break:break-word;}
+  .entry.caller .bubble{border-left:2px solid var(--machine);} .entry.caller .who .n{color:var(--machine);}
+  .entry.human .bubble{border-left:2px solid var(--human);} .entry.human .who .n{color:var(--human);}
+  .entry.system .bubble{background:transparent; border-style:dashed; color:var(--muted);}
+  .tool{border:1px solid var(--line); border-radius:6px; overflow:hidden; background:var(--panel); box-shadow:var(--shadow);}
+  .tool .th{display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid var(--line-soft); font-family:var(--mono); font-size:11px; letter-spacing:.04em; text-transform:uppercase;}
+  .tool.call .th{color:var(--human);} .tool.call{border-left:2px solid var(--human);}
+  .tool.result .th{color:var(--machine);} .tool.result{border-left:2px solid var(--machine);}
+  .tool .th .name{color:var(--text); text-transform:none; letter-spacing:0;}
+  .tool pre{margin:0; padding:11px 13px; font-family:var(--mono); font-size:12.5px; line-height:1.5; overflow-x:auto; white-space:pre-wrap; word-break:break-word;}
+  .entry.rejected .bubble{border-left:2px solid var(--danger); background:var(--danger-soft);} .entry.rejected .who .n{color:var(--danger);}
+
+  .composer{flex:0 0 auto; background:var(--panel); border-top:1px solid var(--line); padding:0 20px 14px;}
+  .composer .inner{max-width:820px; margin:0 auto; padding-top:12px;}
+  .phasebar{border:1px solid var(--line); background:var(--panel); border-radius:6px 6px 0 0; border-bottom:none; box-shadow:inset 2px 0 0 var(--human);
+    padding:9px 13px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;}
+  .phasebar.wait{box-shadow:inset 2px 0 0 var(--machine);}
+  .phasebar.term{border-color:var(--line); background:var(--raised);}
+  .phasebar .name{font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--human); font-weight:600; white-space:nowrap;}
+  .phasebar.wait .name{color:var(--machine);} .phasebar.term .name{color:var(--muted);}
+  .phasebar .exp{color:var(--text); font-size:12.5px;}
+  .composer textarea{width:100%; min-height:76px; resize:vertical; border:1px solid var(--line); border-radius:0 0 6px 6px; border-top:none;
+    padding:10px 12px; background:var(--input); color:var(--text); font:inherit; line-height:1.5;}
+  .composer textarea:focus-visible{outline:2px solid var(--human); border-color:var(--human);}
+  .sendrow{display:flex; gap:8px; margin-top:10px; align-items:center; flex-wrap:wrap;}
+  .hint{font-family:var(--mono); font-size:11px; color:var(--faint); margin-left:auto;}
+  .afterhint{margin-top:9px; font-family:var(--mono); font-size:11px; color:var(--muted); min-height:16px; line-height:1.4;}
+  .afterhint b{color:var(--text); font-weight:600;} .afterhint .ph{color:var(--human);}
+
+  .console-intro{margin:0; padding:15px 18px; border-bottom:1px solid var(--line-soft); font-size:11.5px; color:var(--muted); line-height:1.5;}
+  .console-intro b{color:var(--human); font-weight:600;}
+  .turn-notice{margin:10px 14px 0; padding:10px 12px; border:1px solid var(--machine); background:var(--machine-soft); border-radius:10px; font-size:12px; color:var(--text); line-height:1.5;}
+  .turn-notice.term{border-color:var(--line); background:var(--raised); color:var(--muted);}
+  .sect{padding:15px 18px; border-bottom:1px solid var(--line-soft);}
+  .sect:last-child{border-bottom:none;}
+  .sect>.eyebrow{display:grid; grid-template-columns:minmax(0,1fr) minmax(0,auto); align-items:start; column-gap:12px; margin-bottom:9px;}
+  .sect .native{min-width:0; max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:right; font-family:var(--mono); font-size:10px; color:var(--faint); text-transform:none; letter-spacing:0;}
+  .gate{font-size:11.5px; color:var(--muted); margin:0 0 10px; line-height:1.45;}
+  #workspace-sect .row{display:grid; grid-template-columns:minmax(0,1fr) auto;}
+
+  .change{border:1px solid var(--line); border-radius:6px; margin:7px 0; background:var(--panel); overflow:hidden;}
+  .change .ch{display:flex; align-items:center; gap:9px; padding:9px 11px;}
+  .change .ch input[type=checkbox]{accent-color:var(--human-bg); width:15px; height:15px;}
+  .kind{font-family:var(--mono); font-size:10px; letter-spacing:.05em; text-transform:uppercase; padding:2px 6px; border-radius:5px;}
+  .kind.write,.kind.create{color:var(--ok); background:var(--ok-soft);}
+  .kind.edit,.kind.modify{color:var(--machine); background:var(--machine-soft);}
+  .kind.delete{color:var(--danger); background:var(--danger-soft);}
+  .change .path{font-family:var(--mono); font-size:12.5px; word-break:break-all;}
+  .change details summary{cursor:pointer; padding:0 11px 9px; font-family:var(--mono); font-size:11px; color:var(--faint); list-style:none;}
+  .change details summary::-webkit-details-marker{display:none;}
+  .change pre{margin:0; padding:0 11px 11px; font-family:var(--mono); font-size:12px; overflow-x:auto; white-space:pre-wrap; word-break:break-word; line-height:1.5;}
+  .deliver-row{display:flex; gap:8px; margin-top:10px;}
+
+  .todo{display:flex; gap:10px; align-items:center; padding:5px 2px;}
+  .tstate{width:17px; height:17px; border-radius:50%; border:2px solid var(--faint); background:transparent; padding:0; flex:0 0 auto; position:relative;}
+  .todo[data-status=in_progress] .tstate{border-color:var(--human-bg); background:var(--human-soft); box-shadow:0 0 0 3px var(--human-soft); animation:beat 2s ease-in-out infinite;}
+  .todo[data-status=in_progress] .tstate::after{content:""; position:absolute; inset:3px; border-radius:50%; background:var(--human-bg);}
+  .todo[data-status=completed] .tstate{border-color:var(--human-bg); background:var(--human-bg);}
+  .todo[data-status=completed] .tstate::after{content:"✓"; position:absolute; inset:-1px; display:grid; place-items:center; font-size:11px; color:var(--human-on); font-weight:700;}
+  .todo span.txt{flex:1; font-size:13px; word-break:break-word;}
+  .todo[data-status=in_progress] span.txt{color:var(--human);}
+  .todo[data-status=completed] span.txt{text-decoration:line-through; color:var(--faint);}
+  .todo .slabel{font-family:var(--mono); font-size:9.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--faint);}
+  .todo[data-status=in_progress] .slabel{color:var(--human);}
+  .todo .x{border:none; background:transparent; color:var(--faint); font-size:15px; padding:0 4px;}
+  .todo .x:hover{color:var(--danger);}
+  .mini{width:100%; min-height:32px; border:1px solid var(--line); border-radius:4px; padding:6px 9px; background:var(--input); color:var(--text); font-family:var(--mono); font-size:12px;}
+  .mini:focus{border-color:var(--human); outline:none;}
+
+  .disc{border:1px solid var(--line); border-radius:6px; margin-top:8px; overflow:hidden; background:var(--panel);}
+  .disc>summary{list-style:none; cursor:pointer; padding:10px 13px; display:flex; align-items:center; gap:9px; font-family:var(--mono); font-size:12.5px;}
+  .disc>summary::-webkit-details-marker{display:none;}
+  .disc>summary .native{margin-left:auto;}
+  .disc>summary .caret{color:var(--faint); transition:transform .15s;}
+  .disc[open]>summary .caret{transform:rotate(90deg);}
+  .disc .body{padding:0 13px 13px;}
+  .disc textarea{min-height:56px; resize:vertical;}
+
+  .alert{display:flex; gap:10px; align-items:center; margin:8px 14px 0; padding:9px 12px;
+    border:1px solid var(--danger); background:var(--danger-soft); border-radius:10px; font-size:12.5px;}
+  .alert span{flex:1; word-break:break-word;}
+  .alert button{border:1px solid var(--danger); color:var(--danger); background:transparent; border-radius:7px; padding:3px 9px; font-size:11px;}
+
+  @media (max-width:1180px){ .deck{grid-template-columns:248px minmax(0,1fr) 352px;} .metrics{gap:11px;} }
+  @media (max-width:920px){
+    .deck{grid-template-columns:1fr;}
+    .col{display:none;} .col.active{display:flex; flex-direction:column;}
+    .dispatch,.console{border:none;}
+    .rail{gap:10px; padding:0 10px;}
+    .badge{flex-shrink:0;}
+    .badge .role,#status,.metrics{display:none;}
+    .badge .model{font-size:13px; white-space:nowrap;}
+    .mtab{display:flex; gap:4px; margin-left:auto;}
+    .mtab button{border:1px solid var(--line); background:transparent; color:var(--muted); font-family:var(--mono); font-size:11px; padding:5px 8px; border-radius:8px;}
+    .mtab button.on{color:var(--human); border-color:var(--human);}
   }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.danger { color: var(--danger); border-color: var(--danger); }
-  button:disabled { opacity: .45; cursor: not-allowed; }
-  #transcript { flex: 1; overflow-y: auto; padding: 18px 22px; }
-  .entry { max-width: 760px; margin: 0 auto 12px; }
-  .entry .who { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
-  .entry .bubble {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-    padding: 10px 14px; white-space: pre-wrap; word-break: break-word;
+  @media (max-width:480px){
+    .rail{gap:7px; padding:0 8px;}
+    .badge .model{display:none;}
+    .mtab{flex:1 1 auto; min-width:0; margin-left:0;}
+    .mtab button{flex:1 1 0; min-width:0; padding:5px 3px;}
+    .toggles{flex:0 0 auto; gap:4px;}
+    .toggles button{padding:4px 7px;}
   }
-  .entry.human .bubble { border-color: var(--accent); }
-  .entry.rejected .bubble { border-color: var(--danger); }
-  #composer { border-top: 1px solid var(--line); padding: 12px 22px 16px; background: var(--panel); }
-  #composer .inner { max-width: 760px; margin: 0 auto; }
-  textarea, input[type="text"] {
-    width: 100%; min-height: 72px; resize: vertical; border: 1px solid var(--line);
-    border-radius: 10px; padding: 10px 12px; background: var(--bg); color: var(--text);
-    font: inherit;
-  }
-  input[type="text"] { min-height: 0; padding: 8px 12px; }
-  #todo-list .todo { display: flex; gap: 8px; align-items: center; padding: 4px 2px; }
-  #todo-list .todo.completed span { text-decoration: line-through; color: var(--muted); }
-  #todo-list .todo span { flex: 1; }
-  #todo-list .todo button { padding: 2px 8px; }
-  #composer .row { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
-  #phase { color: var(--muted); font-size: 12px; margin-left: auto; }
-  #topbar { position: fixed; right: 14px; top: 10px; display: flex; gap: 10px; align-items: center; font-size: 12px; }
-  #status { color: var(--muted); }
-  #status.offline { color: var(--danger); }
-  #lang { padding: 2px 8px; font-size: 12px; }
-  #empty { flex: 1; display: grid; place-items: center; color: var(--muted); }
-  details { margin-top: 8px; }
-  details textarea { min-height: 56px; font-family: ui-monospace, monospace; font-size: 12px; }
+  @media (prefers-reduced-motion:reduce){ .conv.turn .lamp,.todo .tstate{animation:none;} }
 </style>
 </head>
 <body>
-<aside>
-  <div id="topbar"><span id="status"></span><button id="lang"></button></div>
-  <h2 data-i18n="inbox"></h2>
-  <div id="inbox"></div>
-  <h2 data-i18n="conversations"></h2>
-  <div id="conversations"></div>
-  <div id="review-panel" hidden>
-    <h2 data-i18n="workspaceChanges"></h2>
-    <div id="review"></div>
-    <div class="actions" style="margin:4px">
-      <button id="deliver-changes" class="primary"></button>
-      <button id="discard-changes" class="danger"></button>
-    </div>
+<header class="rail">
+  <div class="badge">
+    <span class="dot" title="online"></span>
+    <span class="model">human-expert</span>
+    <span class="role" data-i18n="role">你正在扮演模型</span>
   </div>
-</aside>
-<main>
-  <div id="empty"></div>
-  <div id="transcript" hidden></div>
-  <div id="composer" hidden>
-    <div class="inner">
-      <textarea id="draft"></textarea>
+  <span class="spacer"></span>
+  <div class="metrics">
+    <span data-i18n="queue">队列</span> <b id="m-queue">0</b><span class="sep"></span>
+    <span data-i18n="pending">当前挂起</span> <b id="m-pending">—</b><span class="sep"></span>
+    <span data-i18n="tokens">Token</span> <b id="m-tokens">~0</b><span class="sep"></span>
+    <b id="buns" style="cursor:help">3 馒头</b>
+  </div>
+  <div class="mtab" role="tablist">
+    <button data-view="dispatch" data-i18n="mDispatch">派单</button>
+    <button data-view="exchange" class="on" data-i18n="mExchange">对话</button>
+    <button data-view="console" data-i18n="mConsole">操作台</button>
+  </div>
+  <div class="toggles">
+    <span id="status"></span>
+    <button id="theme" title="切换主题">◐</button>
+    <button id="lang">EN</button>
+  </div>
+</header>
+
+<div class="deck">
+  <aside class="col dispatch" data-col="dispatch">
+    <div class="colhead"><span class="eyebrow" data-i18n="inbox">收件箱</span><span class="count" id="inbox-count"></span></div>
+    <div id="alerts"></div>
+    <div id="inbox"></div>
+    <div class="colhead" style="margin-top:6px"><span class="eyebrow" data-i18n="serving">接单中</span><span class="count" id="conv-count"></span></div>
+    <p class="serving-note" data-i18n="servingNote">你接下的单 —— 正在为谁当模型。每个是一次 completion 会话。</p>
+    <div id="conversations"></div>
+    <details id="archived-wrap" hidden>
+      <summary class="arch-summary"><span data-i18n="ended">已结束</span> <span class="count" id="arch-count"></span></summary>
+      <div id="archived"></div>
+    </details>
+  </aside>
+
+  <section class="exchange col active" data-col="exchange">
+    <div class="exhead" id="exhead" hidden>
+      <span class="who" id="ex-who"></span>
+      <span class="task" id="ex-task"></span>
+      <span class="disclose" title="对方知道背后是人"><span class="d"></span><span data-i18n="disclosed">已披露:人类专家</span></span>
+    </div>
+    <div id="empty" data-i18n="emptyHint">从左侧接单或选择一个会话</div>
+    <div class="stream" id="stream" hidden><div class="turnwrap" id="transcript"></div></div>
+    <div class="composer" id="composer" hidden>
+      <div class="inner">
+        <div class="phasebar" id="phasebar">
+          <span class="name" id="phase-name"></span>
+          <span class="exp" id="phase-exp"></span>
+        </div>
+        <textarea id="draft" placeholder="写一段回复…  Ctrl+Enter 发送"></textarea>
+        <div class="sendrow">
+          <button class="btn primary" id="b-send" data-i18n="send">发送</button>
+          <button class="btn end" id="b-handoff" data-i18n="handoff">发送并等对方回复</button>
+          <span class="hint">Ctrl+Enter</span>
+        </div>
+        <div class="afterhint" id="afterhint" data-k="send"></div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="col console" data-col="console">
+    <div class="colhead"><span class="eyebrow" data-i18n="console">操作台</span></div>
+    <p class="console-intro" data-i18n="consoleIntro">以下动作都会生成 <b>对方 Agent 的原生 tool call</b>,由它在自己的环境执行,result 随下一次 completion 回流。文字回复在对话下方,不走这里。</p>
+    <div id="turn-notice" class="turn-notice" hidden></div>
+    <button id="abandon-btn" class="btn ghost-danger" hidden style="margin:8px 14px 0" data-i18n="abandon">放弃这单</button>
+
+    <div class="sect" id="workspace-sect" hidden>
+      <div class="eyebrow"><span data-i18n="humanWorkspace">真人工作目录</span><span class="native" id="workspace-id"></span></div>
+      <p class="gate" data-i18n="humanWorkspaceGate">这是你这台机器上当前会话使用的项目目录。可切换到已有 repo；切换时当前内容会成为新 baseline，不会整仓误交付。</p>
       <div class="row">
-        <button id="send-progress" class="primary"></button>
-        <button id="send-clarify"></button>
-        <button id="send-final" class="ok"></button>
-        <span id="phase"></span>
+        <input type="text" id="workspace-path" class="mini" style="flex:1" autocomplete="off" spellcheck="false">
+        <button class="btn" id="set-workspace" data-i18n="useWorkspace">使用此目录</button>
       </div>
-      <div class="row" id="command-row" hidden>
-        <input type="text" id="command">
-        <button id="send-command"></button>
+    </div>
+
+    <div class="sect" id="review-sect" hidden>
+      <div class="eyebrow"><span data-i18n="ws">变更 · 交付</span><span class="native">write · edit · delete</span></div>
+      <p class="gate" data-i18n="wsGate">你在自己 IDE 里改,fsnotify 监控镜像、debounce 后 full review。勾选哪条才交付哪条 → 对方 Agent 的同名原生工具(增 / 改 / 删),成功回执才推进 baseline。不是自动双向同步。</p>
+      <div id="review"></div>
+      <div class="deliver-row">
+        <button class="btn primary" id="deliver-changes" style="flex:1" data-i18n="deliver">交付所选</button>
+        <button class="btn ghost-danger" id="discard-changes" data-i18n="discard">丢弃</button>
       </div>
-      <details id="todos-panel" hidden>
-        <summary id="todos-summary"></summary>
-        <div id="todo-list"></div>
-        <div class="row">
-          <input type="text" id="todo-new">
-          <button id="add-todo"></button>
-          <button id="send-todos" class="primary"></button>
+    </div>
+
+    <div class="sect" id="plan-sect" hidden>
+      <div class="eyebrow"><span data-i18n="planT">对方 Agent 的计划</span><span class="native" id="plan-native"></span></div>
+      <p class="gate" id="plan-gate"></p>
+      <div id="todo-list"></div>
+      <div class="row" style="margin-top:9px">
+        <input type="text" id="todo-new" class="mini" style="flex:1" data-ph="新任务…" placeholder="新任务…">
+        <button class="btn" id="add-todo" data-i18n="addTodo">添加</button>
+        <button class="btn" id="refresh-tasks" data-i18n="refreshTasks" hidden>刷新</button>
+        <button class="btn primary" id="send-todos" data-i18n="syncPlan">同步计划</button>
+      </div>
+    </div>
+
+    <div class="sect">
+      <details class="disc" id="command-disc" hidden>
+        <summary><span class="caret">▸</span><span data-i18n="cmdT">发送命令</span><span class="native" id="command-native"></span></summary>
+        <div class="body">
+          <p class="gate" data-i18n="cmdGate">命令由对方 Agent 在它自己的环境执行,不在你的机器上跑。破坏性命令二次确认。</p>
+          <input type="text" id="command" class="mini" data-ph="由对方 Agent 执行的命令…  Ctrl+Enter" placeholder="由对方 Agent 执行的命令…  Ctrl+Enter">
         </div>
       </details>
-      <details>
-        <summary id="tools-summary"></summary>
-        <textarea id="tool-calls" placeholder='[{"id":"call-1","name":"bash","input":{"command":"ls"}}]'></textarea>
-        <div class="row"><button id="send-tools"></button></div>
+      <details class="disc">
+        <summary><span class="caret">▸</span><span data-i18n="advT">高级 · 工具调用</span><span class="native">JSON</span></summary>
+        <div class="body">
+          <p class="gate" data-i18n="advGate">对方本次声明的任意工具,手写 JSON。未声明的工具发不出去。</p>
+          <textarea id="tool-calls" class="mini" placeholder='[{"id":"call-1","name":"grep","input":{"pattern":"expiry"}}]'></textarea>
+          <div class="row" style="margin-top:8px"><button class="btn" id="send-tools" data-i18n="sendTools">发送工具调用</button></div>
+        </div>
       </details>
     </div>
-  </div>
-</main>
+
+    <div class="sect end-session">
+      <div class="eyebrow"><span data-i18n="endSession">结束会话</span><span class="native">final · terminal</span></div>
+      <p class="gate" data-i18n="endSessionGate">把回复框中的内容作为最终交付,整个会话(task)到此结束。对方之后再来是新 task,不是这一单的续接。</p>
+      <button class="btn ok" id="send-final" style="width:100%" data-i18n="endSessionBtn">完成交付 · 结束会话</button>
+    </div>
+  </aside>
+</div>
+
 <script>
 "use strict";
-
-// --- i18n: English default, Simplified Chinese available. ---
+// ---- i18n:界面 chrome 双语(默认中文),对话内容保持原文。 ----
 const MESSAGES = {
-  en: {
-    inbox: "Inbox", conversations: "Conversations", workspaceChanges: "Workspace changes",
-    auxiliary: "auxiliary (likely title generation)",
-    accept: "Accept", reject: "Reject", rejectPrompt: "Reason for rejecting",
-    rejectDefault: "Unable to take this request", noText: "(no text)",
-    deliverSelected: "Deliver selected", discardSelected: "Discard selected",
-    sendProgress: "Send progress", clarify: "Ask back", final: "Deliver final",
-    toolsSummary: "Advanced: tool calls (JSON)", sendTools: "Send tool calls",
-    runCommand: "Run via agent", commandPlaceholder: "Command executed by the caller agent… (Ctrl+Enter)",
-    commandDanger: "This command looks destructive. Send it anyway?",
-    todosSummary: "Agent task plan (todos)", addTodo: "Add", sendTodos: "Send plan",
-    todoPlaceholder: "New task…",
-    draftPlaceholder: "Write a reply… (Ctrl+Enter sends progress)",
-    emptyHint: "Accept a request or pick a conversation on the left",
-    connecting: "connecting…", connected: "connected", offline: "disconnected, retrying…",
-    notifyNew: "Human: a new request is waiting",
-    confirmFinal: "Send the final delivery and end this conversation?",
-    confirmDiscard: "Discard the selected changes? They will not be delivered.",
-    needConversation: "Select a conversation to deliver into first",
-    needChanges: "Select changes first", parseError: "Tool-call JSON cannot be parsed",
-    acceptFailed: "Accept failed: ", rejectFailed: "Reject failed: ",
-    sendFailed: "Send failed: ", deliverFailed: "Deliver failed: ", discardFailed: "Discard failed: ",
-    who: { caller: "Caller agent", human: "Me", system: "System" },
-    kind: { progress: "progress", clarification: "question", final: "final",
-      tool_calls: "tool calls", tool_result: "tool result", rejected: "rejected" },
-    change: { create: "create", modify: "modify", delete: "delete" },
-    phase: { active: "Your turn", awaiting_results: "Waiting for tool results…",
-      awaiting_caller: "Asked back, waiting for the caller…", terminal: "Conversation ended" },
-    phaseShort: { active: "active", awaiting_results: "awaiting results",
-      awaiting_caller: "awaiting caller", terminal: "done" },
-  },
-  zh: {
-    inbox: "收件箱", conversations: "会话", workspaceChanges: "工作区改动",
-    auxiliary: "辅助请求(多为标题生成)",
-    accept: "接单", reject: "拒单", rejectPrompt: "拒单原因",
-    rejectDefault: "暂时无法处理", noText: "(无文本)",
-    deliverSelected: "交付所选", discardSelected: "丢弃所选",
-    sendProgress: "发送进度", clarify: "追问", final: "完成交付",
-    toolsSummary: "高级:工具调用 (JSON)", sendTools: "发送工具调用",
-    runCommand: "由对方执行", commandPlaceholder: "由对方 Agent 执行的命令… (Ctrl+Enter)",
-    commandDanger: "该命令看起来有破坏性,确认发送?",
-    todosSummary: "Agent 任务计划 (todos)", addTodo: "添加", sendTodos: "发送计划",
-    todoPlaceholder: "新任务…",
-    draftPlaceholder: "输入回复… (Ctrl+Enter 发送进度)",
-    emptyHint: "从左侧接单或选择会话",
-    connecting: "连接中…", connected: "已连接", offline: "连接断开,重连中…",
-    notifyNew: "Human:有新的请求等待接单",
-    confirmFinal: "确认发送最终交付并结束会话?",
-    confirmDiscard: "丢弃所选改动?它们不会被交付。",
-    needConversation: "请先选择要交付到的会话",
-    needChanges: "请先勾选改动", parseError: "工具调用 JSON 无法解析",
-    acceptFailed: "接单失败: ", rejectFailed: "拒单失败: ",
-    sendFailed: "发送失败: ", deliverFailed: "交付失败: ", discardFailed: "丢弃失败: ",
-    who: { caller: "对方 Agent", human: "我", system: "系统" },
-    kind: { progress: "进度", clarification: "追问", final: "交付",
-      tool_calls: "工具调用", tool_result: "工具结果", rejected: "被拒绝" },
-    change: { create: "新增", modify: "修改", delete: "删除" },
-    phase: { active: "轮到你回复", awaiting_results: "等待对方执行工具…",
-      awaiting_caller: "已追问,等待对方…", terminal: "会话已结束" },
-    phaseShort: { active: "进行中", awaiting_results: "等待工具结果",
-      awaiting_caller: "等待对方回复", terminal: "已完成" },
-  },
+  zh:{ role:"你正在扮演模型", queue:"队列", pending:"当前挂起", tokens:"Token",
+    mDispatch:"派单", mExchange:"对话", mConsole:"操作台",
+    inbox:"收件箱", serving:"接单中", ended:"已结束", servingNote:"你接下的单 —— 正在为谁当模型。每个是一次 completion 会话。",
+    disclosed:"已披露:人类专家", emptyHint:"从左侧接单或选择一个会话",
+    accept:"接单", reject:"拒单", rejectPrompt:"拒单原因", rejectDefault:"暂时无法处理",
+    aux:"辅助 · 标题生成", noText:"(无文本)",
+    send:"发送", handoff:"发送并等对方回复",
+    console:"操作台", consoleIntro:"以下动作都会生成对方 Agent 的原生 tool call,由它在自己的环境执行,result 随下一次 completion 回流。文字回复在对话下方,不走这里。",
+    ws:"变更 · 交付", wsGate:"你在自己 IDE 里改,fsnotify 监控镜像、debounce 后 full review。勾选哪条才交付哪条 → 对方 Agent 的同名原生工具(增 / 改 / 删),成功回执才推进 baseline。不是自动双向同步。",
+    humanWorkspace:"真人工作目录", humanWorkspaceGate:"这是你这台机器上当前会话使用的项目目录。可切换到已有 repo；切换时当前内容会成为新 baseline，不会整仓误交付。", useWorkspace:"使用此目录",
+    workspaceUnavailable:"目录不可用，请选择现有 repo",
+    deliver:"交付所选", discard:"丢弃",
+    planT:"对方 Agent 的计划", planGateList:"编辑对方 Agent 的完整计划并通过本次声明的原生工具同步。点状态圈切换 待办 → 进行中 → 完成。", planGateTasks:"创建、更新或删除 Claude 的原生 Tasks；每次同步后由 Claude 执行，result 随下一次 completion 回流。",
+    addTodo:"添加", refreshTasks:"刷新", syncPlan:"同步计划",
+    cmdT:"发送命令", cmdGate:"命令由对方 Agent 在它自己的环境执行,不在你的机器上跑。破坏性命令二次确认。",
+    advT:"高级 · 工具调用", advGate:"对方本次声明的任意工具,手写 JSON。未声明的工具发不出去。", sendTools:"发送工具调用",
+    endSession:"结束会话", endSessionGate:"把回复框中的内容作为最终交付,整个会话(task)到此结束。对方之后再来是新 task,不是这一单的续接。", endSessionBtn:"完成交付 · 结束会话",
+    connecting:"连接中…", connected:"已连接", offline:"连接断开,重连中…",
+    notifyNew:"Human:有新的请求等待接单",
+    confirmFinal:"把回复框内容作为最终交付并结束会话?", confirmDiscard:"丢弃所选改动?它们不会被交付。",
+    abandon:"放弃这单", confirmAbandon:"放弃这个会话?不通知对方(连接已断时对方本就收不到);已发出的内容无法撤销,对方之后回来会作为新单出现。",
+    needConversation:"请先选择要交付到的会话", needChanges:"请先勾选改动", needText:"请先在回复框写内容",
+    parseError:"工具调用 JSON 无法解析", commandDanger:"该命令看起来有破坏性,确认发送?",
+    acceptFailed:"接单失败: ", rejectFailed:"拒单失败: ", sendFailed:"发送失败: ",
+    alert_caller_gone:"对方已断开连接,可能不会再回复 —— 可以结束这个会话。",
+    deliverFailed:"交付失败: ", discardFailed:"丢弃失败: ",
+    workspaceFailed:"切换工作目录失败: ",
+    who:{ caller:"对方 Agent", human:"我", system:"系统" },
+    kind:{ progress:"进度", clarification:"追问", final:"交付", tool_calls:"工具调用", tool_result:"工具结果", rejected:"被拒绝" },
+    phaseName:{ active:"你的回合", awaiting_results:"等待结果", awaiting_caller:"等待对方", terminal:"会话结束" },
+    phaseExp:{ active:"对方在等你。发送 = 继续说;发送并等对方回复 = 把回合交回去;结束会话在右侧操作台。",
+      awaiting_results:"已发出工具调用,等对方 Agent 执行并回传 result。", awaiting_caller:"已追问,等对方在同一 task 回话。", terminal:"这次会话已结束;对方再来是新 task。" },
+    st:{ active:"轮到你", awaiting_results:"等结果", awaiting_caller:"等对方", terminal:"已结束" },
+    tstate:{ pending:"待办", in_progress:"进行中", completed:"完成" },
+    finalDefault:"(完成,无补充)",
+    turnNotice:{ awaiting_results:"已发出工具调用,球在对方 Agent — 它执行完、result 随下个 completion 回来就自动轮到你。等结果期间不是你的回合,操作台不能发送。", awaiting_caller:"已追问,等对方回话 — 对方回来后自动轮到你。等待期间操作台不能发送。", terminal:"会话已结束 — 不能再发送;对方再来是新 task。" } },
+  en:{ role:"you are the model now", queue:"queue", pending:"pending", tokens:"tokens",
+    mDispatch:"dispatch", mExchange:"exchange", mConsole:"console",
+    inbox:"inbox", serving:"serving", ended:"Ended", servingNote:"The requests you took — who you're the model for. Each is one completion session.",
+    disclosed:"disclosed: human expert", emptyHint:"Accept a request or pick a conversation on the left",
+    accept:"Accept", reject:"Reject", rejectPrompt:"Reason for rejecting", rejectDefault:"Unable to take this request",
+    aux:"auxiliary · title gen", noText:"(no text)",
+    send:"Send", handoff:"Send & await reply",
+    console:"console", consoleIntro:"Every action here generates a native tool call for the caller agent, run in its own environment; the result returns on the next completion. Text replies go below the conversation, not here.",
+    ws:"Changes · deliver", wsGate:"You edit in your own IDE; fsnotify watches the mirror, a full review lists changes. Deliver only what you check → the caller agent's same-named native tool (add / edit / remove); baseline advances only on a success receipt. Not a two-way auto-sync.",
+    humanWorkspace:"Human working directory", humanWorkspaceGate:"This conversation uses this project directory on your machine. You can switch to an existing repo; its current contents become the new baseline, so the whole repo is not delivered.", useWorkspace:"Use this directory",
+    workspaceUnavailable:"directory unavailable; select an existing repo",
+    deliver:"Deliver selected", discard:"Discard",
+    planT:"The caller agent's plan", planGateList:"Edit the caller agent's complete plan through the native tool declared on this request. Click the ring to cycle todo → active → done.", planGateTasks:"Create, update, or delete Claude's native Tasks. Claude executes each sync and returns results in the next completion.",
+    addTodo:"Add", refreshTasks:"Refresh", syncPlan:"Sync plan",
+    cmdT:"Send command", cmdGate:"The command runs in the caller agent's own environment, never on your machine. Destructive commands ask twice.",
+    advT:"Advanced · tool calls", advGate:"Any tool the caller declared this turn, as hand-written JSON. Undeclared tools cannot be sent.", sendTools:"Send tool calls",
+    endSession:"End session", endSessionGate:"Delivers the reply box as your final answer; the whole session (task) ends here. A later ask from the caller is a new task, not a continuation.", endSessionBtn:"Deliver final · end session",
+    connecting:"connecting…", connected:"connected", offline:"disconnected, retrying…",
+    notifyNew:"Human: a new request is waiting",
+    confirmFinal:"Deliver the reply box as final and end this conversation?", confirmDiscard:"Discard the selected changes? They will not be delivered.",
+    abandon:"Abandon", confirmAbandon:"Abandon this conversation? The caller is not notified (a dropped caller wouldn't receive it anyway); anything already sent can't be undone, and if the caller returns it appears as a new inbox request.",
+    needConversation:"Select a conversation to deliver into first", needChanges:"Select changes first", needText:"Write something in the reply box first",
+    parseError:"Tool-call JSON cannot be parsed", commandDanger:"This command looks destructive. Send it anyway?",
+    acceptFailed:"Accept failed: ", rejectFailed:"Reject failed: ", sendFailed:"Send failed: ",
+    alert_caller_gone:"The caller disconnected and may not return — you can end this conversation.",
+    deliverFailed:"Deliver failed: ", discardFailed:"Discard failed: ",
+    workspaceFailed:"Workspace switch failed: ",
+    who:{ caller:"Caller agent", human:"Me", system:"System" },
+    kind:{ progress:"progress", clarification:"question", final:"final", tool_calls:"tool calls", tool_result:"tool result", rejected:"rejected" },
+    phaseName:{ active:"your turn", awaiting_results:"awaiting results", awaiting_caller:"awaiting caller", terminal:"ended" },
+    phaseExp:{ active:"The caller is waiting. Send = keep talking; Send & await reply = hand the turn back; ending the session is in the console.",
+      awaiting_results:"Tool calls sent; waiting for the caller agent to run them and return results.", awaiting_caller:"Asked back; waiting for the caller to reply on the same task.", terminal:"This conversation has ended; a new ask is a new task." },
+    st:{ active:"your turn", awaiting_results:"awaiting", awaiting_caller:"awaiting", terminal:"ended" },
+    tstate:{ pending:"todo", in_progress:"active", completed:"done" },
+    finalDefault:"(Done, no further notes.)",
+    turnNotice:{ awaiting_results:"Tool calls sent — the caller agent is running them; when the result returns on the next completion it's your turn again. Not your turn while waiting; the console can't send.", awaiting_caller:"Asked back, waiting for the caller — it's your turn again when they reply. The console can't send while waiting.", terminal:"Conversation ended — nothing more to send; a new ask is a new task." } },
 };
-let locale = localStorage.getItem("human-web-locale")
-  || ((navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en");
-if (!MESSAGES[locale]) locale = "en";
-const t = (key) => MESSAGES[locale][key] ?? MESSAGES.en[key] ?? key;
-const tt = (table, key) => (MESSAGES[locale][table] || {})[key]
-  ?? (MESSAGES.en[table] || {})[key] ?? key;
-
-function applyStaticText() {
-  document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
-  for (const node of document.querySelectorAll("[data-i18n]")) {
-    node.textContent = t(node.dataset.i18n);
-  }
-  $("lang").textContent = locale === "zh" ? "EN" : "中文";
-  $("deliver-changes").textContent = t("deliverSelected");
-  $("discard-changes").textContent = t("discardSelected");
-  $("send-progress").textContent = t("sendProgress");
-  $("send-clarify").textContent = t("clarify");
-  $("send-final").textContent = t("final");
-  $("tools-summary").textContent = t("toolsSummary");
-  $("send-tools").textContent = t("sendTools");
-  $("send-command").textContent = t("runCommand");
-  $("command").placeholder = t("commandPlaceholder");
-  $("todos-summary").textContent = t("todosSummary");
-  $("add-todo").textContent = t("addTodo");
-  $("send-todos").textContent = t("sendTodos");
-  $("todo-new").placeholder = t("todoPlaceholder");
-  $("draft").placeholder = t("draftPlaceholder");
-  $("empty").textContent = t("emptyHint");
-}
-
-let state = { inbox: [], conversations: [] };
-let selected = null; // {caller, task_id}
-let draftTimer = null;
+let locale = localStorage.getItem("human-web-locale") || ((navigator.language||"").toLowerCase().startsWith("zh") ? "zh" : "en");
+if (!MESSAGES[locale]) locale = "zh";
+const t = (k) => MESSAGES[locale][k] ?? MESSAGES.en[k] ?? k;
+const tt = (table,k) => (MESSAGES[locale][table]||{})[k] ?? (MESSAGES.en[table]||{})[k] ?? k;
 
 const $ = (id) => document.getElementById(id);
+let state = { inbox:[], conversations:[] };
+let selected = null;          // {caller, task_id}
+let draftTimer = null;
 
-async function api(path, body) {
-  const response = await fetch(path, {
+async function api(path, body){
+  const r = await fetch(path, {
     method: body ? "POST" : "GET",
-    headers: body ? { "Content-Type": "application/json" } : {},
+    headers: body ? { "Content-Type":"application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.message || response.statusText);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.message || r.statusText);
   return data;
 }
+const keyOf = (c) => ({ caller:c.key.caller, task_id:c.key.task_id });
+const sameKey = (a,b) => a && b && a.caller===b.caller && a.task_id===b.task_id;
+const selectedConversation = () => state.conversations.find((c)=>sameKey(keyOf(c),selected)) || null;
+const taskLabel = (id) => /^task(?:[_-]|$)/i.test(String(id)) ? String(id) : "task " + id;
 
-function keyOf(conversation) {
-  return { caller: conversation.key.caller, task_id: conversation.key.task_id };
+// Phase gate — mirror of the TLA+-verified completion state machine (HumanLLM.tla).
+// phase is the human-side MIRROR, not the correctness authority (workerkit/state.go).
+// Every reply/console action sends a wire event that closes the current response,
+// which the spec permits ONLY on the human's turn (active):
+//   active --progress-->  active            (MultipleProgressSegmentsEventuallyClose)
+//   active --clarify-->   awaiting_caller   (ClarificationsCloseOnlyTheirResponse)
+//   active --tool_calls-->awaiting_results  (ToolCallsCloseOnlyTheirResponse)
+//   active --final-->     terminal          (TerminalTaskCannotBeReopened)
+//   awaiting_* --caller continuation--> active   (result / reply arrives next completion)
+// So every wire-sending control is gated on activeTurn(); non-active is read-only.
+const activeTurn = (c) => !!c && c.phase === "active";
+
+function applyStaticText(){
+  document.documentElement.lang = locale==="zh" ? "zh-CN" : "en";
+  for (const node of document.querySelectorAll("[data-i18n]")) node.textContent = t(node.dataset.i18n);
+  for (const node of document.querySelectorAll("[data-ph]")) node.placeholder = node.dataset.ph;
+  $("lang").textContent = locale==="zh" ? "EN" : "中文";
+  $("draft").placeholder = locale==="zh" ? "写一段回复…  Ctrl+Enter 发送" : "Write a reply…  Ctrl+Enter to send";
+  $("todo-new").placeholder = locale==="zh" ? "新任务…" : "New task…";
+  $("command").placeholder = locale==="zh" ? "由对方 Agent 执行的命令…  Ctrl+Enter" : "Command run by the caller agent…  Ctrl+Enter";
 }
-function sameKey(a, b) { return a && b && a.caller === b.caller && a.task_id === b.task_id; }
 
-function selectedConversation() {
-  return state.conversations.find((c) => sameKey(keyOf(c), selected)) || null;
-}
+// ---- afterhint:两个发送动作各自导致的 phase 后续 ----
+const AFTER = {
+  zh:{ send:'<b>流继续</b> · 你的回合不结束,可连发多段 · phase 保持 <span class="ph">active</span>',
+       handoff:'<b>交回合</b> · 发完等对方回话,同一 task 续接 · phase → <span class="ph">awaiting_caller</span>' },
+  en:{ send:'<b>stream stays open</b> · your turn continues, send several · phase stays <span class="ph">active</span>',
+       handoff:'<b>hand back</b> · waits for the caller to reply, same task · phase → <span class="ph">awaiting_caller</span>' },
+};
+function setAfter(k){ const el=$("afterhint"); el.dataset.k=k; el.innerHTML=(AFTER[locale]||AFTER.en)[k]; }
 
-function render() {
-  const inbox = $("inbox");
-  inbox.replaceChildren(...state.inbox.map((item) => {
-    const card = document.createElement("div");
-    card.className = "card";
-    card.innerHTML = `
-      <div class="meta"><span class="tier"></span><span class="task"></span></div>
-      <div class="preview"></div>
-      <div class="actions"></div>`;
-    card.querySelector(".tier").textContent = item.tier || "chat";
-    card.querySelector(".task").textContent = item.task_id || "";
-    card.querySelector(".preview").textContent = item.preview || t("noText");
+function render(){
+  // alerts
+  const alerts = state.alerts || [];
+  $("alerts").replaceChildren(...alerts.map((alert)=>{
+    const row = document.createElement("div"); row.className = "alert";
+    const span = document.createElement("span");
+    span.textContent = MESSAGES[locale]["alert_"+alert.code] || MESSAGES.en["alert_"+alert.code] || alert.message || alert.code;
+    const btn = document.createElement("button"); btn.textContent = locale==="zh" ? "知道了" : "Dismiss";
+    btn.onclick = () => api("/api/alerts/dismiss", { seq: alert.seq }).catch(()=>{});
+    row.append(span, btn); return row;
+  }));
+
+  // inbox
+  const inbox = state.inbox || [];
+  $("inbox-count").textContent = inbox.length ? String(inbox.length) : "";
+  $("inbox").replaceChildren(...inbox.map((item)=>{
+    const card = document.createElement("div"); card.className = "card inbox-card";
     card.dataset.testid = "inbox-item";
-    if (!item.tool_count) {
-      const badge = document.createElement("span");
-      badge.textContent = t("auxiliary");
-      badge.style.color = "var(--muted)";
-      card.querySelector(".meta").append(badge);
-    }
-    const accept = document.createElement("button");
-    accept.className = "primary"; accept.textContent = t("accept");
-    accept.dataset.action = "accept";
+    const top = document.createElement("div"); top.className = "top";
+    const chip = document.createElement("span");
+    const tier = item.tier || "chat";
+    chip.className = "chip" + (tier==="chat" ? "" : " workspace"); chip.textContent = tier;
+    const src = document.createElement("span"); src.className = "src"; src.textContent = item.caller || "";
+    top.append(chip, src);
+    if (!item.tool_count){ const aux=document.createElement("span"); aux.className="aux"; aux.textContent=t("aux"); top.append(aux); }
+    const preview = document.createElement("div"); preview.className = "preview"; preview.textContent = item.preview || t("noText");
+    const actions = document.createElement("div"); actions.className = "row";
+    const accept = document.createElement("button"); accept.className="btn primary"; accept.textContent=t("accept"); accept.dataset.action="accept";
     accept.onclick = async () => {
-      try {
-        const result = await api("/api/accept", { delivery: item.delivery });
-        selected = { caller: result.key.Caller || result.key.caller, task_id: result.key.TaskID || result.key.task_id };
-      } catch (error) { alert(t("acceptFailed") + error.message); }
+      try { const r = await api("/api/accept", { delivery:item.delivery });
+        selected = { caller:r.key.Caller||r.key.caller, task_id:r.key.TaskID||r.key.task_id }; render(); }
+      catch(e){ alert(t("acceptFailed")+e.message); }
     };
-    const reject = document.createElement("button");
-    reject.className = "danger"; reject.textContent = t("reject");
-    reject.dataset.action = "reject";
+    const reject = document.createElement("button"); reject.className="btn ghost-danger"; reject.textContent=t("reject"); reject.dataset.action="reject";
     reject.onclick = async () => {
-      const reason = prompt(t("rejectPrompt"), t("rejectDefault"));
-      if (reason === null) return;
-      try { await api("/api/reject", { delivery: item.delivery, reason }); }
-      catch (error) { alert(t("rejectFailed") + error.message); }
+      const reason = prompt(t("rejectPrompt"), t("rejectDefault")); if (reason===null) return;
+      try { await api("/api/reject", { delivery:item.delivery, reason }); }
+      catch(e){ alert(t("rejectFailed")+e.message); }
     };
-    card.querySelector(".actions").append(accept, reject);
-    return card;
+    actions.append(accept, reject);
+    card.append(top, preview, actions); return card;
   }));
 
-  const list = $("conversations");
-  list.replaceChildren(...state.conversations.map((conversation) => {
-    const card = document.createElement("div");
-    const key = keyOf(conversation);
-    card.className = "card" + (sameKey(key, selected) ? " selected" : "");
-    card.innerHTML = `<div class="meta"><span class="task"></span><span class="phase"></span></div><div class="preview"></div>`;
-    card.querySelector(".task").textContent = key.task_id;
-    card.querySelector(".phase").textContent = tt("phaseShort", conversation.phase);
-    const tail = (conversation.transcript || []).at(-1);
-    card.querySelector(".preview").textContent = tail ? (tail.text || tt("kind", tail.kind)) : "";
-    card.onclick = () => { selected = key; render(); };
-    return card;
-  }));
+  // conversations — live (serving) vs ended (terminal, collapsed archive)
+  const convs = state.conversations || [];
+  const live = convs.filter((conv) => conv.phase !== "terminal");
+  const ended = convs.filter((conv) => conv.phase === "terminal");
+  $("conv-count").textContent = live.length ? String(live.length) : "";
+  $("conversations").replaceChildren(...live.map(convCard));
+  $("archived-wrap").hidden = !ended.length;
+  $("arch-count").textContent = ended.length ? String(ended.length) : "";
+  $("archived").replaceChildren(...ended.map(convCard));
 
-  const review = state.review;
-  $("review-panel").hidden = !review || !(review.changes || []).length;
-  if (review && (review.changes || []).length) {
-    const previous = new Set(
-      [...document.querySelectorAll("#review input:checked")].map((box) => box.dataset.id)
-    );
-    $("review").replaceChildren(...review.changes.map((change) => {
-      const card = document.createElement("div");
-      card.className = "card";
-      card.innerHTML = `
-        <label style="display:flex;gap:8px;align-items:baseline">
-          <input type="checkbox">
-          <span class="meta"><span class="kind"></span></span><span class="path"></span>
-        </label>
-        <details><summary>diff</summary><pre style="white-space:pre-wrap;font-size:12px"></pre></details>`;
-      const box = card.querySelector("input");
-      box.dataset.id = change.id;
-      box.checked = previous.has(change.id);
-      card.querySelector(".kind").textContent = tt("change", change.kind);
-      card.querySelector(".path").textContent = change.path;
-      card.querySelector("pre").textContent = change.diff || change.warning || "";
-      return card;
-    }));
+  const c = selectedConversation();
+  const humanWorkspace = c?.human_workspace || null;
+  $("workspace-sect").hidden = !humanWorkspace;
+  const workspaceLabel = humanWorkspace
+    ? (humanWorkspace.available === false ? t("workspaceUnavailable") : humanWorkspace.id)
+    : "";
+  $("workspace-id").textContent = workspaceLabel;
+  $("workspace-id").title = humanWorkspace?.id || "";
+  if (humanWorkspace && document.activeElement !== $("workspace-path")) {
+    $("workspace-path").value = humanWorkspace.path || "";
   }
 
-  const conversation = selectedConversation();
-  $("empty").hidden = !!conversation;
-  $("transcript").hidden = !conversation;
-  $("composer").hidden = !conversation;
-  if (!conversation) return;
+  // review (workspace changes)
+  const review = state.review;
+  const visibleChanges = (review?.changes||[]).filter((change) =>
+    humanWorkspace && change.workspace_id === humanWorkspace.id);
+  const hasChanges = visibleChanges.length;
+  $("review-sect").hidden = !hasChanges;
+  if (hasChanges){
+    const known = new Set([...document.querySelectorAll("#review input")].map((b)=>b.dataset.id));
+    const prev = new Set([...document.querySelectorAll("#review input:checked")].map((b)=>b.dataset.id));
+    $("review").replaceChildren(...visibleChanges.map((ch)=>{
+      const card = document.createElement("div"); card.className = "change";
+      const head = document.createElement("label"); head.className = "ch"; head.style.cursor = "pointer";
+      const box = document.createElement("input"); box.type="checkbox"; box.dataset.id = ch.id;
+      // Preserve the operator's choice for an existing change, but select a
+      // newly published change by default. A delivered change gets a new ID
+      // when the file is edited again, and must not inherit the old card's
+      // stale unchecked state.
+      box.checked = !known.has(ch.id) || prev.has(ch.id);
+      box.onchange = updateDeliverCount;
+      const kind = document.createElement("span"); kind.className = "kind " + (ch.kind||""); kind.textContent = ch.kind||"";
+      const path = document.createElement("span"); path.className = "path"; path.textContent = ch.path;
+      head.append(box, kind, path);
+      const det = document.createElement("details");
+      const sum = document.createElement("summary"); sum.textContent = "diff";
+      const pre = document.createElement("pre"); pre.textContent = ch.diff || ch.warning || "";
+      det.append(sum, pre); card.append(head, det); return card;
+    }));
+    updateDeliverCount();
+  }
 
-  const transcript = $("transcript");
-  const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
-  transcript.replaceChildren(...(conversation.transcript || []).map((entry) => {
+  // transcript + composer for selected conversation
+  $("exhead").hidden = !c;
+  $("empty").hidden = !!c;
+  $("stream").hidden = !c;
+  $("composer").hidden = !c;
+  syncConsoleGates(c);
+  if (!c) return;
+
+  $("ex-who").textContent = c.key?.caller || "caller";
+  $("ex-task").textContent = taskLabel(c.key.task_id);
+
+  const stream = $("stream");
+  const nearBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 80;
+  $("transcript").replaceChildren(...(c.transcript||[]).map((e)=>{
     const item = document.createElement("div");
-    item.className = "entry " + (entry.author === "human" ? "human" : entry.kind === "rejected" ? "rejected" : "");
-    const kind = entry.kind === "text" ? "" : tt("kind", entry.kind);
-    item.innerHTML = `<div class="who"></div><div class="bubble"></div>`;
-    item.querySelector(".who").textContent = tt("who", entry.author) + (kind ? " · " + kind : "");
-    let text = entry.text || "";
-    if (entry.kind === "tool_calls") {
-      text = (entry.tool_calls || []).map((c) => `${c.name}(${JSON.stringify(c.input)})`).join("\n");
+    const author = e.author || "system";
+    item.className = "entry " + (e.kind==="rejected" ? "rejected" : author);
+    const kindLabel = (e.kind && e.kind!=="text") ? tt("kind", e.kind) : "";
+    const who = document.createElement("div"); who.className = "who";
+    const n = document.createElement("span"); n.className = "n"; n.textContent = tt("who", author);
+    who.append(n);
+    if (kindLabel){ const k=document.createElement("span"); k.className="k"; k.textContent="· "+kindLabel; who.append(k); }
+    item.append(who);
+    if (e.kind==="tool_calls"){
+      const tool = document.createElement("div"); tool.className = "tool call";
+      const th = document.createElement("div"); th.className = "th";
+      const label = document.createElement("span"); label.textContent = "⌘ tool call"; th.append(label);
+      const pre = document.createElement("pre");
+      pre.textContent = (e.tool_calls||[]).map((tc)=>`${tc.name}(${JSON.stringify(tc.input)})`).join("\n");
+      tool.append(th, pre); item.append(tool);
+    } else if (e.kind==="tool_result"){
+      const tool = document.createElement("div"); tool.className = "tool result";
+      const th = document.createElement("div"); th.className = "th";
+      const label = document.createElement("span"); label.textContent = "↩ result"; th.append(label);
+      const pre = document.createElement("pre"); pre.textContent = e.text || t("noText");
+      tool.append(th, pre); item.append(tool);
+    } else {
+      const bubble = document.createElement("div"); bubble.className = "bubble";
+      bubble.textContent = e.text || t("noText"); item.append(bubble);
     }
-    item.querySelector(".bubble").textContent = text || t("noText");
     return item;
   }));
-  if (nearBottom) transcript.scrollTop = transcript.scrollHeight;
+  if (nearBottom) stream.scrollTop = stream.scrollHeight;
 
-  const active = conversation.phase === "active";
-  $("send-progress").disabled = !active;
-  $("send-clarify").disabled = !active;
+  const active = activeTurn(c);
+  $("phasebar").className = "phasebar" + (c.phase==="terminal" ? " term" : (active ? "" : " wait"));
+  $("phase-name").textContent = tt("phaseName", c.phase);
+  $("phase-exp").textContent = tt("phaseExp", c.phase);
+  $("b-send").disabled = !active;
+  $("b-handoff").disabled = !active;
   $("send-final").disabled = !active;
+  // Console sends are tool calls that need the human's turn (active). Plan
+  // edits stay usable so a draft can be prepared; only syncing waits for active.
   $("send-tools").disabled = !active;
-  const tools = declaredTools(conversation);
-  $("command-row").hidden = !tools.includes("bash");
-  $("send-command").disabled = !active;
-  $("todos-panel").hidden = !tools.includes("todowrite");
   $("send-todos").disabled = !active;
-  renderTodos(conversation);
-  $("phase").textContent = tt("phase", conversation.phase);
-  if (document.activeElement !== $("draft")) $("draft").value = conversation.draft || "";
+  $("refresh-tasks").disabled = !active;
+  $("deliver-changes").disabled = !active;
+  $("discard-changes").disabled = !active;
+  $("command").disabled = !active;
+  const canSwitchWorkspace = !!humanWorkspace && c.phase !== "terminal" && !c.delivery;
+  $("workspace-path").disabled = !canSwitchWorkspace;
+  $("set-workspace").disabled = !canSwitchWorkspace;
+  $("draft").disabled = !active;
+  $("afterhint").hidden = !active;
+  const notice = $("turn-notice");
+  notice.hidden = active;
+  // Active work is abandonable only after the exact caller disconnect was
+  // observed. Awaiting caller/results is already locally parked and may be
+  // abandoned without that advisory flag.
+  const canAbandon = c.phase === "awaiting_caller" || c.phase === "awaiting_results" ||
+    (c.phase === "active" && c.caller_gone === true);
+  $("abandon-btn").hidden = !canAbandon;
+  if (!active) {
+    notice.className = "turn-notice" + (c.phase === "terminal" ? " term" : "");
+    notice.textContent = tt("turnNotice", c.phase);
+  }
+  if (document.activeElement !== $("draft")) $("draft").value = c.draft || "";
 }
 
-async function sendText(path) {
-  const conversation = selectedConversation();
-  if (!conversation) return;
-  const text = $("draft").value.trim();
-  if (!text) return;
-  try {
-    await api(path, { ...keyOf(conversation), text });
-    $("draft").value = "";
-  } catch (error) { alert(t("sendFailed") + error.message); }
+function convCard(c){
+  const key = keyOf(c);
+  const card = document.createElement("div");
+  const cls = c.phase==="active" ? "turn" : (c.phase==="terminal" ? "" : "wait");
+  card.className = "conv " + cls + (sameKey(key,selected) ? " sel" : "");
+  card.title = taskLabel(key.task_id);
+  const lamp = document.createElement("span"); lamp.className = "lamp";
+  const mid = document.createElement("div"); mid.className = "mid";
+  const id = document.createElement("div"); id.className = "id"; id.textContent = taskLabel(key.task_id);
+  const sub = document.createElement("div"); sub.className = "sub";
+  const tail = (c.transcript||[]).at(-1);
+  sub.textContent = tail ? (tail.text ? tail.text.slice(0,40) : tt("kind", tail.kind)) : "";
+  mid.append(id, sub);
+  const st = document.createElement("span"); st.className = "st"; st.textContent = tt("st", c.phase);
+  card.append(lamp, mid, st);
+  card.onclick = () => { selected = key; render(); };
+  return card;
 }
 
-$("lang").onclick = () => {
-  locale = locale === "zh" ? "en" : "zh";
-  localStorage.setItem("human-web-locale", locale);
-  applyStaticText();
-  render();
-};
-$("send-progress").onclick = () => sendText("/api/reply");
-$("send-clarify").onclick = () => sendText("/api/clarify");
-$("send-final").onclick = () => {
-  if (confirm(t("confirmFinal"))) sendText("/api/final");
-};
-$("send-tools").onclick = async () => {
-  const conversation = selectedConversation();
-  if (!conversation) return;
-  let calls;
-  try { calls = JSON.parse($("tool-calls").value); }
-  catch { alert(t("parseError")); return; }
-  try {
-    await api("/api/tool-calls", { ...keyOf(conversation), calls });
-    $("tool-calls").value = "";
-  } catch (error) { alert(t("sendFailed") + error.message); }
-};
-function declaredTools(conversation) {
-  const declared = conversation?.assignment?.assignment?.request?.tools || [];
-  return declared.map((tool) => tool.name);
+function updateDeliverCount(){
+  const n = document.querySelectorAll("#review input:checked").length;
+  $("deliver-changes").textContent = t("deliver") + " (" + n + ")";
 }
 
-let callSequence = 0;
-function newCallID(prefix) {
-  callSequence += 1;
-  return prefix + "-" + Date.now().toString(36) + "-" + callSequence;
+// 专用命令和计划面板只信任服务端从 exact harness + behavioral schema
+// 解析出的 profile；没有 profile 时保留高级 JSON 入口。
+function syncConsoleGates(c){
+  const commandProfile = c?.command_profile || null;
+  $("command-disc").hidden = !commandProfile;
+  $("command-native").textContent = commandProfile?.tool_name || "";
+  const profile = c?.plan_profile || null;
+  $("plan-sect").hidden = !profile;
+  if (!profile) return;
+  $("plan-native").textContent = profile.kind === "task_lifecycle"
+    ? [profile.create_tool, profile.update_tool, profile.list_tool].join(" · ")
+    : profile.tool_name;
+  $("plan-gate").textContent = profile.kind === "task_lifecycle" ? t("planGateTasks") : t("planGateList");
+  $("refresh-tasks").hidden = profile.kind !== "task_lifecycle";
+  renderTodos(c, profile);
 }
 
-async function sendCalls(conversation, calls) {
-  await api("/api/tool-calls", { ...keyOf(conversation), calls });
+// ---- 回复:发送(progress) / 发送并等对方回复(clarify) ----
+async function sendText(path){
+  const c = selectedConversation(); if (!activeTurn(c)) return;
+  const text = $("draft").value.trim(); if (!text) return;
+  try { await api(path, { ...keyOf(c), text }); $("draft").value=""; }
+  catch(e){ alert(t("sendFailed")+e.message); }
 }
 
-$("send-command").onclick = async () => {
-  const conversation = selectedConversation();
-  const command = $("command").value.trim();
-  if (!conversation || !command) return;
-  if (/(^|\s|;|&&)(rm\s|sudo\s|mkfs|dd\s|shutdown|reboot)/.test(command) && !confirm(t("commandDanger"))) return;
-  try {
-    await sendCalls(conversation, [{
-      id: newCallID("cmd"), name: "bash",
-      input: { command, description: "human console command" },
-    }]);
-    $("command").value = "";
-  } catch (error) { alert(t("sendFailed") + error.message); }
-};
-$("command").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) $("send-command").click();
-});
+// ---- 客户端 tool-call 构造 ----
+let callSeq = 0;
+const newCallID = (prefix) => prefix + "-" + Date.now().toString(36) + "-" + (++callSeq);
+async function sendCalls(c, calls){ await api("/api/tool-calls", { ...keyOf(c), calls }); }
 
-// Todos are kept client-side per conversation until sent as one todowrite call.
-const todosByTask = new Map();
-function todosFor(conversation) {
-  const key = keyOf(conversation);
-  const id = key.caller + " " + key.task_id;
-  if (!todosByTask.has(id)) todosByTask.set(id, []);
-  return todosByTask.get(id);
+// ---- 对方 Agent 计划：exact profile + transcript-backed browser draft ----
+const STATUS_ORDER = ["pending","in_progress","completed"];
+const planDrafts = new Map();
+const planKey = (c) => c.key.caller+" "+c.key.task_id;
+
+function claudeTaskID(text){
+  return [
+    /"taskId"\s*:\s*"([A-Za-z0-9._:-]+)"/i,
+    /\btask\s*#\s*([A-Za-z0-9._:-]+)/i,
+    /\btask(?:\s+id)?\s*:\s*([A-Za-z0-9._:-]+)/i,
+  ].map((pattern)=>String(text||"").match(pattern)?.[1]).find(Boolean) || "";
 }
-function renderTodos(conversation) {
-  const todos = todosFor(conversation);
-  $("todo-list").replaceChildren(...todos.map((todo, index) => {
-    const row = document.createElement("div");
-    row.className = "todo" + (todo.status === "completed" ? " completed" : "");
-    const toggle = document.createElement("input");
-    toggle.type = "checkbox";
-    toggle.checked = todo.status === "completed";
-    toggle.onchange = () => {
-      todo.status = toggle.checked ? "completed" : "pending";
-      renderTodos(conversation);
+
+function remotePlanItems(c, profile){
+  const entries = c.transcript || [];
+  if (profile.kind === "list") {
+    let latest = [];
+    for (const entry of entries) for (const call of (entry.tool_calls || [])) {
+      if (call.name !== profile.tool_name) continue;
+      const values = call.input?.[profile.items_field];
+      if (!Array.isArray(values)) continue;
+      latest = values.map((item)=>({
+        content:String(item?.[profile.content_field]||""),
+        status:String(item?.[profile.status_field]||"pending"),
+        priority:profile.priority_field ? String(item?.[profile.priority_field]||profile.default_priority||"medium") : "",
+        dirty:false,
+      })).filter((item)=>item.content);
+    }
+    return latest;
+  }
+
+  const tasks = new Map();
+  const createCalls = new Map();
+  for (const entry of entries) {
+    for (const call of (entry.tool_calls || [])) {
+      if (call.name === profile.create_tool) {
+        const item = { callID:call.id, taskId:"", content:String(call.input?.subject||""), status:"pending", dirty:false };
+        createCalls.set(call.id, item); tasks.set("call:"+call.id, item);
+      } else if (call.name === profile.update_tool) {
+        const taskId = String(call.input?.taskId||""); if (!taskId) continue;
+        const key = "task:"+taskId;
+        const prior = tasks.get(key) || { taskId, content:`Task ${taskId}`, status:"pending", dirty:false };
+        if (call.input?.subject) prior.content = String(call.input.subject);
+        if (call.input?.status) prior.status = String(call.input.status);
+        tasks.set(key, prior);
+      }
+    }
+    if (entry.kind === "tool_result" && entry.tool_call_id) {
+      const created = createCalls.get(entry.tool_call_id);
+      if (created) {
+        const taskId = claudeTaskID(entry.text);
+        if (taskId) {
+          tasks.delete("call:"+entry.tool_call_id); created.taskId = taskId;
+          tasks.set("task:"+taskId, created);
+        }
+      }
+      // Claude 2.1.217 TaskList renders stable "#id [status] subject" rows.
+      for (const match of String(entry.text||"").matchAll(/^#([A-Za-z0-9._:-]+)\s+\[(pending|in_progress|completed)\]\s+(.+)$/gmi)) {
+        tasks.set("task:"+match[1], { taskId:match[1], status:match[2], content:match[3].trim(), dirty:false });
+      }
+    }
+  }
+  return [...tasks.values()].filter((item)=>item.status !== "deleted" && item.content);
+}
+
+function planStateFor(c, profile){
+  const key = planKey(c);
+  const remote = remotePlanItems(c, profile);
+  let draft = planDrafts.get(key);
+  if (!draft || draft.profileID !== profile.id) {
+    draft = { profileID:profile.id, items:remote, dirty:false };
+  } else if (!draft.dirty) {
+    draft.items = remote;
+  } else if (profile.kind === "task_lifecycle") {
+    // Preserve unsent edits while merging IDs/results that arrived for calls
+    // already visible in the durable transcript.
+    const dirty = draft.items.filter((item)=>item.dirty);
+    draft.items = remote;
+    for (const item of dirty) {
+      const index = draft.items.findIndex((candidate)=>
+        item.taskId ? candidate.taskId===item.taskId : candidate.content===item.content);
+      if (index >= 0) draft.items[index] = { ...draft.items[index], ...item };
+      else draft.items.push(item);
+    }
+  }
+  planDrafts.set(key, draft); return draft;
+}
+
+function renderTodos(c, profile=c?.plan_profile){
+  if (!profile) return;
+  const draft = planStateFor(c, profile);
+  $("todo-list").replaceChildren(...draft.items.map((todo, index)=>{
+    if (todo.deleted) return document.createDocumentFragment();
+    const row = document.createElement("div"); row.className="todo"; row.dataset.status = todo.status;
+    const ring = document.createElement("button"); ring.className="tstate"; ring.setAttribute("aria-label","status");
+    ring.onclick = () => { const i=STATUS_ORDER.indexOf(todo.status); todo.status=STATUS_ORDER[(i+1)%3]; todo.dirty=true; draft.dirty=true; renderTodos(c,profile); };
+    const txt = document.createElement("span"); txt.className="txt"; txt.textContent = todo.content;
+    const lab = document.createElement("span"); lab.className="slabel"; lab.textContent = tt("tstate", todo.status);
+    const x = document.createElement("button"); x.className="x"; x.textContent="×";
+    x.onclick = () => {
+      if (profile.kind === "task_lifecycle" && todo.taskId) { todo.deleted=true; todo.dirty=true; }
+      else draft.items.splice(index,1);
+      draft.dirty=true; renderTodos(c,profile);
     };
-    const label = document.createElement("span");
-    label.textContent = todo.content;
-    const remove = document.createElement("button");
-    remove.textContent = "×";
-    remove.onclick = () => { todos.splice(index, 1); renderTodos(conversation); };
-    row.append(toggle, label, remove);
-    return row;
+    row.append(ring, txt, lab, x); return row;
   }));
 }
-$("add-todo").onclick = () => {
-  const conversation = selectedConversation();
-  const content = $("todo-new").value.trim();
-  if (!conversation || !content) return;
-  todosFor(conversation).push({ content, status: "pending", priority: "medium" });
-  $("todo-new").value = "";
-  renderTodos(conversation);
-};
-$("todo-new").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") $("add-todo").click();
-});
-$("send-todos").onclick = async () => {
-  const conversation = selectedConversation();
-  if (!conversation) return;
-  const todos = todosFor(conversation);
-  if (!todos.length) return;
-  try {
-    await sendCalls(conversation, [{
-      id: newCallID("todos"), name: "todowrite",
-      input: {
-        todos: todos.map((todo, index) => ({
-          id: "todo-" + (index + 1), content: todo.content,
-          status: todo.status, priority: todo.priority,
-        })),
-      },
-    }]);
-  } catch (error) { alert(t("sendFailed") + error.message); }
+
+// ---- SSE + 初始化 ----
+function connect(){
+  const source = new EventSource("/api/events");
+  source.addEventListener("state", (event)=>{
+    state = JSON.parse(event.data);
+    $("status").textContent = t("connected"); $("status").classList.remove("offline");
+    if (!selected && state.conversations.length) selected = keyOf(state.conversations[0]);
+    render(); paintMetrics();
+    if ((state.inbox||[]).length && "Notification" in window && Notification.permission==="granted" && document.hidden) new Notification(t("notifyNew"));
+  });
+  source.onerror = () => { $("status").textContent = t("offline"); $("status").classList.add("offline"); };
+}
+
+// ---- metrics:queue/pending 真实；token 是当前可见会话文本的明确近似值 ----
+function estimatedVisibleTokens(c){
+  if (!c) return 0;
+  let text = "";
+  for (const entry of (c.transcript||[])) {
+    text += entry.text || "";
+    for (const call of (entry.tool_calls||[])) text += JSON.stringify(call);
+  }
+  // CJK 字符通常接近一字一 token；其余文本以四字符一 token 展示近似量。
+  const cjk = (text.match(/[\u3400-\u9fff\uf900-\ufaff]/g)||[]).length;
+  const other = text.replace(/[\u3400-\u9fff\uf900-\ufaff]/g,"").length;
+  return cjk + Math.ceil(other/4);
+}
+function paintMetrics(){
+  $("m-queue").textContent = String((state.inbox||[]).length);
+  const c = selectedConversation();
+  $("m-tokens").textContent = "~" + estimatedVisibleTokens(c);
+  $("m-tokens").title = locale==="en"
+    ? "Estimated from the selected conversation's visible text."
+    : "按当前所选会话的可见文本近似估算。";
+  const last = c && (c.transcript||[]).at(-1);
+  if (c && c.phase==="active" && last && last.at){
+    const secs = Math.max(0, Math.floor((Date.now() - new Date(last.at).getTime())/1000));
+    $("m-pending").textContent = String(Math.floor(secs/60)).padStart(2,"0") + ":" + String(secs%60).padStart(2,"0");
+  } else { $("m-pending").textContent = "—"; }
+}
+let sessionSeconds = 0;
+function paintFuel(){
+  const n = 3 + Math.floor(sessionSeconds/90);
+  const isEn = locale==="en";
+  $("buns").textContent = isEn ? n+" buns" : n+" 馒头";
+  $("buns").title = isEn
+    ? `About ${n*230} kcal of operator fuel this session.`
+    : `本会话约 ${n*230} kcal 的真人模型燃料。`;
+}
+setInterval(()=>{ sessionSeconds++; paintMetrics(); paintFuel(); }, 1000);
+
+// ---- 事件绑定 ----
+$("b-send").onclick = () => sendText("/api/reply");
+$("b-handoff").onclick = () => sendText("/api/clarify");
+$("b-send").addEventListener("mouseenter", ()=>setAfter("send"));
+$("b-send").addEventListener("focus", ()=>setAfter("send"));
+$("b-handoff").addEventListener("mouseenter", ()=>setAfter("handoff"));
+$("b-handoff").addEventListener("focus", ()=>setAfter("handoff"));
+$("composer").addEventListener("mouseleave", ()=>setAfter("send"));
+
+$("send-final").onclick = async () => {
+  const c = selectedConversation(); if (!activeTurn(c)) return;
+  if (!confirm(t("confirmFinal"))) return;
+  const text = $("draft").value.trim() || t("finalDefault");
+  try { await api("/api/final", { ...keyOf(c), text }); $("draft").value=""; }
+  catch(e){ alert(t("sendFailed")+e.message); }
 };
 
-function checkedChangeIDs() {
-  return [...document.querySelectorAll("#review input:checked")].map((box) => box.dataset.id);
+$("send-tools").onclick = async () => {
+  const c = selectedConversation(); if (!c) return;
+  let calls; try { calls = JSON.parse($("tool-calls").value); } catch { alert(t("parseError")); return; }
+  try { await sendCalls(c, calls); $("tool-calls").value=""; } catch(e){ alert(t("sendFailed")+e.message); }
+};
+
+$("command").addEventListener("keydown", (e)=>{ if (e.key==="Enter" && (e.ctrlKey||e.metaKey)) runCommand(); });
+async function runCommand(){
+  const c = selectedConversation(); const profile = c?.command_profile;
+  const command = $("command").value.trim(); if (!c || !profile || !command) return;
+  if (/(^|\s|;|&&)(rm\s|sudo\s|mkfs|dd\s|shutdown|reboot)/.test(command) && !confirm(t("commandDanger"))) return;
+  const input = { [profile.command_field]:command };
+  if (profile.description_field) input[profile.description_field] = "human console command";
+  try { await sendCalls(c, [{ id:newCallID("cmd"), name:profile.tool_name, input }]); $("command").value=""; }
+  catch(e){ alert(t("sendFailed")+e.message); }
 }
+
+$("add-todo").onclick = () => {
+  const c = selectedConversation(); const profile = c?.plan_profile; const content = $("todo-new").value.trim();
+  if (!c || !profile || !content) return;
+  const draft = planStateFor(c,profile);
+  draft.items.push({ content, status:"pending", priority:profile.default_priority||"", taskId:"", dirty:true });
+  draft.dirty=true; $("todo-new").value=""; renderTodos(c,profile);
+};
+$("todo-new").addEventListener("keydown", (e)=>{ if (e.key==="Enter") $("add-todo").click(); });
+$("send-todos").onclick = async () => {
+  const c = selectedConversation(); const profile = c?.plan_profile; if (!c || !profile) return;
+  const draft = planStateFor(c,profile); let calls=[];
+  if (profile.kind === "list") {
+    if (!draft.dirty) return;
+    const items = draft.items.filter((item)=>!item.deleted).map((item)=>{
+      const encoded = { [profile.content_field]:item.content, [profile.status_field]:item.status };
+      if (profile.priority_field) encoded[profile.priority_field]=item.priority||profile.default_priority;
+      return encoded;
+    });
+    calls=[{ id:newCallID("plan"), name:profile.tool_name, input:{ [profile.items_field]:items } }];
+  } else {
+    for (const item of draft.items.filter((candidate)=>candidate.dirty)) {
+      if (!item.taskId && !item.deleted) calls.push({ id:newCallID("task-create"), name:profile.create_tool,
+        input:{ subject:item.content, description:item.content, activeForm:`Working on ${item.content}` } });
+      else if (item.taskId) calls.push({ id:newCallID("task-update"), name:profile.update_tool,
+        input:{ taskId:item.taskId, status:item.deleted ? "deleted" : item.status } });
+    }
+    if (!calls.length) return;
+  }
+  try {
+    await sendCalls(c,calls); draft.dirty=false;
+    for (const item of draft.items) item.dirty=false;
+  } catch(e){ alert(t("sendFailed")+e.message); }
+};
+$("refresh-tasks").onclick = async () => {
+  const c=selectedConversation(); const profile=c?.plan_profile;
+  if (!c || profile?.kind!=="task_lifecycle") return;
+  try { await sendCalls(c,[{ id:newCallID("task-list"), name:profile.list_tool, input:{} }]); }
+  catch(e){ alert(t("sendFailed")+e.message); }
+};
+
+const checkedChangeIDs = () => [...document.querySelectorAll("#review input:checked")].map((b)=>b.dataset.id);
+$("set-workspace").onclick = async () => {
+  const c = selectedConversation(); if (!c?.human_workspace) return;
+  const path = $("workspace-path").value.trim(); if (!path) return;
+  $("set-workspace").disabled = true;
+  try { await api("/api/workspace", { ...keyOf(c), path }); }
+  catch(e){ alert(t("workspaceFailed")+e.message); }
+  finally {
+    const current = selectedConversation();
+    $("set-workspace").disabled = !current?.human_workspace || current.phase === "terminal" || !!current.delivery;
+  }
+};
+$("workspace-path").addEventListener("keydown", (e)=>{
+  if (e.key==="Enter"){ e.preventDefault(); $("set-workspace").click(); }
+});
 $("deliver-changes").onclick = async () => {
-  const conversation = selectedConversation();
-  const ids = checkedChangeIDs();
-  if (!conversation) { alert(t("needConversation")); return; }
-  if (!ids.length) { alert(t("needChanges")); return; }
-  try { await api("/api/review/deliver", { ...keyOf(conversation), change_ids: ids }); }
-  catch (error) { alert(t("deliverFailed") + error.message); }
+  const c = selectedConversation(); const ids = checkedChangeIDs();
+  if (!c){ alert(t("needConversation")); return; } if (!ids.length){ alert(t("needChanges")); return; }
+  try { await api("/api/review/deliver", { ...keyOf(c), change_ids:ids }); }
+  catch(e){ alert(t("deliverFailed")+e.message); }
 };
 $("discard-changes").onclick = async () => {
-  const ids = checkedChangeIDs();
-  if (!ids.length) { alert(t("needChanges")); return; }
+  const ids = checkedChangeIDs(); if (!ids.length){ alert(t("needChanges")); return; }
   if (!confirm(t("confirmDiscard"))) return;
-  try { await api("/api/review/discard", { change_ids: ids }); }
-  catch (error) { alert(t("discardFailed") + error.message); }
+  try { await api("/api/review/discard", { change_ids:ids }); } catch(e){ alert(t("discardFailed")+e.message); }
 };
+$("abandon-btn").onclick = async () => {
+  const c = selectedConversation(); if (!c) return;
+  if (!confirm(t("confirmAbandon"))) return;
+  try { await api("/api/abandon", { ...keyOf(c) }); }
+  catch(e){ alert(t("sendFailed")+e.message); }
+};
+
 $("draft").addEventListener("input", () => {
   clearTimeout(draftTimer);
-  draftTimer = setTimeout(() => {
-    const conversation = selectedConversation();
-    if (conversation) api("/api/draft", { ...keyOf(conversation), text: $("draft").value }).catch(() => {});
-  }, 600);
+  draftTimer = setTimeout(() => { const c=selectedConversation(); if (c) api("/api/draft", { ...keyOf(c), text:$("draft").value }).catch(()=>{}); }, 600);
 });
-$("draft").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) sendText("/api/reply");
-});
+$("draft").addEventListener("keydown", (e)=>{ if (e.key==="Enter" && (e.ctrlKey||e.metaKey)){ e.preventDefault(); sendText("/api/reply"); } });
 
-function connect() {
-  const source = new EventSource("/api/events");
-  source.addEventListener("state", (event) => {
-    state = JSON.parse(event.data);
-    $("status").textContent = t("connected");
-    $("status").classList.remove("offline");
-    if (!selected && state.conversations.length) selected = keyOf(state.conversations[0]);
-    render();
-    if (state.inbox.length && Notification.permission === "granted" && document.hidden) {
-      new Notification(t("notifyNew"));
-    }
-  });
-  source.onerror = () => {
-    $("status").textContent = t("offline");
-    $("status").classList.add("offline");
-  };
-}
+$("theme").onclick = () => {
+  const cur = document.documentElement.getAttribute("data-theme") || (matchMedia("(prefers-color-scheme:dark)").matches ? "dark":"light");
+  const next = cur==="dark" ? "light":"dark";
+  document.documentElement.setAttribute("data-theme", next);
+  try { localStorage.setItem("human-web-theme", next); } catch (_) {}
+};
+$("lang").onclick = () => {
+  locale = locale==="zh" ? "en":"zh"; localStorage.setItem("human-web-locale", locale);
+  applyStaticText(); setAfter($("afterhint").dataset.k||"send"); render(); paintMetrics(); paintFuel();
+};
+for (const tab of document.querySelectorAll(".mtab button")) tab.onclick = () => {
+  for (const other of document.querySelectorAll(".mtab button")) other.classList.remove("on");
+  tab.classList.add("on");
+  for (const col of document.querySelectorAll(".deck .col")) col.classList.toggle("active", col.dataset.col===tab.dataset.view);
+};
 
-if ("Notification" in window && Notification.permission === "default") {
-  Notification.requestPermission();
-}
-applyStaticText();
+if ("Notification" in window && Notification.permission==="default") Notification.requestPermission();
+applyStaticText(); setAfter("send"); paintFuel();
 $("status").textContent = t("connecting");
-api("/api/state").then((initial) => { state = initial; render(); }).catch(() => {});
+api("/api/state").then((initial)=>{ state = initial; if (!selected && state.conversations.length) selected = keyOf(state.conversations[0]); render(); paintMetrics(); }).catch(()=>{});
 connect();
 </script>
 </body>

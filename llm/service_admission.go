@@ -7,12 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/vibe-agi/human/observe"
 )
 
 type admissionTaskPlan struct {
-	existing bool
-	task     StoreTaskRecord
-	results  []toolResultMutation
+	existing  bool
+	preempt   bool
+	preempted StoreRequestHead
+	task      StoreTaskRecord
+	results   []toolResultMutation
 }
 
 type toolResultMutation struct {
@@ -40,8 +44,7 @@ func taskContextFromRecord(task StoreTaskRecord) TaskContext {
 	context := TaskContext{
 		WorkspaceKey: task.WorkspaceKey, CapabilityTier: task.CapabilityTier,
 		HarnessID: task.HarnessID, HarnessVersion: task.HarnessVersion,
-		HarnessSessionID: task.HarnessSessionID, WorkspaceRoot: task.WorkspaceRoot,
-		ExecAllowed: task.ExecAllowed,
+		HarnessSessionID: task.HarnessSessionID, ExecAllowed: task.ExecAllowed,
 	}
 	context = normalizeTaskContext(context)
 	if context.CapabilityTier != TierChat {
@@ -338,8 +341,8 @@ func (service *Service) Admit(ctx context.Context, input AdmissionRequest) (Admi
 	task := StoreTaskRecord{
 		Key: taskKey, WorkspaceKey: input.Task.WorkspaceKey, CapabilityTier: input.Task.CapabilityTier,
 		Codec: registration.snapshot, HarnessID: input.Task.HarnessID, HarnessVersion: input.Task.HarnessVersion,
-		HarnessSessionID: input.Task.HarnessSessionID, WorkspaceRoot: input.Task.WorkspaceRoot,
-		ExecAllowed: input.Task.ExecAllowed, State: TaskLeased, LeaseOwner: worker, LeaseID: lease.ID,
+		HarnessSessionID: input.Task.HarnessSessionID, ExecAllowed: input.Task.ExecAllowed,
+		State: TaskLeased, LeaseOwner: worker, LeaseID: lease.ID,
 		Revision: 1, CreatedAt: now, UpdatedAt: now,
 	}
 	if plan.existing {
@@ -372,6 +375,49 @@ func (service *Service) Admit(ctx context.Context, input AdmissionRequest) (Admi
 			}
 			if current.Revision != plan.task.Revision || current.State != plan.task.State {
 				return ErrTaskConflict
+			}
+			if plan.preempt {
+				// Supersede the abandoned in-flight request so the resuming
+				// request takes over: marking it ResponseComplete makes it a
+				// terminal RequestSuperseded and clears active_request_per_task.
+				active, findErr := tx.FindActiveRequest(taskKey)
+				if findErr != nil {
+					if errors.Is(findErr, ErrStoreRecordNotFound) {
+						return ErrTaskConflict
+					}
+					return findErr
+				}
+				// Planning observed one exact detached request. Re-check every
+				// immutable identity plus its revision inside this transaction so
+				// a concurrent continuation or late cleanup cannot cause us to
+				// supersede whichever request merely happens to be active now.
+				if active.Key != plan.preempted.Key ||
+					active.RequestID != plan.preempted.RequestID ||
+					active.Revision != plan.preempted.Revision ||
+					active.ResponseComplete {
+					return ErrTaskConflict
+				}
+				stale, loadReqErr := tx.LoadRequest(active.Key, StoreReadLimit{MaxBytes: service.readLimitBytes})
+				if loadReqErr != nil {
+					return loadReqErr
+				}
+				if stale.RequestID != plan.preempted.RequestID || stale.Revision != plan.preempted.Revision || stale.ResponseComplete {
+					return ErrTaskConflict
+				}
+				superseded := stale
+				superseded.ResponseComplete = true
+				supersededAt := now
+				superseded.CompletedAt = &supersededAt
+				superseded.Revision = stale.Revision + 1
+				swapped, swapErr := tx.CompareAndSwapRequest(StoreRequestMutation{
+					Key: active.Key, ExpectedRevision: stale.Revision, Next: superseded,
+				})
+				if swapErr != nil {
+					return swapErr
+				}
+				if !swapped {
+					return ErrTaskConflict
+				}
 			}
 			changed, changeErr := tx.CompareAndSwapTask(StoreTaskMutation{
 				Key: taskKey, ExpectedRevision: plan.task.Revision, Next: task,
@@ -427,6 +473,12 @@ func (service *Service) Admit(ctx context.Context, input AdmissionRequest) (Admi
 		return AdmissionResult{}, service.internalAdmissionError(input.CodecID, "admission persistence failed", commitErr)
 	}
 	service.addAssignment(key, delivery, true, now)
+	if plan.preempt {
+		// Clear only after the replacement request is durably committed. Clearing
+		// during planning makes a transient/unknown commit strand the abandoned
+		// task by consuming its sole takeover authorization.
+		service.clearDetached(taskKey)
+	}
 	page, err := service.readResponse(ctx, ResponseQuery{
 		CallerID: input.CallerID, IdempotencyKey: input.IdempotencyKey,
 		RequestDigest: digest, Limit: defaultResponseLimit, MaxBytes: service.readLimitBytes,
@@ -434,6 +486,10 @@ func (service *Service) Admit(ctx context.Context, input AdmissionRequest) (Admi
 	if err != nil {
 		return AdmissionResult{}, err
 	}
+	observe.Emit(service.observer, observe.Event{
+		Kind: observe.KindAdmissionAdmitted, Caller: string(input.CallerID),
+		Task: string(taskID), Worker: string(worker),
+	})
 	return AdmissionResult{Identity: identity, RequestDigest: digest, Response: page}, nil
 }
 
@@ -474,6 +530,7 @@ func (service *Service) reconcileAdmissionCommit(
 	if !found {
 		return AdmissionResult{}, ErrWorkerDeliveryIndeterminate
 	}
+	service.clearDetached(recovery.Task.Key)
 	return replay, nil
 }
 
@@ -605,6 +662,26 @@ func (service *Service) planAdmissionTask(
 		}
 		return plan, nil
 	default:
+		// Scenario C: a resume takes over ONLY a task whose in-flight caller has
+		// detached (service.callerDetached) and whose current request is still
+		// in-flight — admitted but not durably closed. This is RequestInFlight in
+		// HumanLLM.tla (Admitted/Decided/Streaming): a stream commits its 200 at
+		// admission to open the SSE channel, so "not closed" (an active request
+		// that is not yet ResponseComplete), NOT "pre-decision", is what makes
+		// takeover safe — the gone caller got a status line but no answer. A
+		// terminal task or an already-closed response is never preempted (that
+		// would resurrect a delivered answer). Anything else stays a hard conflict.
+		if !task.State.Terminal() {
+			var head StoreRequestHead
+			headErr := service.store.View(ctx, func(view StoreView) error {
+				loaded, loadErr := view.FindActiveRequest(key)
+				head = loaded
+				return loadErr
+			})
+			if headErr == nil && !head.ResponseComplete && service.callerDetached(key, head) {
+				return admissionTaskPlan{existing: true, preempt: true, preempted: head, task: task}, nil
+			}
+		}
 		return admissionTaskPlan{}, ErrTaskConflict
 	}
 }
@@ -756,6 +833,9 @@ func (service *Service) admissionFailure(
 	if err := registration.description.Limits.CheckAdmissionError(body); err != nil {
 		return errors.Join(cause, err)
 	}
+	observe.Emit(service.observer, observe.Event{
+		Kind: observe.KindAdmissionRejected, Detail: failure.Code, Err: cause,
+	})
 	return &AdmissionError{
 		Failure: failure, ContentType: registration.aggregateType,
 		RetryAfter: parseRetryAfter(retryAfter), Body: append([]byte(nil), body...), Cause: cause,

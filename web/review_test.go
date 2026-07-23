@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/vibe-agi/human/llm"
 	"github.com/vibe-agi/human/web"
 	"github.com/vibe-agi/human/workerkit"
+	"github.com/vibe-agi/human/workerkit/fsmirror"
 )
 
 type fakeMirror struct {
@@ -66,7 +69,6 @@ func TestWebReviewDeliverAndDiscard(t *testing.T) {
 	assignment.Assignment.Task = llm.TaskContext{
 		TaskID: "task-1", CapabilityTier: llm.TierWorkspace, WorkspaceKey: "workspace-a",
 		HarnessID: "harness-a", HarnessVersion: "v1", HarnessSessionID: "session-a",
-		WorkspaceRoot: "/workspace",
 	}
 	assignment.Assignment.Request.Tools = []llm.Tool{{Name: "write", InputSchema: []byte(`{"type":"object"}`)}}
 	wire.assignments <- assignment
@@ -118,4 +120,98 @@ func TestWebReviewDeliverAndDiscard(t *testing.T) {
 	if notFound["error"] != "not_found" {
 		t.Fatalf("unknown change = %v", notFound)
 	}
+}
+
+func TestWebCanSwitchConversationToExistingHumanRepo(t *testing.T) {
+	base := t.TempDir()
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "existing.txt"), []byte("baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mirror, err := fsmirror.Open(t.Context(), fsmirror.Config{
+		Root: base, Scope: workerkit.WorkspaceScope{Caller: "caller-a", WorkspaceKey: "workspace-a"},
+		Build: func(change workerkit.Change, content []byte, _ workerkit.MirrorResolve) ([]llm.ToolCall, error) {
+			return []llm.ToolCall{{
+				ID: "call-" + change.ID, Name: "write",
+				Input: map[string]any{"filePath": change.Path, "content": string(content)},
+			}}, nil
+		},
+		Debounce: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mirror.Close() })
+
+	wire := newFakeWire()
+	store, _ := workerkit.NewMemoryStateStore()
+	worker, err := workerkit.Open(t.Context(), workerkit.Config{Wire: wire, State: store, Mirror: mirror})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := web.New(web.Config{Worker: worker, SessionToken: testToken, Heartbeat: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := httptest.NewServer(server)
+	t.Cleanup(func() {
+		listener.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+		_ = worker.Shutdown(ctx)
+	})
+
+	assignment := chatAssignment("task-switch", "delivery-switch", "edit the repo")
+	assignment.Assignment.Task = llm.TaskContext{
+		TaskID: "task-switch", CapabilityTier: llm.TierWorkspace, WorkspaceKey: "workspace-a",
+		HarnessID: "opencode", HarnessVersion: "1.17.18", HarnessSessionID: "session-switch",
+	}
+	assignment.Assignment.Request.Tools = []llm.Tool{{Name: "write", InputSchema: []byte(`{"type":"object"}`)}}
+	wire.assignments <- assignment
+	waitForState(t, listener.URL, func(state map[string]any) bool {
+		inbox, _ := state["inbox"].([]any)
+		return len(inbox) == 1
+	})
+	doJSON(t, authedRequest(t, http.MethodPost, listener.URL+"/api/accept",
+		map[string]string{"delivery": "delivery-switch"}), http.StatusOK)
+	doJSON(t, authedRequest(t, http.MethodPost, listener.URL+"/api/workspace", map[string]any{
+		"caller": "caller-a", "task_id": "task-switch", "path": repo,
+	}), http.StatusOK)
+	canonicalRepo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := waitForState(t, listener.URL, func(state map[string]any) bool {
+		conversations, _ := state["conversations"].([]any)
+		if len(conversations) != 1 {
+			return false
+		}
+		conversation, _ := conversations[0].(map[string]any)
+		workspace, _ := conversation["human_workspace"].(map[string]any)
+		return workspace["path"] == canonicalRepo
+	})
+	conversations, _ := state["conversations"].([]any)
+	conversation, _ := conversations[0].(map[string]any)
+	workspace, _ := conversation["human_workspace"].(map[string]any)
+	workspaceID, _ := workspace["id"].(string)
+	if workspaceID == "" {
+		t.Fatal("Web state omitted Human workspace id")
+	}
+
+	if err := os.WriteFile(filepath.Join(repo, "existing.txt"), []byte("changed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForState(t, listener.URL, func(state map[string]any) bool {
+		review, _ := state["review"].(map[string]any)
+		changes, _ := review["changes"].([]any)
+		for _, raw := range changes {
+			change, _ := raw.(map[string]any)
+			if change["workspace_id"] == workspaceID && change["path"] == "existing.txt" &&
+				change["kind"] == string(workerkit.ChangeModify) {
+				return true
+			}
+		}
+		return false
+	})
 }

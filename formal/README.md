@@ -50,11 +50,12 @@ runner 不传 `-deadlock`；TLC 的死锁检查保持开启。临时状态目录
 | `HumanRuntimeWorkspaceRace.cfg` | 两项从同一 base 提交，只能一成一冲突 | 17 |
 | `HumanRuntimeBothSurfaces.cfg` | LLM 与 Agent 共用 runtime 但不串 key/receipt/lease | 25,921 |
 | `HumanWorkerSequence.cfg` | 累计 ACK 绑定、reject 原子删除、follower 与 stale producer | 40 |
-| `HumanLLMSafety.cfg` | 两 task/两 request 的 completion safety | 29,753 |
+| `HumanLLMSafety.cfg` | 两 task/两 request 的 completion safety | 125,921 |
 | `HumanLLMLiveness.cfg` | tool result、clarification 与后续 completion 最终收口 | 4,489 |
-| `HumanLLMNoCaller.cfg` | caller 缺席时只守 safety，不伪造进展 | 97 |
-| `HumanLLMTransitionOracles.cfg` | 四种 response 终态和 result 分桶的精确 transition | 1,481 |
+| `HumanLLMNoCaller.cfg` | caller 缺席时只守 safety，不伪造进展 | 193 |
+| `HumanLLMTransitionOracles.cfg` | 四种 response 终态和 result 分桶的精确 transition | 6,369 |
 | `HumanLLMProgress.cfg` | 同一 response 连续两个 progress 后再 final | 7 |
+| `HumanLLMPreempt.cfg` | caller 断开后 exact resume 才能 preempt，live/stale cleanup 不得夺权 | 13,409 |
 | `HumanAgentSafety.cfg` | 两 Task 的消息、终态、Artifact 与 receipt | 356,409 |
 | `HumanAgentLiveness.cfg` | 在明确 Human/caller fairness 下最终收口 | 667 |
 | `HumanAgentNoHuman.cfg` | Human 不在线时 safety 仍成立 | 197 |
@@ -72,7 +73,7 @@ runner 不传 `-deadlock`；TLC 的死锁检查保持开启。临时状态目录
 | `HumanSystem.cfg` | 两 surface 的 workspace 组合交错 | 308 |
 | `HumanSystemRace.cfg` | 两 surface 同-base 发布后只能一成功一冲突 | 20 |
 
-`HumanLLM`、`HumanAgent` 大安全模型和 `HumanSystem` 会再用 fingerprint 1 重跑。runner 共执行 90 个门：34 个正向检查（含三个 alternate fingerprint）、7 个指定环境/coverage 反例和 49 个 mutant。新增的两个 Agent transport witness 分别证明：旧 fence 上已提交命令可在 fence 后精确 replay 并收口；`input_required` 回合可达且不会隐式撤销 grant。
+`HumanLLM`、`HumanAgent` 大安全模型和 `HumanSystem` 会再用 fingerprint 1 重跑。runner 共执行 91 个门：35 个正向检查（含三个 alternate fingerprint）、7 个指定环境/coverage 反例和 49 个 mutant。新增的两个 Agent transport witness 分别证明：旧 fence 上已提交命令可在 fence 后精确 replay 并收口；`input_required` 回合可达且不会隐式撤销 grant。
 
 ## Mutant oracle
 

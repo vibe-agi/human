@@ -772,7 +772,7 @@ func testAssignment(suffix string, stream bool) llm.WorkerAssignmentDelivery {
 			Task: llm.TaskContext{
 				TaskID: llm.TaskID("task-" + suffix), WorkspaceKey: "workspace-a",
 				CapabilityTier: llm.TierWorkspace, HarnessID: "harness-a", HarnessVersion: "1",
-				HarnessSessionID: "session-a", WorkspaceRoot: "/workspace/a",
+				HarnessSessionID: "session-a",
 			},
 			Request: llm.Request{
 				Model:  "human-expert",

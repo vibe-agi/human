@@ -11,14 +11,11 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/vibe-agi/human/gateway"
 )
 
-// TestOpenWebModeServesBrowserHumanSide proves the migrated product path: the
-// legacy gateway serves the caller, while the human side runs on
-// workerkit + web over the worker bridge — no TUI. The full loop crosses the
-// real worker WebSocket, the durable outbox, and the bridge conversion.
+// TestOpenWebModeServesBrowserHumanSide proves the reference product path: the
+// public service serves the caller while workerkit + web use an in-process
+// worker connection to deliver a human response.
 func TestOpenWebModeServesBrowserHumanSide(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -27,16 +24,13 @@ func TestOpenWebModeServesBrowserHumanSide(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := Config{
-		Gateway: gateway.Config{DatabasePath: filepath.Join(root, "gateway.db")},
-		Worker: WorkerPaths{
-			MirrorRoot: filepath.Join(root, "mirror"),
-			OutboxPath: filepath.Join(privateRoot, "outbox.db"),
-		},
-		ListenAddress:    "127.0.0.1:0",
-		WebListenAddress: "127.0.0.1:0",
-		WebStatePath:     filepath.Join(privateRoot, "workerkit-state.db"),
-		CallerSubject:    "test-caller",
-		WorkerSubject:    "test-worker",
+		Public:             PublicStackConfig{DatabasePath: filepath.Join(root, "store.db")},
+		HumanWorkspaceRoot: filepath.Join(root, "mirror"),
+		ListenAddress:      "127.0.0.1:0",
+		WebListenAddress:   "127.0.0.1:0",
+		WebStatePath:       filepath.Join(privateRoot, "workerkit-state.db"),
+		CallerSubject:      "test-caller",
+		WorkerSubject:      "test-worker",
 	}
 	instance, err := Open(context.Background(), config)
 	if err != nil {

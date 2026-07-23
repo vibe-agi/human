@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/vibe-agi/human/framework"
+	"github.com/vibe-agi/human/observe"
 	"github.com/vibe-agi/human/protect"
 )
 
@@ -106,7 +106,6 @@ type TaskContext struct {
 	HarnessID        string         `json:"harness_id,omitempty"`
 	HarnessVersion   string         `json:"harness_version,omitempty"`
 	HarnessSessionID string         `json:"harness_session_id,omitempty"`
-	WorkspaceRoot    string         `json:"workspace_root,omitempty"`
 	ExecAllowed      bool           `json:"exec_allowed,omitempty"`
 }
 
@@ -263,6 +262,11 @@ type Config struct {
 	Router         WorkerRouter
 	Admission      AdmissionPolicy
 	ToolAuthorizer ToolAuthorizer
+	// Observer receives telemetry events (admission outcomes, worker sessions,
+	// event settlements). Nil is a no-op. Events are emitted after their
+	// durable decision and outside Store callbacks; a slow or panicking
+	// Observer cannot affect correctness (see the observe package contract).
+	Observer observe.Observer
 
 	AssignmentBuffer int
 	// WorkerPayloadLimitBytes is the maximum transport-neutral JSON assignment
@@ -375,8 +379,7 @@ func validateTaskContext(input TaskContext) error {
 	switch input.CapabilityTier {
 	case TierChat:
 		if input.TaskID != "" || input.WorkspaceKey != "" || input.HarnessID != "" ||
-			input.HarnessVersion != "" || input.HarnessSessionID != "" ||
-			input.WorkspaceRoot != "" || input.ExecAllowed {
+			input.HarnessVersion != "" || input.HarnessSessionID != "" || input.ExecAllowed {
 			return fmt.Errorf("%w: chat requests cannot carry a stable workspace Task", ErrInvalidServiceConfig)
 		}
 	case TierRemoteTools, TierWorkspace:
@@ -390,13 +393,6 @@ func validateTaskContext(input TaskContext) error {
 			if value == "" || !workerStableKeyPattern.MatchString(value) {
 				return fmt.Errorf("%w: %s is required and must be a stable key", ErrInvalidServiceConfig, name)
 			}
-		}
-		if input.WorkspaceRoot == "" || len(input.WorkspaceRoot) > maximumWorkspaceRootBytes ||
-			!utf8.ValidString(input.WorkspaceRoot) || strings.ContainsAny(input.WorkspaceRoot, "\x00\r\n") {
-			return fmt.Errorf(
-				"%w: workspace root is required and must be UTF-8 without NUL/CR/LF (maximum %d bytes)",
-				ErrInvalidServiceConfig, maximumWorkspaceRootBytes,
-			)
 		}
 	default:
 		return fmt.Errorf("%w: unsupported capability tier %q", ErrInvalidServiceConfig, input.CapabilityTier)

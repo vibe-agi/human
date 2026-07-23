@@ -59,7 +59,7 @@ jobs:
       - name: Verify real OpenCode product gates
         run: |
           test "$(opencode --version)" = "1.17.18"
-          make real-opencode-tui-test REAL_COUNT=3
+          make real-opencode-web-test REAL_COUNT=3
           make real-opencode-network-test REAL_COUNT=3
 
   release:

@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vibe-agi/human/gateway"
 	"github.com/vibe-agi/human/internal/completion/adapter"
 	"github.com/vibe-agi/human/internal/userdata"
 )
@@ -59,7 +58,7 @@ func TestDoctorJSONWarnsForFirstRunWithoutFailing(t *testing.T) {
 	}
 }
 
-func TestDoctorValidatesCredentialJournalWithoutPrintingSecrets(t *testing.T) {
+func TestDoctorValidatesCallerCredentialWithoutPrintingSecret(t *testing.T) {
 	dataRoot := t.TempDir()
 	if err := os.Chmod(dataRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -74,14 +73,7 @@ func TestDoctorValidatesCredentialJournalWithoutPrintingSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	const callerSecret = "caller-secret-must-never-print"
-	const workerSecret = "worker-secret-must-never-print"
-	if err := writeLocalCredentials(credentialPath, localCredentialFile{
-		Version: localCredentialVersion,
-		Active: &localCredentialPair{
-			Caller: localCredential{Type: gateway.PrincipalCaller, SubjectID: "local-caller", KeyID: "caller-key", Secret: callerSecret},
-			Worker: localCredential{Type: gateway.PrincipalWorker, SubjectID: "local-worker", KeyID: "worker-key", Secret: workerSecret},
-		},
-	}); err != nil {
+	if err := writePublicCredentials(credentialPath, callerSecret); err != nil {
 		t.Fatal(err)
 	}
 	report := runDoctor(context.Background(), ".", defaultDoctorHealthURL, false, doctorDependencies{
@@ -97,7 +89,7 @@ func TestDoctorValidatesCredentialJournalWithoutPrintingSecrets(t *testing.T) {
 	if !report.OK || report.Summary.Fail != 0 || report.Summary.Warn != 0 {
 		t.Fatalf("ready doctor report = %+v", report)
 	}
-	if bytes.Contains(encoded, []byte(callerSecret)) || bytes.Contains(encoded, []byte(workerSecret)) {
+	if bytes.Contains(encoded, []byte(callerSecret)) {
 		t.Fatalf("doctor leaked a credential: %s", encoded)
 	}
 }
@@ -200,7 +192,7 @@ func TestProbeHealthAcceptsReadyGatewayWithoutWorker(t *testing.T) {
 	}
 }
 
-func TestDoctorWarnsButDoesNotFailWhenGatewayHasNoWorker(t *testing.T) {
+func TestDoctorWarnsButDoesNotFailWhenServiceHasNoWorker(t *testing.T) {
 	dataRoot := t.TempDir()
 	if err := os.Chmod(dataRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -220,14 +212,14 @@ func TestDoctorWarnsButDoesNotFailWhenGatewayHasNoWorker(t *testing.T) {
 		t.Fatalf("worker-offline readiness failed doctor: %+v", report)
 	}
 	for _, check := range report.Checks {
-		if check.ID == "gateway_health" {
+		if check.ID == "service_health" {
 			if check.Status != doctorWarn || !strings.Contains(check.Message, "no Human worker is online") {
 				t.Fatalf("worker-offline gateway check = %+v", check)
 			}
 			return
 		}
 	}
-	t.Fatal("doctor omitted gateway_health check")
+	t.Fatal("doctor omitted service_health check")
 }
 
 func TestProbeHealthRejectsLegacyFixedOKWithoutReadinessEvidence(t *testing.T) {

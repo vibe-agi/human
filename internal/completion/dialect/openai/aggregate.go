@@ -64,6 +64,9 @@ func (aggregate *aggregate) Encode(event completion.Event, _ ...dialect.EventSee
 	case completion.EventToolCalls:
 		calls := make([]map[string]any, 0, len(event.ToolCalls))
 		for _, call := range event.ToolCalls {
+			if call.TextInput != nil {
+				return nil, false, fmt.Errorf("OpenAI Chat tool call %q cannot use text input", call.ID)
+			}
 			arguments, err := marshalToolArguments(call.Input)
 			if err != nil {
 				return nil, false, fmt.Errorf("marshal tool call %q arguments: %w", call.ID, err)
@@ -105,7 +108,10 @@ func (aggregate *aggregate) Encode(event completion.Event, _ ...dialect.EventSee
 
 func (aggregate *aggregate) completion(toolCalls []map[string]any, finishReason string) ([]byte, error) {
 	content := any(aggregate.text.String())
-	message := map[string]any{"role": "assistant", "content": content}
+	message := map[string]any{
+		"role": "assistant", "content": content, "refusal": nil,
+		"annotations": []any{}, "audio": nil,
+	}
 	if len(toolCalls) != 0 {
 		message["tool_calls"] = toolCalls
 		if aggregate.text.Len() == 0 {
@@ -115,10 +121,24 @@ func (aggregate *aggregate) completion(toolCalls []map[string]any, finishReason 
 	return json.Marshal(map[string]any{
 		"id": aggregate.responseID, "object": "chat.completion",
 		"created": aggregate.created, "model": aggregate.model,
+		"service_tier": nil, "system_fingerprint": nil, "usage": completionUsage(),
 		"choices": []map[string]any{{
-			"index": 0, "message": message, "finish_reason": finishReason,
+			"index": 0, "message": message, "finish_reason": finishReason, "logprobs": nil,
 		}},
 	})
+}
+
+func completionUsage() map[string]any {
+	return map[string]any{
+		"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+		"prompt_tokens_details": map[string]int{
+			"cached_tokens": 0, "audio_tokens": 0,
+		},
+		"completion_tokens_details": map[string]int{
+			"accepted_prediction_tokens": 0, "audio_tokens": 0,
+			"reasoning_tokens": 0, "rejected_prediction_tokens": 0,
+		},
+	}
 }
 
 func nullableAggregateString(value string) any {

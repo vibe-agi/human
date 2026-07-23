@@ -15,6 +15,7 @@ import (
 	"github.com/vibe-agi/human/framework"
 	"github.com/vibe-agi/human/llm"
 	llmsqlite "github.com/vibe-agi/human/llm/sqlite"
+	"github.com/vibe-agi/human/observe"
 )
 
 func TestServiceStreamingReplayAndWorkerReceipts(t *testing.T) {
@@ -338,6 +339,77 @@ func TestServiceContinuationUsesAffinityAndCompletesEveryToolResult(t *testing.T
 		t.Fatalf("affinity continuation task = %q, want %q", second.Identity.TaskID, first.Identity.TaskID)
 	}
 }
+
+func TestServiceEnforcesToolCallPolicy(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		policy llm.ToolCallPolicy
+		tools  []llm.Tool
+		calls  []llm.ToolCall
+		code   llm.WorkerRejectionCode
+	}{
+		{
+			name: "disabled", policy: llm.ToolCallsDisabled, code: llm.WorkerRejectForbidden,
+			calls: []llm.ToolCall{{ID: "call-a", Name: "tool_a", Input: map[string]any{}}},
+		},
+		{
+			name: "serial", policy: llm.ToolCallsSerial, code: llm.WorkerRejectInvalid,
+			calls: []llm.ToolCall{
+				{ID: "call-a", Name: "tool_a", Input: map[string]any{}},
+				{ID: "call-b", Name: "tool_b", Input: map[string]any{}},
+			},
+		},
+		{
+			name: "json-tool-rejects-text", code: llm.WorkerRejectInvalid,
+			tools: []llm.Tool{{Name: "tool_a", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+			calls: []llm.ToolCall{{ID: "call-a", Name: "tool_a", TextInput: testStringPointer("freeform")}},
+		},
+		{
+			name: "text-tool-requires-text", code: llm.WorkerRejectInvalid,
+			tools: []llm.Tool{{Name: "tool_a", InputKind: llm.ToolInputText}},
+			calls: []llm.ToolCall{{ID: "call-a", Name: "tool_a", Input: map[string]any{}}},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			service := openTestService(t, filepath.Join(t.TempDir(), "policy.db"), nil)
+			worker := openTestWorker(t, service, "worker-a", "session-a")
+			request := testRequest(true, "policy")
+			request.ToolCallPolicy = test.policy
+			request.Tools = test.tools
+			if len(request.Tools) == 0 {
+				request.Tools = []llm.Tool{
+					{Name: "tool_a", InputSchema: json.RawMessage(`{"type":"object"}`)},
+					{Name: "tool_b", InputSchema: json.RawMessage(`{"type":"object"}`)},
+				}
+			}
+			_, err := service.Admit(t.Context(), llm.AdmissionRequest{
+				CallerID: "caller-a", IdempotencyKey: llm.IdempotencyKey("policy-" + test.name),
+				CodecID: testCodecID, Body: mustJSON(t, request),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assignment := receiveServiceAssignment(t, worker)
+			if err := worker.AckAssignment(t.Context(), assignment.ID); err != nil {
+				t.Fatal(err)
+			}
+			receipt, err := worker.CommitEvent(t.Context(), workerDelivery(
+				assignment, llm.WorkerDeliveryID("delivery-"+test.name), llm.Event{
+					ID: "event-" + test.name, Type: llm.EventToolCalls, ToolCalls: test.calls,
+				},
+			))
+			if err != nil || receipt.Decision != llm.WorkerEventNACK || receipt.Code != test.code {
+				t.Fatalf("policy settlement = %+v, %v; want NACK %q", receipt, err, test.code)
+			}
+		})
+	}
+}
+
+func testStringPointer(value string) *string { return &value }
 
 func TestServiceShutdownSynchronouslyClosesAdmission(t *testing.T) {
 	entered := make(chan struct{})
@@ -748,51 +820,6 @@ func TestServiceRejectsOversizeAssignmentBeforePersistence(t *testing.T) {
 		t.Fatalf("oversize assignment was persisted: %v", storeErr)
 	}
 
-	for _, test := range []struct {
-		name string
-		root string
-	}{
-		{name: "over-4096-bytes", root: "/" + strings.Repeat("r", 4096)},
-		{name: "invalid-utf8", root: string([]byte{'/', 0xff})},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			task := testRemoteTask()
-			task.WorkspaceRoot = test.root
-			key := llm.IdempotencyKey("bad-root-" + test.name)
-			_, admitErr := service.Admit(t.Context(), llm.AdmissionRequest{
-				CallerID: "caller-a", IdempotencyKey: key, CodecID: testCodecID,
-				Task: task, Body: mustJSON(t, testRequest(true, "small")),
-			})
-			var failure *llm.AdmissionError
-			if !errors.As(admitErr, &failure) || failure.Failure.Status != 400 || failure.Failure.Code != "invalid_task" {
-				t.Fatalf("invalid workspace root error = %v", admitErr)
-			}
-			persistErr := store.View(t.Context(), func(view llm.StoreView) error {
-				_, loadErr := view.LoadRequestHead(llm.StoreRequestKey{Caller: "caller-a", IdempotencyKey: key})
-				return loadErr
-			})
-			if !errors.Is(persistErr, llm.ErrStoreRecordNotFound) {
-				t.Fatalf("invalid workspace root was persisted: %v", persistErr)
-			}
-		})
-	}
-
-	largeContext := testRemoteTask()
-	largeContext.WorkspaceRoot = "/" + strings.Repeat("r", 4094)
-	_, err = service.Admit(t.Context(), llm.AdmissionRequest{
-		CallerID: "caller-a", IdempotencyKey: "root-counted", CodecID: testCodecID,
-		Task: largeContext, Body: mustJSON(t, testRequest(true, "small")),
-	})
-	if !errors.As(err, &admission) || admission.Failure.Status != 413 || admission.Failure.Code != "assignment_too_large" {
-		t.Fatalf("workspace root was not counted by assignment gate: %v", err)
-	}
-	storeErr = store.View(t.Context(), func(view llm.StoreView) error {
-		_, loadErr := view.LoadRequestHead(llm.StoreRequestKey{Caller: "caller-a", IdempotencyKey: "root-counted"})
-		return loadErr
-	})
-	if !errors.Is(storeErr, llm.ErrStoreRecordNotFound) {
-		t.Fatalf("oversize workspace assignment was persisted: %v", storeErr)
-	}
 }
 
 const testCodecID llm.CodecID = "test.service"
@@ -968,6 +995,47 @@ func openTestServiceOptions(t *testing.T, path string, policy llm.AdmissionPolic
 	return newTestServiceWithOptions(t, resource, policy, limit, clock)
 }
 
+// baseObserveTime is a fixed, deterministic clock origin for observer tests, so
+// emitted event timestamps are stable across runs.
+func baseObserveTime() time.Time { return time.Unix(1_800_000_000, 0) }
+
+// newObserverService opens a service wired to an observer, so a test can assert
+// on the telemetry the core emits (worker sessions, admission outcomes, settled
+// events). The observer is advisory and never affects correctness.
+func newObserverService(t *testing.T, observer observe.Observer) *llm.Service {
+	resource, err := llmsqlite.Open(t.Context(), llmsqlite.Config{
+		Path: filepath.Join(t.TempDir(), "observe.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := llm.NewService(t.Context(), llm.Config{
+		DeploymentID: "test-observe", Store: resource,
+		Codecs: []llm.CodecRegistration{{
+			Codec: testCodec{}, StreamContentType: "text/event-stream",
+			AggregateContentType: "application/json", SuccessStatus: 200,
+		}},
+		Clock: &stepClock{next: baseObserveTime()}, IDs: &sequenceIDs{},
+		Router: llm.WorkerRouterFunc(func(context.Context, llm.WorkerRouteRequest) (llm.WorkerID, error) {
+			return "worker-a", nil
+		}),
+		Admission:      llm.AdmitAll(),
+		ToolAuthorizer: llm.ToolAuthorizerFunc(func(context.Context, llm.ToolAuthorization) error { return nil }),
+		Observer:       observer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-service.Done():
+		default:
+			shutdownRuntime(t, service)
+		}
+	})
+	return service
+}
+
 func newTestService(t *testing.T, resource framework.Resource[llm.Store], policy llm.AdmissionPolicy) *llm.Service {
 	return newTestServiceWithOptions(t, resource, policy, 0, &stepClock{next: time.Unix(1_800_000_000, 0)})
 }
@@ -1049,7 +1117,7 @@ func testRemoteTask() llm.TaskContext {
 	return llm.TaskContext{
 		WorkspaceKey: "workspace-a", CapabilityTier: llm.TierWorkspace,
 		HarnessID: "harness-a", HarnessVersion: "v1", HarnessSessionID: "session-a",
-		WorkspaceRoot: "/workspace", ExecAllowed: true,
+		ExecAllowed: true,
 	}
 }
 

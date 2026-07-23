@@ -334,6 +334,44 @@ func TestRequestDigestIsDeterministicAndCodecNeutral(t *testing.T) {
 	}
 }
 
+func TestRequestValidatesJSONAndTextToolContracts(t *testing.T) {
+	base := llm.Request{
+		Model: "human-expert",
+		Messages: []llm.Message{{
+			Role: llm.RoleUser, Blocks: []llm.Block{{Type: llm.BlockText, Text: "edit it"}},
+		}},
+	}
+	valid := []llm.Tool{
+		{Name: "function", InputSchema: json.RawMessage(`{"type":"object"}`)},
+		{
+			Name: "apply_patch", InputKind: llm.ToolInputText,
+			InputFormat: json.RawMessage(`{"type":"grammar","syntax":"lark","definition":"start: /.+/"}`),
+		},
+	}
+	for _, tool := range valid {
+		request := base
+		request.Tools = []llm.Tool{tool}
+		if err := request.Validate(); err != nil {
+			t.Fatalf("valid %q tool: %v", tool.Name, err)
+		}
+	}
+
+	invalid := []llm.Tool{
+		{Name: "json_without_schema"},
+		{Name: "json_with_format", InputSchema: json.RawMessage(`{"type":"object"}`), InputFormat: json.RawMessage(`{}`)},
+		{Name: "text_with_schema", InputKind: llm.ToolInputText, InputSchema: json.RawMessage(`{"type":"object"}`)},
+		{Name: "text_bad_format", InputKind: llm.ToolInputText, InputFormat: json.RawMessage(`{`)},
+		{Name: "unknown", InputKind: llm.ToolInputKind("binary")},
+	}
+	for _, tool := range invalid {
+		request := base
+		request.Tools = []llm.Tool{tool}
+		if err := request.Validate(); err == nil {
+			t.Fatalf("invalid %q tool passed validation: %+v", tool.Name, tool)
+		}
+	}
+}
+
 func TestAdmissionFailureAndAggregateAreUsableExternally(t *testing.T) {
 	codec := &exampleCodec{}
 	failure := llm.AdmissionFailure{Status: 503, Code: "capacity", Message: "try again"}

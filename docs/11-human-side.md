@@ -1,221 +1,152 @@
-# 11 · 人侧栈设计:workerkit 与 Human Web
+# 11 · 人侧公共栈：workerkit 与 Web
 
-本页是设计文档,不是现状描述。除 §0 与 L0 外,本页所有能力均**未实现**;
-实现顺序与验收门见 §7。
+本页描述当前实现。`human local` 的人侧已经是 `workerkit + web`，不再经过旧
+gateway、worker WebSocket 或本地 durable outbox。
 
-## 0. 问题(现状确认)
-
-人这一端目前是单一产品,不是可复用的库:
-
-- 官方 TUI 经 `worker.Open → internal/workerclient` 使用 `internal/workerproto`
-  的 WebSocket 方言,只能连接 legacy 产品 gateway;它不认识公共 `llm/workerws`
-  协议。嵌入 `human.NewLLM` 的宿主因此**没有任何官方人侧客户端可用**。
-- TUI 内部的注入点(`WithMirrorManager`、`WithStateStore`)都在 `internal/`,
-  第三方无法注入自己的实现;Live Workspace 的全部正确性逻辑
-  (save-ahead 交付链、拒单 finalizer、continuation 停放)同样锁在
-  `internal/mirror` 与 `internal/tui` 里。
-- durable worker 状态(outbox、mirror、草稿)与终端屏幕耦合在同一进程:
-  专家必须常驻终端,关掉终端 UI 与 worker 一起消失。
-- 公共侧已有的是 `llm/workerws.Client`:WS 连接、instance identity、重连
-  退避、durable Journal/outbox、assignment/event/ACK/NACK。缺的是它之上的
-  领域层和 UI。
-
-## 1. 目标与非目标
-
-目标:
-
-1. 人侧成为公共、分层、可替换的栈:第三方可以 (a) 直接用官方 UI,
-   (b) 只换 UI、复用领域层,(c) 只用 wire client 全自建。
-2. **Web 是第一公民 UI**:worker daemon 与浏览器分离,专家不常驻终端,
-   移动浏览器可用;daemon 拥有全部 durable 状态,UI 只是投影。
-3. 该栈只依赖公共 `llm` 内核与 `llm/workerws`,因此它同时是双栈收敛
-   ([06 §架构决策](06-product-todos.md#架构决策方向性不进入本轮验收))
-   worker 半边的落地路径,不是额外的第三套实现。
-
-非目标:
-
-- 不做移动原生 app;Web 响应式即可。
-- 本设计不含 HumanAgent 的人侧装配;workerkit 的分层完成后另行复用。
-- **不维护两个官方 UI。** TUI 的终态是删除,不是迁移:它从现在起冻结
-  (只修 bug,不加功能),在 web 通过同一真实 OpenCode 产品门之前继续作为
-  RC 的已验收产品面;过门之日,TUI、`internal/tui`、`internal/workerclient`
-  与旧 worker WS 方言整体删除。不存在"迁移 TUI 到 workerkit"的中间工程。
-
-## 2. 分层架构
+## 1. 分层
 
 ```text
-┌──────────────────────────────────────────────────┐
-│ L3  第三方 UI / 集成(Slack、工单系统、自研桌面) │ ← 消费 workerkit 公共 API
-├──────────────────────────────────────────────────┤
-│ L2  官方 UI adapter                              │
-│     human web(唯一官方 UI;TUI 冻结待删)       │
-├──────────────────────────────────────────────────┤
-│ L1  workerkit(新公共包,headless 领域层)       │
-│     接单/回复/final 状态机 · 草稿 · continuation │
-│     停放 · tool-call 构造 · Mirror/StateStore/   │
-│     Notifier/Observer ports                      │
-├──────────────────────────────────────────────────┤
-│ L0  llm/workerws.Client(已有)                  │
-│     WS 连接 · instance identity · 重连退避 ·     │
-│     durable Journal/outbox · ACK/NACK            │
-└──────────────────────────────────────────────────┘
+第三方 UI / 官方 Web
+          │  Snapshot + 命令 + Notifications
+          ▼
+workerkit.Worker
+  对话状态机 · Inbox · 草稿 · tool calls · alerts
+  ├── Wire port
+  ├── StateStore / AlertStore ports
+  ├── Mirror port
+  └── observe.Observer port
+          │
+          ▼
+llm.WorkerConnection / llm/workerws.Client
+          │
+          ▼
+llm.Service
 ```
 
-依赖只能向下;L1 不 import 任何 UI 或 `internal/*`,L2/L3 不直接触碰 L0。
+依赖只向下。`workerkit` 不 import Web、CLI 或 `internal/*`；Web 不保存第二份
+业务状态；`llm.Service` 不知道浏览器、文件镜像或具体网络协议。
 
-## 3. workerkit(L1)
+## 2. workerkit：可替换的人侧领域层
 
-形态:事件驱动的领域对象,不渲染。`workerkit.Open(ctx, Config) (*Worker, error)`。
+`workerkit.Open(ctx, Config)` 返回一个 headless `Worker`。UI 只需要：
 
-对 UI 的 API 是三件套:
+- `Snapshot()`：Inbox、Conversation、Review 和未 dismiss 的 Alert 的深拷贝；
+- `Notifications()`：coalescing 的“重新读取 Snapshot”提示；
+- `Accept/Reject/Reply/Clarify/Final/SubmitToolCalls` 等串行命令；
+- Mirror 的 pull、review、confirm、discard 与 result settlement 命令。
 
-- **命令**:`Accept/Reject/Reply(progress)/Clarify/Final/SubmitToolCalls/`
-  `PullFile/ConfirmDelivery/DiscardChange` 与 Tasks 计划工具的 CRUD。
-  每个命令绑定稳定 scope(task/session),并发调用串行化。
-- **订阅**:`Events() <-chan Event` —— `AssignmentArrived`、`ReviewUpdated`、
-  `DeliverySettled`、`RejectionArrived`、`ConnectionChanged` 等 typed 事件。
-- **快照**:`Snapshot() State` —— inbox、活动任务、对话记录、pending review、
-  各命令当前可用性。UI 崩溃/重开只需重放快照 + 订阅。
+主要 ports：
 
-Config ports(全部可替换,官方实现只是 adapter):
-
-| port | 职责 | 官方 adapter | 第三方可换成 |
-|---|---|---|---|
-| Wire | assignment/event 传输 | `llm/workerws.Client` | in-process 测试桩、自有协议 |
-| StateStore | 草稿、parked continuation、review 基线 | sqlite | PostgreSQL、自有服务 |
-| Mirror | Live Workspace 文件镜像与 review | fs + fsnotify | 虚拟 FS、远程 IDE |
-| Notifier | 新单/review/结果通知 | no-op / 桌面 | Web Push、webhook、IM |
-| Observer | 结构化运行事件 | slog | Prometheus 等(见 §6) |
-
-正确性语义整体从 `internal/tui`/`internal/mirror` **搬迁**而非重写:
-save-ahead 交付链(exact pending row → delivery intent → intent-recorded
-phase → durable outbox)、崩溃恢复冻结原字节、拒单 finalizer 与 tombstone、
-最多 32 个 parked continuation、成功 result 只推进已发送版本——现有故障注入
-测试随语义一起迁到 workerkit 层,作为其 conformance 的一部分。
-
-边界不变:workerkit 不执行客户命令、不挂载客户工作树;客户 Agent 仍是唯一
-执行现场。
-
-## 4. human web(L2)
-
-### 进程模型 —— 与 TUI 的本质区别
-
-```text
-human worker --web 127.0.0.1:19081        # 或 human local --web
-┌── worker daemon(常驻)──────────────────┐
-│ workerkit:outbox · mirror · 草稿 · 状态 │
-│ 内嵌 HTTP:静态 SPA + SSE 推送 + 命令 POST│
-└──────────────────────────────────────────┘
-        ↑ 浏览器 / 手机浏览器(随开随关,零持久状态)
-```
-
-durable 状态全部在 daemon;关浏览器不丢任务、不断连接。多个 UI 会话可同时
-读同一 daemon,写命令统一串行进 workerkit(单专家单 worker 身份不变)。
-
-### 安全
-
-- 本机默认只听 loopback,启动时生成一次性 UI session token(打印为可点击
-  URL);浏览器只持有 UI session,**worker bearer token 永不进浏览器**。
-- 远程/团队部署由运维放置反向代理 TLS 与自己的 SSO;web 层暴露与
-  `callerhttp.Authenticator` 同形态的认证 port,示例中的受信 header 只是
-  扩展点演示,不是生产认证(与 [07](07-embedding.md) 同一措辞与边界)。
-
-### 信息架构
-
-对应 TUI 四区,为非终端用户重排:
-
-- **收件箱**:待接单队列,含等待时长;接单/拒单一键操作,浏览器
-  Notification(可选 Web Push)在页面不在前台时提醒。
-- **任务工作台**:左侧对话流(progress 草稿、clarification、final,
-  Ctrl+Enter 发送);右侧三个可折叠面板——Workspace Review(逐 change 的
-  diff 与安全级别,confirm/discard)、Tasks(计划工具)、Command
-  (caller 声明兼容时启用,含 `:pull`)。
-- 危险命令的二次确认、部分可交付批次必须人工确认等既有安全交互原样保留。
-
-### 技术选型
-
-- 后端:daemon 内嵌 `net/http`,SSE 推状态、短 POST 发命令;`go:embed`
-  静态资源,单二进制交付,无 Node 运行时依赖。
-- 前端:轻量方案(htmx/Preact 量级),严禁外部 CDN;diff 渲染是唯一重组件。
-- web 层**零业务状态**:一切来自 workerkit 的 Snapshot/Events,不产生第二套
-  状态语义。
-
-## 5. 第三方注入点总表(设计完成后)
-
-| 第三方想做什么 | 用哪一层 |
-|---|---|
-| 直接用现成人侧产品 | `human web` |
-| 自己的 UI(Slack bot、工单、桌面) | workerkit 命令/订阅/快照 API |
-| 换草稿与状态存储 | `workerkit.StateStore` + conformance |
-| 换镜像实现(远程 IDE、虚拟工作区) | `workerkit.Mirror` |
-| 含状态机全自建 | `llm/workerws.Client` |
-| 换传输(非 WebSocket) | `llm.WorkerTransport` |
-
-## 6. Observability(同批补洞)
-
-- 新公共 `observe` 包:`Observer` 接口 + typed 事件(admission 结果、
-  assignment 生命周期、delivery settle、重连、outbox 深度、review 周期)。
-- `llm.Config` 与 `workerkit.Config` 各加 `Observer` 字段,nil = no-op;
-  官方提供 slog adapter,Prometheus/OTel adapter 留给宿主(事件已 typed,
-  实现是薄层)。
-- 契约:Observer 调用发生在 Store callback 之外,不得阻塞正确性路径;
-  慢/坏 Observer 只丢事件,不失败业务操作。
-
-## 7. 里程碑与验收门
-
-| 里程碑 | 内容 | 状态(2026-07-19) |
+| Port | 官方基础实现 | 宿主可以替换为 |
 |---|---|---|
-| M0 TUI 冻结 | TUI 与 `internal/tui`/`internal/workerclient` 只修 bug,不加功能 | **完成**:三个包已带冻结声明 |
-| M1 workerkit-core | 接单/回复/final/工具循环 + StateStore conformance + fake wire 故障注入 | **完成**:公共 `workerkit` + memory/sqlite StateStore + `humantest.TestWorkerStateStore`;fake-wire 覆盖重投去重、发送失败重试、拒单顺序、NACK 先持久后确认、32 上限 fail-closed、重启恢复;并以进程内 adapter 驱动真实 `llm.Service` 通过 chat 与 workspace 工具续接闭环 |
-| M2 human web MVP | web 包 + SSE + 会话 token + 嵌入式单文件 UI(en/zh,默认 en) | **完成**:真实 OpenCode 1.17.18 Basic 门通过——CLI 连嵌入内核,人侧全程 web HTTP API,final 逐字回流;另有 Playwright 驱动真实 Chrome 操作页面、GLM 类 LLM 模拟人类专家的浏览器门 |
-| M3 Mirror port 化 | `workerkit.Mirror` port + 官方 `fsmirror` adapter + web Review 面板 | **完成**:baseline 仅在成功 result 回流时推进、失败保持 pending、可选 BaselineFile 跨重启;工具映射 builder 留在宿主侧待 Harness SPI |
-| M4 web 门对齐 → 删除 TUI | web 版真实 OpenCode 门逐项对齐 TUI 门;随后删除 TUI 栈 | **完成**:Workspace 档真实门(accept、流式回复、`:pull` 字节级 hydration、镜像 save→review→confirm、原生 `write` 交付、result 续接、bash+todowrite、final、aux 自动应答)、`human local` web 产品门(含同 session 第二 user turn)与三断点真实网络门均已在 web 人侧通过;`internal/tui`、`worker` 包与 TUI 装配已删除,`human local`/`human worker` 只组合 workerkit + web,`make real-opencode-web-test` 取代旧 TUI 门 |
+| `Wire` | `WrapConnection`（进程内）、`llm/workerws.Client` adapter | 自有队列、消息总线、测试桩 |
+| `StateStore` | memory、`workerkit/sqlite` | 自有数据库或服务 |
+| `AlertStore` | memory、`workerkit/sqlite` | 任意 durable alert store；这是可选扩展，不扩大最小 StateStore |
+| `Mirror` | `workerkit/fsmirror` | 远程 IDE、虚拟 FS、禁用镜像 |
+| `Observer` | nil/no-op、`observe.NewSlog` | metrics、trace、日志 adapter |
 
-**产品迁移已落地**:`internal/workerbridge` 把 legacy worker WS 方言桥接为公共
-`workerkit.Wire`(确定性桥接 ID 去重重投、ConfirmAssignment ↦ 幂等 accepted
-事件、SendEvent 绑定 durable outbox、NACK inbox ↦ Rejections/ConfirmRejection);
-`human local --web <loopback>` 用它装配 workerkit + web 替代 TUI:独立 loopback
-listener、每次启动一次性 session token、独立 `workerkit-state.db`、Close 逆序
-拆除。真实 OpenCode 门已通过:CLI 连真实 local 产品(legacy gateway + 签发凭据 +
-真实 WS + durable outbox + 桥),人侧全程 web HTTP API,final 逐字回流。
+Store 接口是行为合同，不是“必须使用 SQLite”的别名。官方 SQLite 只是基础实现；
+自定义实现保有自己的生命周期，除非宿主显式把 release ownership 交给上层。
 
-### 已知边界(代码审查记录,非阻塞)
+### 2.1 两个用户、两个文件系统
 
-- **Observer/Notifier 缺口**:workerkit 尚无全局 Notifier port。桥接后 legacy
-  worker 的 `OutboxQuarantine` 告警只经 `Bridge.Err()` 暴露,web 不主动展示;
-  第一优先的后续项是给 workerkit 加 Notifier port,让"回复因 outbox 隔离而
-  无法送达"成为人可见告警。
-- **CallerAttributes 深拷贝**:`llm` 内核对 caller 认证属性做顶层浅拷贝
-  (`maps.Clone`)。契约要求策略实现只借用、不修改嵌套值;内核不做深拷贝防护
-  (任意 `map[string]any` 深拷贝昂贵)。ABAC 策略若原地规范化嵌套 slice/map,
-  须自行拷贝。
-- **routeAdmission 升级说明**:多 worker 且未配 `WorkerRouter` 的 admission 从
-  旧的可重试 `503 worker_unavailable` 变为不可重试 `500 worker_router_required`
-  (有意 fail-closed)。曾靠"两 worker 随便挑 + 重试"的部署须显式配置 Router。
-  单 worker 部署无回归。
-- **会话状态非 backup 对象**:workerkit 会话/草稿(workerkit-state.db)是显示/
-  恢复层,不入 `human local backup` archive;correctness(gateway DB、worker
-  outbox)照常入档。会话状态丢失只损失草稿与显示历史,不损失已交付内容。
+Agent User 与 Human User 是两个 principal，也默认位于两个互不挂载的文件系统：
 
-删除已执行,诚实边界如下:
+- Agent User 的 cwd 只属于 Agent/harness，不进入 HumanLLM Task 或 wire；
+- `fsmirror.Config.Root` 是 Human User 自己选择并拥有的基础目录；
+- `WorkspaceScope{Caller, WorkspaceKey}` 只是两者之间的不透明路由身份，不是路径映射。
 
-1. **保留** `internal/workerclient`(桥的传输——legacy gateway 仍讲旧 WS 方言,
-   其删除属于双栈收敛 caller 半边)、`internal/workerstate`(backup manifest
-   依赖)与 `internal/mirror`(gateway exact-profile 门的 worker 仿真)。
-2. workerkit 会话状态(workerkit-state.db)是显示/草稿恢复层,不入 backup
-   archive;correctness(gateway DB、worker outbox)照旧入档。auto-title 自动
-   应答无工具 chat 请求,可用 `WebDisableAutoTitle` 关闭。
-3. 旧 TUI 门的 PTY 键值路径与 save-ahead journal 细节由 workerkit 层故障注入 +
-   web 真实门(REAL_COUNT 可重复)接替;`fault-test` 内部矩阵不变。
+`fsmirror` 只读取 Human 选择的目录。原生工具 builder 发送项目相对路径；Agent harness
+在自己的 cwd 与本机路径语义下解析，因此 Human 不需要知道 Agent 是 POSIX 还是 Windows。
+每个 filesystem mirror 必须绑定完整 scope，每个会话还绑定独立 `HumanWorkspace.ID`；
+跨 caller/workspace 或跨会话投递都返回 `ErrMirrorScopeMismatch`。
 
-Observer(§6)仍未落地,与产品迁移同批实现。
+## 3. durable 与 advisory 边界
 
-风险与诚实边界:
+- assignment/event 的正确性真相在 `llm.Service` Store；远程连接时由
+  `llm/workerws` Journal 保护发送事件。
+- 已接受 Conversation、草稿、parked tool calls、Alert 在 StateStore；本地默认
+  使用 `workerkit-state.db`。
+- Inbox 不重复持久化。未确认 assignment 由 transport 重投；同时写进
+  StateStore 会制造两个真相。
+- caller 断开是 advisory notice，但带 exact `caller/task/request` 身份；它只能
+  影响匹配的请求，不能把同一 Task 的新 continuation 标成已断开。
+- `request_expired` 对应的 core 决定已经 durable。workerkit 会从 Inbox 移除精确
+  assignment，或把精确当前 Conversation 收成 terminal；迟到的旧 NACK 不会改写
+  新 request/lease。
+- Alert 的保存和 dismiss 在支持 `AlertStore` 时都是 durable；重启后恢复。
 
-- M3 之前 web 不宣称 Live Workspace;M2 只是文本/工具闭环。
-- M4 之前 TUI 是唯一已验收产品面,`human local` 默认入口不变;web 的
-  "已等价"必须以 web 版真实 OpenCode 门为证据,不以组件测试替代。
-- web 版真实门预期比 PTY 键值门更易自动化(HTTP 命令替代原始键值),这是
-  删除 TUI 的维护收益之一,但覆盖范围必须先逐项对齐旧门再谈删除。
-- web 远程部署的认证/TLS 边界遵循 [08 运维](08-operations.md);本设计不
-  引入新的默认公网暴露。
+## 4. 官方 Web
+
+`web.Server` 是 workerkit 的 HTTP 投影：
+
+- `GET /api/state` 返回版本化的 Human 投影（当前 `schema_version: 2`），不是内部
+  `Conversation` 的无差别序列化；
+- `GET /api/events` 通过 SSE 推送状态更新并发送 keepalive；
+- `POST /api/accept`、`/api/reply`、`/api/final`、tool/review 等端点只调用
+  workerkit 命令，不复制状态机；
+- active Conversation 只有收到 exact `caller_gone` 后才允许 abandon；
+  awaiting-caller/results 仍可显式结束；
+- 页面直接支持 Inbox、对话、progress/final、结构化 tool call、文件 review、
+  caller-gone/expiry alert 与 durable dismiss。
+
+Web 投影只暴露不透明 `workspace_scope`、Human 侧会话目录和必要的对话状态，不发送
+harness session 或内部 `Assignment`。Agent 的 cwd/绝对路径根本不进入 Task、Store 或
+worker wire。文件 builder 只生成项目相对路径，真实工具由 Agent 在自己的 cwd 与权限
+系统中执行。
+
+关闭浏览器不会停止 Worker。daemon 拥有 Store、Mirror 和连接；浏览器随时可以重新
+打开并从 Snapshot 恢复。多个浏览器可读同一状态，所有写命令仍由 workerkit 的单一
+命令锁串行化。
+
+## 5. 本地组合与安全
+
+`local.Open` 是这套 ports 的 batteries-included 实现：
+
+1. `llm/sqlite` + 三个 built-in codecs 创建 `llm.Service`；
+2. `callerhttp` 暴露 Chat Completions、Responses、Anthropic Messages；
+3. 一个进程内 `llm.WorkerConnection` 经 `workerkit.WrapConnection` 进入人侧；
+4. `workerkit/sqlite`、`fsmirror` 与 `web.Server` 组成浏览器产品。
+
+模型端和 Web 端都只允许 loopback。模型端使用单 caller token，同时接受
+`Authorization: Bearer` 和 Anthropic `X-Api-Key`；二者重复或冲突时 fail closed。
+Web 每次启动生成独立 session token，只出现在打印的登录 URL；caller token 不进入
+浏览器。若部署到远程网络，TLS、SSO、代理信任和 header 剥离由宿主负责，不能直接把
+loopback session token 当成公网认证方案。
+
+本地 human side 不需要 worker token，因为它与 Service 同进程；真实工具也从不在
+Human 进程执行。人只返回模型 tool call，调用方 Agent 在自己的工作区和权限系统里
+执行，再把 result 放进下一次模型请求。
+
+`human local --workspace` 只配置 Human 侧基础目录。每个 exact harness session 默认映射
+到稳定的 `session-<hash>` 子目录；原始 session id 不直接用作文件名。Human 可在 Web
+中把某个会话切换到已有 repo，选择会持久化，重启后恢复。切换目录会以新目录当前内容
+重新种 baseline，因此不会把已有 repo 全部当作 create；之后的修改才进入该会话的
+Review。不同会话的 change 带独立 workspace id，跨会话交付在 workerkit 与 fsmirror
+两层 fail closed。外接盘或 restore 后目录暂时不存在时，daemon 仍可启动并把目录标成
+unavailable，Human 可从 Web 选择替代 repo。
+
+## 6. 生命周期与可观测性
+
+`local.Close` 先取消 handler/expiry/retention，再关闭 caller transport、Web、Worker、
+Mirror、StateStore，最后关闭拥有 Store 的 Service。`workerkit.Worker.Shutdown` 会停止
+notice pump，不留下等待一个仍存活连接的 goroutine。
+
+`observe` 当前覆盖 admission、worker connect/disconnect、event settlement、expiry、
+retention、assignment、human command、NACK 和 alert。Observer 在 Store callback 之外
+调用；panic 被隔离，不能改变业务结果。Prometheus/OTel 仍是宿主可自行添加的薄 adapter，
+不是 core 正确性依赖。
+
+## 7. 已验证边界
+
+- 真实 OpenCode 1.17.18 两轮 resume 已经通过 `human local` 公共组合；
+- 浏览器 API 与 Playwright 门覆盖 accept、progress/final、tool loop、review 和断连；
+- workerkit fake-wire/SQLite 测试覆盖重投、NACK、重启恢复、alert 持久化和 abandon；
+- OpenAI Chat、Responses、Anthropic Messages 的 aggregate/stream 都有默认产品门：
+  真实请求进入 `human local`，再只经 Web API 接单并完成；
+- Codex 0.145.0 已经在公共 local 栈真实执行 `exec_command`、回传
+  `function_call_output` 并收到 Human final；在请求声明 exact Responses custom freeform
+  `apply_patch` 时还完成 mirror create/modify 和 caller 最终字节核对。Claude Code
+  2.1.217 也已通过 Messages + Web 的 `Bash` 成功/失败 result 回流与恢复 final。
+  具体 harness 的 Workspace 能力仍按实际 profile/schema 单独声明，不能因协议或普通工具
+  闭环就外推成所有高级功能都已验证。
