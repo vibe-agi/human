@@ -7,6 +7,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
 )
 
 // localWebAPI is the operator-facing JSON surface used by product-level tests.
@@ -55,4 +58,23 @@ func webAPIForLocal(t interface{ Fatalf(string, ...any) }, instance *Local, clie
 		t.Fatalf("local web URL has no login token: %s", webURL)
 	}
 	return localWebAPI{base: webURL[:index], token: webURL[index+len(separator):], client: client}
+}
+
+func awaitHandled(t testing.TB, handled *atomic.Int64, want int64) int64 {
+	t.Helper()
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		current := handled.Load()
+		if current >= want {
+			return current
+		}
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			t.Fatalf("web operator handled %d conversations, want at least %d", current, want)
+		}
+	}
 }

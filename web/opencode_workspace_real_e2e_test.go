@@ -126,7 +126,10 @@ func TestRealOpenCodeWorkspaceWebDoor(t *testing.T) {
 	})
 
 	// --- Human side: workerkit + filesystem mirror + web, all over public API.
-	mirrorRoot := t.TempDir()
+	mirrorRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	mirror, err := fsmirror.Open(t.Context(), fsmirror.Config{
 		Root: mirrorRoot, Debounce: 100 * time.Millisecond,
 		Scope:         workerkit.WorkspaceScope{Caller: "caller-opencode", WorkspaceKey: "workspace-web-door"},
@@ -169,7 +172,9 @@ func TestRealOpenCodeWorkspaceWebDoor(t *testing.T) {
 	defer stopOperator()
 	operatorErr := make(chan error, 1)
 	go func() {
-		operatorErr <- runWorkspaceOperator(operatorCtx, webListener.URL, mirrorRoot, workspace, editedSuffix, finalAnswer)
+		operatorErr <- runWorkspaceOperator(
+			operatorCtx, webListener.URL, mirrorRoot, workspace, editedSuffix, finalAnswer,
+		)
 	}()
 
 	// --- Real OpenCode, workspace tier, one turn covering the whole loop.
@@ -204,10 +209,29 @@ func TestRealOpenCodeWorkspaceWebDoor(t *testing.T) {
 		"Use the Human response and complete the requested native workspace tool loop.")
 	command.Dir = workspace
 	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_DATA_HOME="+dataHome)
-	output, runErr := command.CombinedOutput()
-	if ctx.Err() != nil {
-		t.Fatalf("real OpenCode timed out: %v\n%s", ctx.Err(), output)
+	type commandResult struct {
+		output []byte
+		err    error
 	}
+	commandDone := make(chan commandResult, 1)
+	go func() {
+		output, runErr := command.CombinedOutput()
+		commandDone <- commandResult{output: output, err: runErr}
+	}()
+	var result commandResult
+	select {
+	case result = <-commandDone:
+	case runErr := <-operatorErr:
+		cancel()
+		result = <-commandDone
+		t.Fatalf("web operator exited before OpenCode: %v\n%s", runErr, result.output)
+	case <-ctx.Done():
+		stopOperator()
+		operatorRunErr := <-operatorErr
+		result = <-commandDone
+		t.Fatalf("real OpenCode timed out: %v (operator: %v)\n%s", ctx.Err(), operatorRunErr, result.output)
+	}
+	output, runErr := result.output, result.err
 	if runErr != nil {
 		t.Fatalf("real OpenCode failed: %v\n%s", runErr, output)
 	}
@@ -342,6 +366,9 @@ func runWorkspaceOperator(
 			// `opencode debug file read --pure` returns an envelope of the exact
 			// bytes: {"content":"<base64>","encoding":"base64","mime":...}.
 			result := transcriptToolResult(conversation, pullCallID)
+			if result == "" {
+				continue
+			}
 			var envelope struct {
 				Content  string `json:"content"`
 				Encoding string `json:"encoding"`
@@ -360,8 +387,16 @@ func runWorkspaceOperator(
 				return fmt.Errorf("pull content undecodable: %q (%v)", envelope.Content, err)
 			}
 			pulled = decoded
-			// Seed the mirror with the exact pulled bytes plus the human edit.
-			if err := os.WriteFile(filepath.Join(mirrorRoot, "native.txt"),
+			workspaceView, _ := conversation["human_workspace"].(map[string]any)
+			humanWorkspace := fmt.Sprint(workspaceView["path"])
+			relative, err := filepath.Rel(mirrorRoot, humanWorkspace)
+			if err != nil || relative == "." || relative == "" || relative == ".." ||
+				strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("conversation has invalid Human session workspace %q", humanWorkspace)
+			}
+			// Seed the exact per-session Human workspace shown by Web with the
+			// pulled bytes plus the Human edit. The mirror root is only a base.
+			if err := os.WriteFile(filepath.Join(humanWorkspace, "native.txt"),
 				append(append([]byte(nil), pulled...), []byte(editedSuffix)...), 0o600); err != nil {
 				return err
 			}
@@ -406,6 +441,9 @@ func runWorkspaceOperator(
 				continue
 			}
 			verify := transcriptToolResult(conversation, "call-verify")
+			if verify == "" {
+				continue
+			}
 			if !strings.Contains(verify, "command-ok:") {
 				return fmt.Errorf("bash verification result = %q", verify)
 			}

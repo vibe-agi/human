@@ -103,10 +103,13 @@ func TestRealOpenCodeLocalWebMode(t *testing.T) {
 					continue
 				}
 				key, _ := accepted["key"].(map[string]any)
-				webJSON(http.MethodPost, "/api/final", map[string]any{
+				_, status = webJSON(http.MethodPost, "/api/final", map[string]any{
 					"caller": fmt.Sprint(key["caller"]), "task_id": fmt.Sprint(key["task_id"]),
 					"text": finalAnswer,
 				})
+				if status != http.StatusOK {
+					continue
+				}
 				handled.Add(1)
 			}
 		}
@@ -156,10 +159,7 @@ func TestRealOpenCodeLocalWebMode(t *testing.T) {
 	if !strings.Contains(string(output), "LOCAL-WEB-DOOR-FINAL") {
 		t.Fatalf("OpenCode output lacks the web-delivered final:\n%s", output)
 	}
-	firstHandled := handled.Load()
-	if firstHandled < 1 {
-		t.Fatalf("web operator handled %d conversations, want at least 1", firstHandled)
-	}
+	firstHandled := awaitHandled(t, &handled, 1)
 
 	// Second top-level user turn in the SAME OpenCode session must reach the
 	// human again and complete through the web API.
@@ -185,11 +185,9 @@ func TestRealOpenCodeLocalWebMode(t *testing.T) {
 	if secondErr != nil || ctx.Err() != nil {
 		t.Fatalf("second OpenCode turn failed: %v %v\n%s", secondErr, ctx.Err(), secondOutput)
 	}
+	awaitHandled(t, &handled, firstHandled+1)
 	stopOperator()
 	if !strings.Contains(string(secondOutput), "LOCAL-WEB-DOOR-FINAL") {
 		t.Fatalf("second turn lacks the web-delivered final:\n%s", secondOutput)
-	}
-	if handled.Load() <= firstHandled {
-		t.Fatalf("second turn did not reach the web operator (handled %d)", handled.Load())
 	}
 }
