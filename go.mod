@@ -3,18 +3,18 @@ module github.com/vibe-agi/human
 go 1.25.0
 
 require (
-	github.com/a2aproject/a2a-go/v2 v2.3.1
-	github.com/anthropics/anthropic-sdk-go v1.59.0
+	github.com/a2aproject/a2a-go/v2 v2.4.0
+	github.com/anthropics/anthropic-sdk-go v1.61.0
 	github.com/coder/websocket v1.8.15
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/google/uuid v1.6.0
-	github.com/openai/openai-go/v3 v3.45.0
+	github.com/openai/openai-go/v3 v3.47.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
 	github.com/spf13/viper v1.21.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.40.0
-	modernc.org/sqlite v1.54.0
+	modernc.org/sqlite v1.55.0
 )
 
 require (
